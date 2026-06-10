@@ -13,6 +13,8 @@ class Vendor(models.Model):
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    product = models.CharField(max_length=255, blank=True, null=True)
+    product_version = models.CharField(max_length=100, blank=True, null=True)
 
     def __str__(self):
         return self.name
