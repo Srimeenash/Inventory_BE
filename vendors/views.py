@@ -16,11 +16,11 @@ class VendorViewSet(viewsets.ModelViewSet):
         print("VENDOR VIEWSET CALLED")
         return super().list(request, *args, **kwargs)
     
-class VendorViewSet(viewsets.ModelViewSet):
-    queryset = Vendor.objects.all().order_by("name")
-    serializer_class = VendorSerializer
-    permission_classes = [AllowAny]
-    authentication_classes = []
+# class VendorViewSet(viewsets.ModelViewSet):
+#     queryset = Vendor.objects.all().order_by("name")
+#     serializer_class = VendorSerializer
+#     permission_classes = [AllowAny]
+#     authentication_classes = []
 
     filter_backends = [
         DjangoFilterBackend,
