@@ -61,6 +61,7 @@ INSTALLED_APPS = [
     'approvals',
     'reports',
     'notifications',
+    'users',
 ]
 
 # ---------------------------------------------------------------------
@@ -179,3 +180,9 @@ CORS_ALLOW_CREDENTIALS = True
 # Default PK
 # ---------------------------------------------------------------------
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": (
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
+    ),
+}
