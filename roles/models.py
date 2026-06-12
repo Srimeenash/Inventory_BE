@@ -4,20 +4,25 @@ from django.db import models
 class Role(models.Model):
     ROLE_CHOICES = [
         ('ADMIN', 'Admin'),
+        ('SUB_ADMIN', 'Sub Admin'),
+
         ('PROCUREMENT_MANAGER', 'Procurement Manager'),
         ('PROCUREMENT_EXECUTIVE', 'Procurement Executive'),
+
         ('INVENTORY_MANAGER', 'Inventory Manager'),
         ('INVENTORY_EXECUTIVE', 'Inventory Executive'),
+
         ('ENGINEERING_MANAGER', 'Engineering Manager'),
         ('ENGINEER', 'Engineer'),
+
         ('FINANCE_MANAGER', 'Finance Manager'),
         ('FINANCE_EXECUTIVE', 'Finance Executive'),
     ]
 
     module = models.CharField(
-    max_length=50,
-    blank=True,
-    null=True
+        max_length=50,
+        blank=True,
+        null=True
     )
 
     name = models.CharField(
