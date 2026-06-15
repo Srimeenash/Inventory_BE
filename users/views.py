@@ -57,6 +57,7 @@ class CreateUserView(APIView):
         password = data.get("password")
         role = data.get("role")
         designation = data.get("designation")
+        profile_image = request.FILES.get("profile_image")  # ✅ ADD THIS
 
         if not all([employee_name, email, password]):
             return Response(
@@ -75,7 +76,8 @@ class CreateUserView(APIView):
             email=email,
             password=password,
             role=role,
-            designation=designation
+            designation=designation,
+            profile_image=profile_image  # ✅ SAVE IMAGE HERE
         )
 
         return Response({
@@ -85,103 +87,96 @@ class CreateUserView(APIView):
                 "employee_name": user.employee_name,
                 "email": user.email,
                 "role": user.role,
-                "designation": user.designation
+                "designation": user.designation,
+                "profile_image": user.profile_image.url if user.profile_image else None
             }
         }, status=status.HTTP_201_CREATED)
+        
+class UpdateUserView(APIView):
 
-    def post(self, request):
+    def put(self, request, user_id):
         try:
-            data = request.data
-
-            employee_name = data.get("employee_name")
-            email = data.get("email")
-            password = data.get("password")
-            role = data.get("role")
-            designation = data.get("designation")
-
-            if not employee_name or not email or not password:
-                return Response(
-                    {"detail": "Required fields missing"},
-                    status=400
-                )
-
-            if User.objects.filter(email=email).exists():
-                return Response(
-                    {"detail": "Email already exists"},
-                    status=400
-                )
-
-            user = User(
-                employee_name=employee_name,
-                email=email,
-                role=role,
-                designation=designation
-            )
-
-            user.password = password
-            user.save()
-
-            return Response({
-                "message": "User created",
-                "user": {
-                    "id": user.id,
-                    "email": user.email,
-                    "role": user.role
-                }
-            }, status=201)
-
-        except Exception as e:
+            user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
             return Response(
-                {"detail": str(e)},
-                status=500
+                {"detail": "User not found"},
+                status=status.HTTP_404_NOT_FOUND
             )
 
-    def post(self, request):
         data = request.data
 
         employee_name = data.get("employee_name")
         email = data.get("email")
-        password = data.get("password")
         role = data.get("role")
         designation = data.get("designation")
+        password = data.get("password")
+
+        # ✅ IMAGE COMES FROM FILES (IMPORTANT)
+        profile_image = request.FILES.get("profile_image")
 
         # -----------------------
-        # VALIDATION
+        # UPDATE FIELDS
         # -----------------------
-        if not all([employee_name, email, password]):
-            return Response(
-                {"detail": "employee_name, email and password are required"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        if employee_name:
+            user.employee_name = employee_name
 
-        # check duplicate email
-        if User.objects.filter(email=email).exists():
-            return Response(
-                {"detail": "User with this email already exists"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        if email:
+            if User.objects.exclude(id=user_id).filter(email=email).exists():
+                return Response(
+                    {"detail": "Email already exists"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            user.email = email
 
-        # -----------------------
-        # CREATE USER SAFELY
-        # -----------------------
-        user = User(
-            employee_name=employee_name,
-            email=email,
-            role=role,
-            designation=designation
-        )
+        if role:
+            user.role = role
 
-        # IMPORTANT: hash password properly
-        user.password = password
+        if designation:
+            user.designation = designation
+
+        if password:
+            user.password = password
+
+        # ✅ UPDATE IMAGE
+        if profile_image:
+            user.profile_image = profile_image
+
         user.save()
 
         return Response({
-            "message": "User created successfully",
+            "message": "User updated successfully",
             "user": {
                 "id": user.id,
                 "employee_name": user.employee_name,
                 "email": user.email,
                 "role": user.role,
-                "designation": user.designation
+                "designation": user.designation,
+                "profile_image": user.profile_image.url if user.profile_image else None
             }
-        }, status=status.HTTP_201_CREATED)
+        }, status=status.HTTP_200_OK)
+        
+        
+class UploadProfileImageView(APIView):
+
+    def post(self, request, user_id):
+        try:
+            user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return Response(
+                {"detail": "User not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        if "profile_image" not in request.FILES:
+            return Response(
+                {"detail": "No image provided"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        user.profile_image = request.FILES["profile_image"]
+        user.save()
+
+        return Response({
+            "message": "Profile image uploaded successfully",
+            "profile_image": user.profile_image.url if user.profile_image else None
+        }, status=status.HTTP_200_OK)
