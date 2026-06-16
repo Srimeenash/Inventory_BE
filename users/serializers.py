@@ -29,7 +29,7 @@ class EmailTokenSerializer(serializers.Serializer):
         except User.DoesNotExist:
             raise serializers.ValidationError("Invalid email or password")
 
-        if user.password != password:
+        if not user.check_password(password):
             raise serializers.ValidationError("Invalid email or password")
 
         if not user.is_active:

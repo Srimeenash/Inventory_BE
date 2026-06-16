@@ -1,4 +1,4 @@
-from from rest_framework.views import APIView
+from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import viewsets
 
@@ -10,13 +10,12 @@ from procurement.models import PurchaseRequest, PurchaseOrder
 from finance.models import Invoice
 from bom.models import BOM
 
-from accounts.permissions import IsManager
+
 
 
 class ReportLogViewSet(viewsets.ModelViewSet):
     queryset = ReportLog.objects.all().order_by('-created_at')
     serializer_class = ReportLogSerializer
-    permission_classes = [IsManager]
 
 
 # 📊 INVENTORY REPORT

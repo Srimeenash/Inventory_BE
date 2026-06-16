@@ -4,13 +4,10 @@ from rest_framework.response import Response
 
 from .models import Notification
 from .serializers import NotificationSerializer
-from accounts.permissions import IsManager
-
 
 class NotificationViewSet(viewsets.ModelViewSet):
     queryset = Notification.objects.all().order_by('-created_at')
     serializer_class = NotificationSerializer
-    permission_classes = [IsManager]
 
     def get_queryset(self):
         # show only logged-in user's notifications

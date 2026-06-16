@@ -4,13 +4,12 @@ from rest_framework.response import Response
 
 from .models import ApprovalRequest
 from .serializers import ApprovalRequestSerializer
-from accounts.permissions import IsManager
+
 
 
 class ApprovalRequestViewSet(viewsets.ModelViewSet):
     queryset = ApprovalRequest.objects.all().order_by('-created_at')
     serializer_class = ApprovalRequestSerializer
-    permission_classes = [IsManager]
 
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):

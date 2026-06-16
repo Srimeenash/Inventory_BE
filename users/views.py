@@ -1,23 +1,21 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from .models import User
-
+from rest_framework_simplejwt.tokens import RefreshToken
+from django.contrib.auth import authenticate
+from rest_framework.permissions import AllowAny
+from rest_framework_simplejwt.tokens import RefreshToken
+from roles.models import Role
+from users.models import User
+from django.contrib.auth import get_user_model
 
 class LoginView(APIView):
+    permission_classes = [AllowAny]
 
     def post(self, request):
         email = request.data.get("email")
         password = request.data.get("password")
 
-        # validate input
-        if not email or not password:
-            return Response(
-                {"detail": "Email and password required"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # check user by email only
         try:
             user = User.objects.get(email=email)
         except User.DoesNotExist:
@@ -26,71 +24,65 @@ class LoginView(APIView):
                 status=status.HTTP_401_UNAUTHORIZED
             )
 
-        # check password
-        if user.password != password:
+        if not user.check_password(password):
             return Response(
                 {"detail": "Invalid credentials"},
                 status=status.HTTP_401_UNAUTHORIZED
             )
 
-        # success response
+        refresh = RefreshToken.for_user(user)
+
         return Response({
-            "message": "Login successful",
+            "access": str(refresh.access_token),
+            "refresh": str(refresh),
             "user": {
                 "id": user.id,
-                "employee_name": user.employee_name,
                 "email": user.email,
-                "role": user.role,
-                "designation": user.designation
+                "employee_name": user.employee_name,
+                "role": user.role if user.role else None,
+                "designation": user.designation,
+                "profile_image": user.profile_image.url if user.profile_image else None,
             }
-        }, status=status.HTTP_200_OK)
-        
-        
-
+        })
 class CreateUserView(APIView):
+    permission_classes = [AllowAny]
 
     def post(self, request):
-        data = request.data
+        try:
+            data = request.data
+            role_name = data.get("role")
 
-        employee_name = data.get("employee_name")
-        email = data.get("email")
-        password = data.get("password")
-        role = data.get("role")
-        designation = data.get("designation")
-        profile_image = request.FILES.get("profile_image")  # ✅ ADD THIS
+            # Validate role if provided
+            valid_roles = [choice[0] for choice in User.ROLE_CHOICES]
+            if role_name and role_name not in valid_roles:
+                return Response({
+                    "error": f"Invalid role. Must be one of: {', '.join(valid_roles)}"
+                }, status=400)
 
-        if not all([employee_name, email, password]):
-            return Response(
-                {"detail": "employee_name, email and password are required"},
-                status=status.HTTP_400_BAD_REQUEST
+            user = User(
+                employee_name=data.get("employee_name"),
+                email=data.get("email"),
+                role=role_name,
+                designation=data.get("designation"),
             )
 
-        if User.objects.filter(email=email).exists():
-            return Response(
-                {"detail": "User with this email already exists"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            user.set_password(data.get("password"))
+            user.save()
 
-        user = User.objects.create(
-            employee_name=employee_name,
-            email=email,
-            password=password,
-            role=role,
-            designation=designation,
-            profile_image=profile_image  # ✅ SAVE IMAGE HERE
-        )
-
-        return Response({
-            "message": "User created successfully",
-            "user": {
+            return Response({
+                "message": "User created successfully",
                 "id": user.id,
-                "employee_name": user.employee_name,
-                "email": user.email,
-                "role": user.role,
-                "designation": user.designation,
-                "profile_image": user.profile_image.url if user.profile_image else None
-            }
-        }, status=status.HTTP_201_CREATED)
+                "user": {
+                    "id": user.id,
+                    "email": user.email,
+                    "employee_name": user.employee_name,
+                    "role": user.role,
+                    "designation": user.designation,
+                }
+            }, status=201)
+
+        except Exception as e:
+            return Response({"error": str(e)}, status=500)
         
 class UpdateUserView(APIView):
 
@@ -107,7 +99,7 @@ class UpdateUserView(APIView):
 
         employee_name = data.get("employee_name")
         email = data.get("email")
-        role = data.get("role")
+        role_name = data.get("role")
         designation = data.get("designation")
         password = data.get("password")
 
@@ -128,14 +120,20 @@ class UpdateUserView(APIView):
                 )
             user.email = email
 
-        if role:
-            user.role = role
+        if role_name:
+            # Validate role
+            valid_roles = [choice[0] for choice in User.ROLE_CHOICES]
+            if role_name not in valid_roles:
+                return Response({
+                    "error": f"Invalid role. Must be one of: {', '.join(valid_roles)}"
+                }, status=400)
+            user.role = role_name
 
         if designation:
             user.designation = designation
 
         if password:
-            user.password = password
+            user.set_password(password)
 
         # ✅ UPDATE IMAGE
         if profile_image:

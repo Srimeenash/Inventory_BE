@@ -27,7 +27,7 @@ ALLOWED_HOSTS = os.environ.get('DJANGO_ALLOWED_HOSTS', '*').split(',')
 # ---------------------------------------------------------------------
 # Custom User Model
 # ---------------------------------------------------------------------
-AUTH_USER_MODEL = 'accounts.User'
+AUTH_USER_MODEL = "users.User"
 
 # ---------------------------------------------------------------------
 # Installed Applications
@@ -40,15 +40,10 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-
-    # Third Party Apps
     'rest_framework',
     'rest_framework_simplejwt',
     'corsheaders',   # ✅ ONLY ONCE (FIXED)
     'django_filters',
-
-    # Local Apps
-    'accounts',
     'roles',
     'dashboard',
     'projects',
@@ -150,6 +145,13 @@ USE_TZ = True
 # Static Files
 # ---------------------------------------------------------------------
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+# ---------------------------------------------------------------------
+# Media Files
+# ---------------------------------------------------------------------
+MEDIA_URL = 'media/'
+MEDIA_ROOT = BASE_DIR / 'media'
 
 # ---------------------------------------------------------------------
 # DRF CONFIG
@@ -182,7 +184,7 @@ CORS_ALLOW_CREDENTIALS = True
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 REST_FRAMEWORK = {
-    "DEFAULT_AUTHENTICATION_CLASSES": (
-        "rest_framework_simplejwt.authentication.JWTAuthentication",
+    'DEFAULT_PERMISSION_CLASSES': (
+        'rest_framework.permissions.IsAuthenticated',
     ),
 }
