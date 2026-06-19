@@ -111,7 +111,7 @@ DATABASES = {
         'ENGINE': os.environ.get('DATABASE_ENGINE', 'django.db.backends.mysql'),
         'NAME': os.environ.get('DATABASE_NAME', 'ipms_db'),
         'USER': os.environ.get('DATABASE_USER', 'root'),
-        'PASSWORD': os.environ.get('DATABASE_PASSWORD', 'mysql'),
+        'PASSWORD': os.environ.get('DATABASE_PASSWORD', 'root@123'),
         'HOST': os.environ.get('DATABASE_HOST', 'localhost'),
         'PORT': os.environ.get('DATABASE_PORT', '3306'),
     }
@@ -156,13 +156,17 @@ MEDIA_ROOT = BASE_DIR / 'media'
 # ---------------------------------------------------------------------
 # DRF CONFIG
 # ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# DRF CONFIG
+# ---------------------------------------------------------------------
+
 REST_FRAMEWORK = {
-    'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
-    ),
+    'DEFAULT_AUTHENTICATION_CLASSES': [],
     'DEFAULT_PERMISSION_CLASSES': (
-        'rest_framework.permissions.IsAuthenticated',
+        'rest_framework.permissions.AllowAny',
     ),
+
+
     'DEFAULT_FILTER_BACKENDS': (
         'django_filters.rest_framework.DjangoFilterBackend',
         'rest_framework.filters.SearchFilter',
@@ -171,6 +175,8 @@ REST_FRAMEWORK = {
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 20,
 }
+
+
 
 # ---------------------------------------------------------------------
 # CORS SETTINGS
@@ -183,8 +189,3 @@ CORS_ALLOW_CREDENTIALS = True
 # ---------------------------------------------------------------------
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-REST_FRAMEWORK = {
-    'DEFAULT_PERMISSION_CLASSES': (
-        'rest_framework.permissions.IsAuthenticated',
-    ),
-}

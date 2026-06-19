@@ -1,17 +1,20 @@
 from rest_framework import serializers
-from django.contrib.auth import get_user_model
 from .models import Component
-
 
 class ComponentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Component
         fields = [
             'id',
-            'component_number',
+            'component_id',
             'name',
             'category',
             'specifications',
+            'unit_of_measurements',
+            'hsn_numbers',
+            'sku_numbers',
+            'part_numbers',
+            'ordering_id',
             'unit_price',
             'stock_quantity',
             'reorder_level',
