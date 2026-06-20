@@ -57,6 +57,7 @@ INSTALLED_APPS = [
     'reports',
     'notifications',
     'users',
+    'componentusage',
 ]
 
 # ---------------------------------------------------------------------

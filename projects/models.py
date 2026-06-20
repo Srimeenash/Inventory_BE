@@ -12,6 +12,7 @@ class Project(models.Model):
     ]
 
     project_code = models.CharField(max_length=50, unique=True)
+    project_type = models.CharField(max_length=50, blank=True, null=True)
     name = models.CharField(max_length=255)
     description = models.TextField(blank=True, null=True)
     department = models.CharField(max_length=100, blank=True, null=True)

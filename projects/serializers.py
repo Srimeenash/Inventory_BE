@@ -29,6 +29,7 @@ class ProjectSerializer(serializers.ModelSerializer):
         fields = [
             'id',
             'project_code',
+            'project_type',
             'name',
             'description',
             'department',
