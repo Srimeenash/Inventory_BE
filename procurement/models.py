@@ -3,14 +3,24 @@ from decimal import Decimal
 from django.db import models
 from components.models import Component
 
+STATUS_CHOICES = [
+    ("DRAFT", "Draft"),
+    ("PENDING", "Pending"),
+    ("APPROVED", "Approved"),
+    ("ORDERED", "Ordered"),
+    ("DELIVERED", "Delivered"),
+    ("REJECTED", "Rejected"),
+]
 
 class PurchaseRequest(models.Model):
 
     STATUS_CHOICES = [
+        ("DRAFT", "Draft"),
         ("PENDING", "Pending"),
         ("APPROVED", "Approved"),
+        ("ORDERED", "Ordered"),
+        ("DELIVERED", "Delivered"),
         ("REJECTED", "Rejected"),
-        ("CONVERTED", "Converted To PO"),
     ]
 
     pr_number = models.CharField(
@@ -73,59 +83,26 @@ class PurchaseOrder(models.Model):
 
     STATUS_CHOICES = [
         ("DRAFT", "Draft"),
+        ("PENDING", "Pending"),
+        ("APPROVED", "Approved"),
         ("ORDERED", "Ordered"),
-        ("PARTIAL", "Partially Received"),
-        ("RECEIVED", "Received"),
-        ("CANCELLED", "Cancelled"),
+        ("DELIVERED", "Delivered"),
+        ("REJECTED", "Rejected"),
     ]
+    po_number = models.CharField(max_length=50, unique=True)
 
-    po_number = models.CharField(
-        max_length=50,
-        unique=True
-    )
+    vendor_name = models.CharField(max_length=255)
+    gstin = models.CharField(max_length=30, blank=True)
+    location = models.CharField(max_length=255, blank=True)
 
-    purchase_request = models.ForeignKey(
-        PurchaseRequest,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="purchase_orders"
-    )
+    ordered_date = models.DateField(null=True, blank=True)
+    expected_delivery_date = models.DateField(null=True, blank=True)  # ✅ ADD THIS
 
-    # Vendor Details
-    vendor_name = models.CharField(
-        max_length=255
-    )
+    remarks = models.TextField(blank=True, null=True)
 
-    gstin = models.CharField(
-        max_length=30,
-        blank=True
-    )
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="PENDING")
 
-    location = models.CharField(
-        max_length=255,
-        blank=True
-    )
-
-    ordered_date = models.DateField(
-        null=True,
-        blank=True
-    )
-
-    remarks = models.TextField(
-        blank=True,
-        null=True
-    )
-
-    status = models.CharField(
-        max_length=20,
-        choices=STATUS_CHOICES,
-        default="DRAFT"
-    )
-
-    created_at = models.DateTimeField(
-        auto_now_add=True
-    )
+    created_at = models.DateTimeField(auto_now_add=True)
 
     @property
     def total_quantity(self):
@@ -148,92 +125,27 @@ class PurchaseOrder(models.Model):
 
 
 class PurchaseOrderItem(models.Model):
-
     purchase_order = models.ForeignKey(
         PurchaseOrder,
         on_delete=models.CASCADE,
         related_name="items"
     )
 
-    component = models.ForeignKey(
-        Component,
-        on_delete=models.CASCADE
-    )
+    component = models.ForeignKey(Component, on_delete=models.CASCADE)
 
     quantity = models.PositiveIntegerField()
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2)
 
-    unit_price = models.DecimalField(
-        max_digits=12,
-        decimal_places=2
-    )
-
-    gst_percentage = models.DecimalField(
-        max_digits=5,
-        decimal_places=2,
-        default=18.00
-    )
-
-    # Logistics / Inward
-    shipping_qty = models.PositiveIntegerField(
-        default=0
-    )
-
-    shipping_date = models.DateField(
-        null=True,
-        blank=True
-    )
-
-    received_qty = models.PositiveIntegerField(
-        default=0
-    )
-
-    received_date = models.DateField(
-        null=True,
-        blank=True
-    )
-
-    inwarded = models.BooleanField(
-        default=False
-    )
-
-    remarks = models.TextField(
-        blank=True,
-        null=True
-    )
-
-    @property
-    def specification(self):
-        return getattr(
-            self.component,
-            "component_specification",
-            ""
-        )
-
-    @property
-    def uom(self):
-        return getattr(
-            self.component,
-            "unit_of_measurement",
-            ""
-        )
+    gst_percentage = models.DecimalField(max_digits=5, decimal_places=2, default=18.00)
 
     @property
     def subtotal(self):
-        return Decimal(self.quantity) * self.unit_price
+        return Decimal(self.quantity) * (self.unit_price or Decimal("0"))
 
     @property
     def gst_amount(self):
-        return (
-            self.subtotal * self.gst_percentage
-        ) / Decimal("100")
+        return (self.subtotal * (self.gst_percentage or Decimal("0"))) / Decimal("100")
 
     @property
     def total_cost(self):
-        return self.subtotal + self.gst_amount
-
-    def __str__(self):
-        return (
-            f"{self.purchase_order.po_number} - "
-            f"{self.component}"
-        )
-        
+        return self.subtotal + self.gst_amount   
