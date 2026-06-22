@@ -14,8 +14,10 @@ class ComponentSerializer(serializers.ModelSerializer):
             'hsn_numbers',
             'sku_numbers',
             'part_numbers',
+            'product_link', 
             'ordering_id',
             'unit_price',
+            'tally_reference',
             'stock_quantity',
             'reorder_level',
             'total_value',
@@ -32,3 +34,15 @@ class ComponentSerializer(serializers.ModelSerializer):
             representation.pop('unit_price', None)
             representation.pop('total_value', None)
         return representation
+    def validate_component_id(self, value):
+        qs = Component.objects.filter(component_id=value)
+
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.pk)
+
+        if qs.exists():
+            raise serializers.ValidationError(
+                "Component ID already exists."
+            )
+
+        return value

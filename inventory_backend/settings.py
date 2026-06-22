@@ -58,6 +58,7 @@ INSTALLED_APPS = [
     'notifications',
     'users',
     'componentusage',
+    'materialrequest',
 ]
 
 # ---------------------------------------------------------------------

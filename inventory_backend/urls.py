@@ -44,9 +44,11 @@ urlpatterns = [
     path('api/procurement/', include('procurement.urls')),
     path('api/inventory/', include('inventory.urls')),
     path('api/finance/', include('finance.urls')),
-    path('api/', include('componentusage.urls')),
-
+    path("api/materialrequest/", include("materialrequest.urls")),
+    path("api/componentusage/", include("componentusage.urls")),
 ]
+
+
 
 # Serve media files during development
 if settings.DEBUG:
