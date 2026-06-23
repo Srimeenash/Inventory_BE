@@ -27,8 +27,8 @@ ALLOWED_HOSTS = os.environ.get('DJANGO_ALLOWED_HOSTS', '*').split(',')
 # ---------------------------------------------------------------------
 # Custom User Model
 # ---------------------------------------------------------------------
-AUTH_USER_MODEL = "users.User"
 
+AUTH_USER_MODEL = 'users.User'
 # ---------------------------------------------------------------------
 # Installed Applications
 # ---------------------------------------------------------------------
@@ -44,7 +44,6 @@ INSTALLED_APPS = [
     'rest_framework_simplejwt',
     'corsheaders',   # ✅ ONLY ONCE (FIXED)
     'django_filters',
-    'roles',
     'dashboard',
     'projects',
     'vendors',
@@ -53,11 +52,12 @@ INSTALLED_APPS = [
     'procurement',
     'bom',
     'finance',
-    'approvals',
+    'users',
+    'roles',
     'reports',
     'notifications',
-    'users',
     'componentusage',
+    'approvals',
     'materialrequest',
 ]
 

@@ -1,7 +1,7 @@
-from rest_framework import viewsets
+from rest_framework.viewsets import ModelViewSet
 from .models import ComponentUsage
 from .serializers import ComponentUsageSerializer
 
-class ComponentUsageViewSet(viewsets.ModelViewSet):
-    queryset = ComponentUsage.objects.all().order_by("-date")
+class ComponentUsageViewSet(ModelViewSet):
+    queryset = ComponentUsage.objects.all().order_by('-id')
     serializer_class = ComponentUsageSerializer

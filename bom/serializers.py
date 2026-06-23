@@ -1,15 +1,19 @@
 from rest_framework import serializers
 from .models import BOM, BOMItem
-from components.models import Component
+from .models import BOMItem
 
-
-
+# BOMItem serializer – exclude 'bom' so frontend doesn’t need to send it
 class BOMItemSerializer(serializers.ModelSerializer):
+    bom = serializers.PrimaryKeyRelatedField(
+        queryset=BOM.objects.all(),
+        required=False,
+        write_only=True
+    )
+
     class Meta:
         model = BOMItem
         fields = "__all__"
-
-
+# BOM serializer – nests BOMItemSerializer
 class BOMSerializer(serializers.ModelSerializer):
     items = BOMItemSerializer(many=True)
 
@@ -17,54 +21,20 @@ class BOMSerializer(serializers.ModelSerializer):
         model = BOM
         fields = "__all__"
 
-    def create(self, validated_data):
-        items_data = validated_data.pop("items", [])
+    def update(self, instance, validated_data):
+        items_data = validated_data.pop("items", None)
 
-        bom = BOM.objects.create(**validated_data)
+        # update BOM fields
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
 
-        for item in items_data:
-            BOMItem.objects.create(
-                bom=bom,
-                **item
-            )
+        instance.save()
 
-        return bom
+        # update items ONLY if provided
+        if items_data is not None:
+            instance.items.all().delete()
 
-class BOMSerializer(serializers.ModelSerializer):
-    items = BOMItemSerializer(many=True, required=False)
+            for item in items_data:
+                BOMItem.objects.create(bom=instance, **item)
 
-    class Meta:
-        model = BOM
-        fields = [
-            'id',
-            'bom_number',
-            'product_name',
-            'version',
-            'project_type',
-            'bom_name',
-            'created_by',
-            'description',
-            'is_active',
-            'created_at',
-            'updated_at',
-            'items',
-        ]
-
-    def create(self, validated_data):
-        items_data = validated_data.pop('items', [])
-
-        bom = BOM.objects.create(**validated_data)
-
-        for item_data in items_data:
-            BOMItem.objects.create(
-                bom=bom,
-                component=item_data['component'],
-                category=item_data.get('category'),
-                specifications=item_data.get('specifications'),
-                quantity=item_data.get('quantity', 1),
-                price=item_data.get('price', 0),
-                tax=item_data.get('tax', 0),
-                vendor=item_data.get('vendor'),
-            )
-
-        return bom
+        return instance

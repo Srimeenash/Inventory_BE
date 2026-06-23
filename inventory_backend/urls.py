@@ -17,26 +17,18 @@ Including another URLconf
 from django.contrib import admin
 from django.conf import settings
 from django.conf.urls.static import static
-
-from users.views import CreateUserView, LoginView, UpdateUserView
-from .views import home
 from django.urls import include, path
-from users.views import UploadProfileImageView
-from rest_framework_simplejwt.views import (
-    TokenObtainPairView,
-    TokenRefreshView,
-)
+from .views import home
+from users.views import AuthView
 
 urlpatterns = [
     path('', home),
     path('admin/', admin.site.urls),
-    path("api/auth/login/", LoginView.as_view(), name="auth-login"),
-    path("create-user/", CreateUserView.as_view(), name="create-user"),
-    path("update-user/<int:user_id>/", UpdateUserView.as_view(), name="update-user"),
-    path("api/users/<int:user_id>/upload-profile/", UploadProfileImageView.as_view(), name="upload-profile"),
-    path("api/auth/", include("users.urls")),
 
-    path('api/roles/', include('roles.urls')),
+    # AUTH API
+    path('api/auth/', AuthView.as_view()),   # ✅ ADD THIS
+
+    # other modules
     path('api/projects/', include('projects.urls')),
     path('api/components/', include('components.urls')),
     path('api/vendors/', include('vendors.urls')),
@@ -45,11 +37,8 @@ urlpatterns = [
     path('api/inventory/', include('inventory.urls')),
     path('api/finance/', include('finance.urls')),
     path("api/materialrequest/", include("materialrequest.urls")),
-    path("api/componentusage/", include("componentusage.urls")),
+    path("api/component-usage/", include("componentusage.urls")),
 ]
 
-
-
-# Serve media files during development
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

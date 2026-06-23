@@ -89,6 +89,17 @@ class PurchaseOrder(models.Model):
         ("DELIVERED", "Delivered"),
         ("REJECTED", "Rejected"),
     ]
+
+    approval_status = models.CharField(
+    max_length=20,
+    choices=[
+        ("NOT_REQUESTED", "Not Requested"),
+        ("REQUESTED", "Requested"),
+        ("APPROVED", "Approved"),
+        ("REJECTED", "Rejected"),
+    ],
+    default="NOT_REQUESTED"
+)
     po_number = models.CharField(max_length=50, unique=True)
 
     vendor_name = models.CharField(max_length=255)
@@ -149,3 +160,30 @@ class PurchaseOrderItem(models.Model):
     @property
     def total_cost(self):
         return self.subtotal + self.gst_amount   
+
+class PurchaseOrderApproval(models.Model):
+    ACTION_CHOICES = [
+        ("REQUESTED", "Requested"),
+        ("APPROVED", "Approved"),
+        ("REJECTED", "Rejected"),
+    ]
+
+    purchase_order = models.ForeignKey(
+        PurchaseOrder,
+        on_delete=models.CASCADE,
+        related_name="approvals"
+    )
+
+    action = models.CharField(
+        max_length=20,
+        choices=ACTION_CHOICES,
+        default="REQUESTED"
+    )
+
+    requested_by = models.CharField(max_length=100)
+    remarks = models.TextField(blank=True, null=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.purchase_order.po_number} - {self.action}"

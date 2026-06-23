@@ -14,6 +14,7 @@ class Notification(models.Model):
     ]
 
     recipient = models.ForeignKey(
+        
         User,
         on_delete=models.CASCADE,
         related_name='notifications'
