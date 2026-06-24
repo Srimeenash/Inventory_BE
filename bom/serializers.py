@@ -21,19 +21,26 @@ class BOMSerializer(serializers.ModelSerializer):
         model = BOM
         fields = "__all__"
 
+    def create(self, validated_data):
+        items_data = validated_data.pop("items", [])
+
+        bom = BOM.objects.create(**validated_data)
+
+        for item in items_data:
+            BOMItem.objects.create(bom=bom, **item)
+
+        return bom
+
     def update(self, instance, validated_data):
         items_data = validated_data.pop("items", None)
 
-        # update BOM fields
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
 
         instance.save()
 
-        # update items ONLY if provided
         if items_data is not None:
             instance.items.all().delete()
-
             for item in items_data:
                 BOMItem.objects.create(bom=instance, **item)
 
