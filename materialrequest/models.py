@@ -3,6 +3,7 @@ from django.db import models
 
 class MaterialRequest(models.Model):
     requester_name = models.CharField(max_length=100)
+    
     date = models.DateField()
     project = models.CharField(max_length=100)
     bom = models.CharField(max_length=100)
@@ -11,14 +12,30 @@ class MaterialRequest(models.Model):
     remarks = models.TextField(blank=True, null=True)
     status = models.CharField(
         max_length=20,
-        choices=[("Pending", "Pending"), ("Approved", "Approved"), ("Rejected", "Rejected")],
-        default="Pending"
+        choices=[
+            ("PENDING", "Pending"),
+            ("APPROVED", "Approved"),
+            ("REJECTED", "Rejected"),
+        ],
+        default="PENDING"
     )
+
+    approval_status = models.CharField(
+        max_length=20,
+        choices=[
+            ("NOT_REQUESTED", "Not Requested"),
+            ("REQUESTED", "Requested"),
+            ("APPROVED", "Approved"),
+            ("REJECTED", "Rejected"),
+        ],
+        default="NOT_REQUESTED"
+    )
+    
 
     def __str__(self):
         return f"{self.project} - {self.requester_name}"
 
-
+     
 class BOMItem(models.Model):
     material_request = models.ForeignKey(
         MaterialRequest, related_name="bom_items", on_delete=models.CASCADE

@@ -125,11 +125,17 @@ class PurchaseOrder(models.Model):
 
     @property
     def grand_gst_amount(self):
-        return sum(item.gst_amount for item in self.items.all())
+        return sum(
+            (item.gst_amount or Decimal("0"))
+            for item in self.items.all()
+        )
 
     @property
     def grand_total(self):
-        return sum(item.total_cost for item in self.items.all())
+        return sum(
+            (item.total_cost or Decimal("0"))
+            for item in self.items.all()
+        )
 
     def __str__(self):
         return self.po_number
@@ -147,7 +153,12 @@ class PurchaseOrderItem(models.Model):
     quantity = models.PositiveIntegerField()
     unit_price = models.DecimalField(max_digits=12, decimal_places=2)
 
-    gst_percentage = models.DecimalField(max_digits=5, decimal_places=2, default=18.00)
+    gst_percentage = models.DecimalField(
+    max_digits=5,
+    decimal_places=2,
+    null=True,
+    blank=True
+    )
 
     @property
     def subtotal(self):
@@ -155,11 +166,18 @@ class PurchaseOrderItem(models.Model):
 
     @property
     def gst_amount(self):
-        return (self.subtotal * (self.gst_percentage or Decimal("0"))) / Decimal("100")
+        if self.gst_percentage is None:
+            return None
+
+        return (self.subtotal * self.gst_percentage) / Decimal("100")
+
 
     @property
     def total_cost(self):
-        return self.subtotal + self.gst_amount   
+        if self.gst_percentage is None:
+            return None
+
+        return self.subtotal + self.gst_amount
 
 class PurchaseOrderApproval(models.Model):
     ACTION_CHOICES = [

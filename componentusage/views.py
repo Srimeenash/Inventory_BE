@@ -3,5 +3,5 @@ from .models import ComponentUsage
 from .serializers import ComponentUsageSerializer
 
 class ComponentUsageViewSet(ModelViewSet):
-    queryset = ComponentUsage.objects.all().order_by('-id')
+    queryset = ComponentUsage.objects.all()
     serializer_class = ComponentUsageSerializer
