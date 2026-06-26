@@ -45,6 +45,8 @@ urlpatterns = [
     path('api/bom/', include('bom.urls')),
     path('api/procurement/', include('procurement.urls')),
     path('api/inventory/', include('inventory.urls')),
+    path('api/inward/', include('inward.urls')),
+    path('api/outward/', include('outward.urls')),
     path('api/finance/', include('finance.urls')),
     path("api/materialrequest/", include("materialrequest.urls")),
     path("api/component-usage/", include("componentusage.urls")),
