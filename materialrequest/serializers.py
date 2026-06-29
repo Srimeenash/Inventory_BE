@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import MaterialRequest, BOMItem
+from .models import MaterialRequest, BOMItem, RDItem
 
 
 class BOMItemSerializer(serializers.ModelSerializer):
@@ -8,12 +8,46 @@ class BOMItemSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
 
+class RDItemSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RDItem
+        exclude = ["material_request"]
+
+
 class MaterialRequestSerializer(serializers.ModelSerializer):
-    bom_items = BOMItemSerializer(many=True, read_only=True)
+
+    bom = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True
+    )
+
+    bom_items = BOMItemSerializer(many=True, required=False)
+    rd_items = RDItemSerializer(many=True, required=False)
 
     class Meta:
         model = MaterialRequest
         fields = "__all__"
+
+    def create(self, validated_data):
+        bom_items = validated_data.pop("bom_items", [])
+        rd_items = validated_data.pop("rd_items", [])
+
+        material_request = MaterialRequest.objects.create(**validated_data)
+
+        for item in bom_items:
+            BOMItem.objects.create(
+                material_request=material_request,
+                **item
+            )
+
+        for item in rd_items:
+            RDItem.objects.create(
+                material_request=material_request,
+                **item
+            )
+
+        return material_request
 
     def validate_status(self, value):
         allowed = ["PENDING", "APPROVED", "REJECTED"]
@@ -33,7 +67,6 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
         if approval_status:
             instance.approval_status = approval_status
 
-            # 🔥 AUTO SYNC STATUS
             if approval_status == "APPROVED":
                 instance.status = "APPROVED"
             elif approval_status == "REJECTED":

@@ -6,7 +6,19 @@ class MaterialRequest(models.Model):
     
     date = models.DateField()
     project = models.CharField(max_length=100)
-    bom = models.CharField(max_length=100)
+    bom = models.CharField(
+    max_length=100,
+    blank=True,
+    null=True
+)
+    request_type = models.CharField(
+        max_length=10,
+        choices=[
+            ("BOM", "BOM"),
+            ("R&D", "R&D"),
+        ],
+        default="BOM",
+    )
     required_quantity = models.PositiveIntegerField()
     required_date = models.DateField()
     remarks = models.TextField(blank=True, null=True)
@@ -47,3 +59,21 @@ class BOMItem(models.Model):
 
     def __str__(self):
         return f"{self.specification} ({self.quantity} {self.unit})"
+
+
+class RDItem(models.Model):
+    material_request = models.ForeignKey(
+        MaterialRequest,
+        related_name="rd_items",
+        on_delete=models.CASCADE
+    )
+
+    component = models.CharField(max_length=200)
+    category = models.CharField(max_length=100)
+    specification = models.CharField(max_length=200)
+    quantity = models.PositiveIntegerField()
+    unit = models.CharField(max_length=50)
+    vendor = models.CharField(max_length=100)
+
+    def __str__(self):
+        return self.component
