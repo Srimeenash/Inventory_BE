@@ -27,6 +27,7 @@ class BOMItem(models.Model):
     category = models.CharField(max_length=100, blank=True, null=True)
     specifications = models.TextField(blank=True, null=True)
     quantity = models.PositiveIntegerField(default=1)
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     unit = models.CharField(max_length=20, default="pc")
     price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     tax = models.DecimalField(max_digits=5, decimal_places=2, default=0)

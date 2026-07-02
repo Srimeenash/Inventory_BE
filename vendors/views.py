@@ -7,20 +7,11 @@ from .serializers import VendorSerializer
 
 
 class VendorViewSet(viewsets.ModelViewSet):
-    queryset = Vendor.objects.all().order_by("name")
+    queryset = Vendor.objects.prefetch_related("products").all().order_by("name")
     serializer_class = VendorSerializer
+
     permission_classes = [AllowAny]
     authentication_classes = []
-
-    def list(self, request, *args, **kwargs):
-        print("VENDOR VIEWSET CALLED")
-        return super().list(request, *args, **kwargs)
-    
-# class VendorViewSet(viewsets.ModelViewSet):
-#     queryset = Vendor.objects.all().order_by("name")
-#     serializer_class = VendorSerializer
-#     permission_classes = [AllowAny]
-#     authentication_classes = []
 
     filter_backends = [
         DjangoFilterBackend,
@@ -29,7 +20,8 @@ class VendorViewSet(viewsets.ModelViewSet):
     ]
 
     filterset_fields = ["is_active"]
-    search_fields = [       
+
+    search_fields = [
         "name",
         "gst_number",
         "pan_number",
@@ -37,5 +29,15 @@ class VendorViewSet(viewsets.ModelViewSet):
         "email",
         "phone",
     ]
-    ordering_fields = ["name", "rating", "created_at"]
+
+    ordering_fields = [
+        "name",
+        "rating",
+        "created_at",
+    ]
+
     ordering = ["name"]
+
+    def list(self, request, *args, **kwargs):
+        print("VENDOR VIEWSET CALLED")
+        return super().list(request, *args, **kwargs)
