@@ -1,36 +1,46 @@
 from rest_framework import serializers
-from .models import StockIn, StockInItem, StockOut, StockOutItem, InventoryLedger
+from .models import Inventory
 
 
-class StockInItemSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = StockInItem
-        fields = '__all__'
+class InventorySerializer(serializers.ModelSerializer):
+    component_name = serializers.CharField(
+        source="component.name",
+        read_only=True
+    )
 
-
-class StockInSerializer(serializers.ModelSerializer):
-    items = StockInItemSerializer(many=True, read_only=True)
-
-    class Meta:
-        model = StockIn
-        fields = '__all__'
-
-
-class StockOutItemSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = StockOutItem
-        fields = '__all__'
-
-
-class StockOutSerializer(serializers.ModelSerializer):
-    items = StockOutItemSerializer(many=True, read_only=True)
+    category = serializers.CharField(
+        source="component.category",
+        read_only=True
+    )
 
     class Meta:
-        model = StockOut
-        fields = '__all__'
+        model = Inventory
+        fields = [
+            "id",
+            "inventory_code",
 
+            "component",
+            "component_name",
+            "category",
 
-class InventoryLedgerSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = InventoryLedger
-        fields = '__all__'
+            "vendor",
+
+            "purchase_order",
+
+            "quantity",
+            "received_date",
+            "total_price",
+
+            "moved",
+            "employee_id",
+            "bom",
+
+            "created_at",
+        ]
+
+        read_only_fields = [
+            "inventory_code",
+            "component_name",
+            "category",
+            "created_at",
+        ]

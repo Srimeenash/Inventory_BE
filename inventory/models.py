@@ -1,58 +1,51 @@
 from django.db import models
 from components.models import Component
-from procurement.models import PurchaseOrder
 
 
-class StockIn(models.Model):
-    reference_number = models.CharField(max_length=100, unique=True)
-    purchase_order = models.ForeignKey(PurchaseOrder, on_delete=models.CASCADE, related_name='stock_ins')
-    received_by = models.CharField(max_length=100)
-    received_date = models.DateTimeField(auto_now_add=True)
-    remarks = models.TextField(blank=True, null=True)
+class Inventory(models.Model):
+    inventory_code = models.CharField(max_length=100, unique=True, blank=True)
 
-    def __str__(self):
-        return self.reference_number
+    component = models.ForeignKey(
+        Component,
+        on_delete=models.CASCADE,
+        related_name="inventory_items"
+    )
 
+    category = models.CharField(
+    max_length=100,
+    blank=True,
+    null=True
+)
+    vendor = models.CharField(max_length=255, blank=True, null=True)
+    purchase_order = models.CharField(max_length=255, blank=True, null=True)
+    quantity = models.PositiveIntegerField(default=1)
+    received_date = models.DateField()
 
-class StockInItem(models.Model):
-    stock_in = models.ForeignKey(StockIn, on_delete=models.CASCADE, related_name='items')
-    component = models.ForeignKey(Component, on_delete=models.CASCADE)
-    quantity_received = models.PositiveIntegerField()
-    unit_price = models.DecimalField(max_digits=14, decimal_places=2)
+    total_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0
+    )
 
-    @property
-    def total_cost(self):
-        return self.quantity_received * self.unit_price
+    moved = models.BooleanField(default=False)
+    employee_id = models.CharField(max_length=100, blank=True, null=True)
+    bom = models.CharField(max_length=100, blank=True, null=True)
 
-
-class StockOut(models.Model):
-    reference_number = models.CharField(max_length=100, unique=True)
-    issued_to = models.CharField(max_length=100)
-    department = models.CharField(max_length=100)
-    issued_date = models.DateTimeField(auto_now_add=True)
-    remarks = models.TextField(blank=True, null=True)
-
-    def __str__(self):
-        return self.reference_number
-
-
-class StockOutItem(models.Model):
-    stock_out = models.ForeignKey(StockOut, on_delete=models.CASCADE, related_name='items')
-    component = models.ForeignKey(Component, on_delete=models.CASCADE)
-    quantity_issued = models.PositiveIntegerField()
-
-
-class InventoryLedger(models.Model):
-    TRANSACTION_TYPES = [
-        ('IN', 'Stock In'),
-        ('OUT', 'Stock Out'),
-    ]
-
-    component = models.ForeignKey(Component, on_delete=models.CASCADE)
-    transaction_type = models.CharField(max_length=10, choices=TRANSACTION_TYPES)
-    quantity = models.IntegerField()
-    reference = models.CharField(max_length=100)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    def save(self, *args, **kwargs):
+
+        if not self.inventory_code:
+            last = Inventory.objects.order_by("-id").first()
+
+            if last:
+                last_no = int(last.inventory_code.replace("INV", ""))
+            else:
+                last_no = 0
+
+            self.inventory_code = f"INV{last_no + 1:05d}"
+
+        super().save(*args, **kwargs)
+
     def __str__(self):
-        return f"{self.component.name} - {self.transaction_type}"
+        return self.inventory_code

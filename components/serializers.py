@@ -1,7 +1,10 @@
 from rest_framework import serializers
+from django.db.models import Max
 from .models import Component
 
 class ComponentSerializer(serializers.ModelSerializer):
+    
+    component_id = serializers.CharField(required=False)
     class Meta:
         model = Component
         fields = [
@@ -34,6 +37,18 @@ class ComponentSerializer(serializers.ModelSerializer):
             representation.pop('unit_price', None)
             representation.pop('total_value', None)
         return representation
+    
+    def create(self, validated_data):
+    # Generate Component ID automatically if not provided
+       if not validated_data.get("component_id"):
+        last_id = Component.objects.aggregate(
+            Max("id")
+        )["id__max"] or 0
+
+        validated_data["component_id"] = f"CMP{last_id + 1:04d}"
+
+       return super().create(validated_data)
+    
     def validate_component_id(self, value):
         qs = Component.objects.filter(component_id=value)
 

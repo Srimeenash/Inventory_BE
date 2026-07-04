@@ -9,6 +9,7 @@ class InwardEntry(models.Model):
         ('PENDING', 'Pending'),
         ('PASS', 'Pass'),
         ('FAIL', 'Fail'),
+        ('COMPLETED', 'Completed'),
     ]
 
     code = models.CharField(max_length=100, unique=True)

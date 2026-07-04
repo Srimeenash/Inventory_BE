@@ -1,35 +1,29 @@
 from rest_framework import viewsets
-from .models import StockIn, StockOut, InventoryLedger
-from .serializers import StockInSerializer, StockOutSerializer, InventoryLedgerSerializer
-from rest_framework.views import APIView
+from rest_framework.decorators import action
 from rest_framework.response import Response
-from django.db.models import Sum
-from .models import InventoryLedger
+
+from .models import Inventory
+from .serializers import InventorySerializer
 
 
-class StockInViewSet(viewsets.ModelViewSet):
-    queryset = StockIn.objects.all().order_by('-received_date')
-    serializer_class = StockInSerializer
+class InventoryViewSet(viewsets.ModelViewSet):
+    queryset = Inventory.objects.all().order_by("-created_at")
+    serializer_class = InventorySerializer
 
+    @action(detail=False, methods=["get"], url_path="next-code")
+    def next_code(self, request):
+        last = Inventory.objects.order_by("-id").first()
 
-class StockOutViewSet(viewsets.ModelViewSet):
-    queryset = StockOut.objects.all().order_by('-issued_date')
-    serializer_class = StockOutSerializer
+        if last and last.inventory_code:
+            try:
+                last_no = int(last.inventory_code.replace("INV", ""))
+            except ValueError:
+                last_no = 0
+        else:
+            last_no = 0
 
+        next_code = f"INV{last_no + 1:05d}"
 
-
-class InventoryLedgerViewSet(viewsets.ModelViewSet):
-    queryset = InventoryLedger.objects.all().order_by('-created_at')
-    serializer_class = InventoryLedgerSerializer
-
-class InventoryBreakdownView(APIView):
-    def get(self, request):
-        # Aggregate stock quantities by category
-        data = (
-            InventoryLedger.objects
-            .values("category")
-            .annotate(value=Sum("quantity"))
-            .order_by("category")
-        )
-        formatted = [{"name": d["category"], "value": d["value"]} for d in data]
-        return Response(formatted)
+        return Response({
+            "inventory_code": next_code
+        })

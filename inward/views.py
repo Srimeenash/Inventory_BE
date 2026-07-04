@@ -24,18 +24,19 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
         passed_rows = serializer.validated_data.get('passedRows', [])
         failed_rows = serializer.validated_data.get('failedRows', [])
 
-        if failed_rows and not passed_rows:
-            inward_entry.qc_status = 'FAIL'
-        elif passed_rows and not failed_rows:
-            inward_entry.qc_status = 'PASS'
-        elif passed_rows and failed_rows:
-            inward_entry.qc_status = 'FAIL'
+        passed_rows = serializer.validated_data.get("passedRows", [])
+        failed_rows = serializer.validated_data.get("failedRows", [])
+
+        inspected_count = len(passed_rows) + len(failed_rows)
+
+        if inspected_count == inward_entry.quantity_received:
+            inward_entry.qc_status = "COMPLETED"
         else:
-            inward_entry.qc_status = 'PENDING'
+            inward_entry.qc_status = "PENDING"
 
         inward_entry.qc_passed_rows = passed_rows
         inward_entry.qc_failed_rows = failed_rows
-        inward_entry.qc_timestamp = serializer.validated_data.get('timestamp')
+        inward_entry.qc_timestamp = serializer.validated_data.get("timestamp")
         inward_entry.save()
         return Response(
             {
