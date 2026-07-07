@@ -5,7 +5,7 @@ from .serializers import ProjectSerializer
 
 
 class ProjectViewSet(viewsets.ModelViewSet):
-    queryset = Project.objects.prefetch_related('team').select_related('manager').all().order_by('-created_at')
+    queryset = Project.objects.prefetch_related('team').all().order_by('-created_at')
     serializer_class = ProjectSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['is_active', 'status', 'department']

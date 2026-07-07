@@ -3,6 +3,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from .models import InwardEntry
 from .serializers import InwardEntrySerializer
+from django.db.models import Q
 
 
 class InwardQCSerializer(serializers.Serializer):
@@ -12,8 +13,26 @@ class InwardQCSerializer(serializers.Serializer):
 
 
 class InwardEntryViewSet(viewsets.ModelViewSet):
-    queryset = InwardEntry.objects.all().order_by('-received_date')
     serializer_class = InwardEntrySerializer
+
+    def get_queryset(self):
+        return InwardEntry.objects.filter(
+            removed_from_inventory=False
+        ).order_by("-received_date")
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        instance.removed_from_inventory = True
+        instance.save()
+        def get_queryset(self):
+            return (
+            InwardEntry.objects.filter(
+                Q(removed_from_inventory=False) |
+                Q(removed_from_inventory__isnull=True)
+            )
+            .order_by("-received_date")
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=['post'], url_path='qc')
     def qc(self, request, pk=None):

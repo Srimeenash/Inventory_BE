@@ -5,8 +5,11 @@ from procurement.models import PurchaseRequest, PurchaseOrder
 from approvals.models import ApprovalRequest
 from bom.models import BOM
 
-from .serializers import DashboardSerializer
 
+from rest_framework import status
+from rest_framework.views import APIView
+from .models import ManualLowStock
+from .serializers import ManualLowStockSerializer
 
 class DashboardView(APIView):
 
@@ -51,3 +54,23 @@ class DashboardView(APIView):
 
         serializer = DashboardSerializer(data)
         return Response(serializer.data)
+
+from rest_framework import status
+from rest_framework.views import APIView
+from .models import ManualLowStock
+from .serializers import ManualLowStockSerializer
+
+
+class ManualLowStockView(APIView):
+
+    def get(self, request):
+        data = ManualLowStock.objects.all().order_by("-created_at")
+        serializer = ManualLowStockSerializer(data, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        serializer = ManualLowStockSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)

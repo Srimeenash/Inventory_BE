@@ -26,6 +26,9 @@ class InwardEntry(models.Model):
     remarks = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    issued = models.BooleanField(default=False)
+    removed_from_inventory = models.BooleanField(default=False)
+
 
     def __str__(self):
         return self.code

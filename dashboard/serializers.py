@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from .models import ManualLowStock
 
 
 class DashboardSerializer(serializers.Serializer):
@@ -16,3 +17,10 @@ class DashboardSerializer(serializers.Serializer):
 
     total_bom = serializers.IntegerField()
     active_bom = serializers.IntegerField()
+
+
+# ADD THIS BELOW
+class ManualLowStockSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ManualLowStock
+        fields = "__all__"

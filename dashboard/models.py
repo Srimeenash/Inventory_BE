@@ -16,3 +16,13 @@ class DashboardSnapshot(models.Model):
 
     def __str__(self):
         return f"Dashboard Snapshot {self.snapshot_date}"
+
+
+class ManualLowStock(models.Model):
+    component_name = models.CharField(max_length=255)
+    quantity = models.PositiveIntegerField()
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.component_name

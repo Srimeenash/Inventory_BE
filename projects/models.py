@@ -20,12 +20,10 @@ class Project(models.Model):
     budget = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     start_date = models.DateField(blank=True, null=True)
     end_date = models.DateField(blank=True, null=True)
-    manager = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.SET_NULL,
-        null=True,
+    manager = models.CharField(
+        max_length=150,
         blank=True,
-        related_name='managed_projects'
+        null=True
     )
     team = models.ManyToManyField(
         settings.AUTH_USER_MODEL,

@@ -31,16 +31,31 @@ class InventorySerializer(serializers.ModelSerializer):
             "received_date",
             "total_price",
 
-            "moved",
-            "employee_id",
-            "bom",
+            "issued",
 
             "created_at",
         ]
 
         read_only_fields = [
-            "inventory_code",
             "component_name",
             "category",
             "created_at",
         ]
+
+    def create(self, validated_data):
+        if not validated_data.get("inventory_code"):
+            validated_data["inventory_code"] = self._generate_next_inventory_code()
+        return super().create(validated_data)
+
+    @staticmethod
+    def _generate_next_inventory_code():
+        last = Inventory.objects.order_by("-id").first()
+        if last and last.inventory_code:
+            try:
+                last_no = int(last.inventory_code.replace("INV", ""))
+            except (ValueError, TypeError):
+                last_no = 0
+        else:
+            last_no = 0
+
+        return f"INV{last_no + 1:05d}"
