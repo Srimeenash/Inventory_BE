@@ -9,6 +9,7 @@ from .serializers import InventorySerializer
 class InventoryViewSet(viewsets.ModelViewSet):
     queryset = Inventory.objects.all().order_by("-created_at")
     serializer_class = InventorySerializer
+    pagination_class = None
 
     @action(detail=False, methods=["get"], url_path="next-code")
     def next_code(self, request):
