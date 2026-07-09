@@ -1,15 +1,15 @@
+from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.response import Response
+
 from components.models import Component
 from procurement.models import PurchaseRequest, PurchaseOrder
 from approvals.models import ApprovalRequest
 from bom.models import BOM
 
-
-from rest_framework import status
-from rest_framework.views import APIView
 from .models import ManualLowStock
-from .serializers import ManualLowStockSerializer
+from .serializers import DashboardSerializer, ManualLowStockSerializer
+
 
 class DashboardView(APIView):
 
@@ -23,9 +23,15 @@ class DashboardView(APIView):
             c.unit_price * c.stock_quantity for c in components
         )
 
-        low_stock_items = components.filter(
-            stock_quantity__lte=5
-        ).count()
+        manual_low_stock_items = ManualLowStock.objects.all().order_by('-created_at')
+        low_stock_items = manual_low_stock_items.count()
+        low_stock_items_list = [
+            {
+                "component_name": item.component_name,
+                "quantity": item.quantity,
+            }
+            for item in manual_low_stock_items
+        ]
 
         # PROCUREMENT
         pending_pr = PurchaseRequest.objects.filter(status='PENDING').count()
@@ -44,6 +50,7 @@ class DashboardView(APIView):
             "total_components": total_components,
             "total_stock_value": total_stock_value,
             "low_stock_items": low_stock_items,
+            "low_stock_list": low_stock_items_list,
             "pending_pr": pending_pr,
             "approved_pr": approved_pr,
             "pending_po": pending_po,
@@ -54,12 +61,6 @@ class DashboardView(APIView):
 
         serializer = DashboardSerializer(data)
         return Response(serializer.data)
-
-from rest_framework import status
-from rest_framework.views import APIView
-from .models import ManualLowStock
-from .serializers import ManualLowStockSerializer
-
 
 class ManualLowStockView(APIView):
 
@@ -74,3 +75,15 @@ class ManualLowStockView(APIView):
             serializer.save()
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ManualLowStockDetailView(APIView):
+
+    def delete(self, request, pk, format=None):
+        try:
+            item = ManualLowStock.objects.get(pk=pk)
+        except ManualLowStock.DoesNotExist:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        item.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)

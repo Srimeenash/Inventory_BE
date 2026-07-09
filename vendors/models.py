@@ -9,9 +9,19 @@ class Vendor(models.Model):
         blank=True,
         null=True
     )
-
-    phone = models.CharField(
+    vendor_id = models.CharField(
+        max_length=20,
+        editable=False,
+        blank=True,
+        null=True,
+    )
+    phone_number = models.CharField(
         max_length=30,
+        blank=True,
+        null=True
+    )
+    manager = models.CharField(
+        max_length=255,
         blank=True,
         null=True
     )
@@ -58,7 +68,21 @@ class Vendor(models.Model):
 
     def __str__(self):
         return self.name
+    def save(self, *args, **kwargs):
+        if not self.vendor_id:
+            last_vendor = Vendor.objects.order_by("-id").first()
 
+            if last_vendor and last_vendor.vendor_id:
+                try:
+                    last_number = int(last_vendor.vendor_id.split("_")[1])
+                except (IndexError, ValueError):
+                    last_number = 0
+            else:
+                last_number = 0
+
+            self.vendor_id = f"VEN_{last_number + 1:04d}"
+
+        super().save(*args, **kwargs)
 
 class VendorProduct(models.Model):
     vendor = models.ForeignKey(
@@ -83,6 +107,7 @@ class VendorProduct(models.Model):
 
     unit = models.CharField(
         max_length=50,
+        blank=True,
         default="pcs"
     )
 

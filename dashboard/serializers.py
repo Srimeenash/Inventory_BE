@@ -7,6 +7,7 @@ class DashboardSerializer(serializers.Serializer):
     total_stock_value = serializers.DecimalField(max_digits=20, decimal_places=2)
 
     low_stock_items = serializers.IntegerField()
+    low_stock_list = serializers.ListField(child=serializers.DictField(), required=False)
 
     pending_pr = serializers.IntegerField()
     approved_pr = serializers.IntegerField()
