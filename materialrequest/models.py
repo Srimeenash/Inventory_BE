@@ -1,7 +1,19 @@
 # models.py
+from datetime import datetime
+
 from django.db import models
 from components.models import Component
+
+
+def generate_material_request_id():
+    now = datetime.now()
+    date_part = now.strftime("%Y%m%d")
+    time_part = now.strftime("%H%M%S")
+    return f"MR-{date_part}-{time_part}"
+
+
 class MaterialRequest(models.Model):
+    material_request_id = models.CharField(max_length=50, unique=True, blank=True, null=True)
     requester_name = models.CharField(max_length=100)
     
     date = models.DateField()
@@ -44,8 +56,19 @@ class MaterialRequest(models.Model):
     )
     
 
+    def save(self, *args, **kwargs):
+        if not self.material_request_id:
+            base_id = generate_material_request_id()
+            candidate = base_id
+            suffix = 1
+            while MaterialRequest.objects.filter(material_request_id=candidate).exists():
+                candidate = f"{base_id}-{suffix}"
+                suffix += 1
+            self.material_request_id = candidate
+        super().save(*args, **kwargs)
+
     def __str__(self):
-        return f"{self.project} - {self.requester_name}"
+        return self.material_request_id or f"{self.project} - {self.requester_name}"
 
      
 class BOMItem(models.Model):
