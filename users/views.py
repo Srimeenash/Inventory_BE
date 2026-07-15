@@ -6,8 +6,6 @@ from .models import User
 from .serializers import UserSerializer, EmailTokenSerializer
 
 
-
-
 class RegisterView(APIView):
     def get(self, request):
         # Return all registered users
@@ -28,8 +26,7 @@ class RegisterView(APIView):
 
 class LoginView(APIView):
     def get(self, request):
-        # Return all active users (those who can log in)
-        users = User.objects.filter(is_active=True)
+        users = User.objects.all().order_by("-created_at")
         serializer = UserSerializer(users, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -50,3 +47,37 @@ class LoginView(APIView):
                 }
             }, status=status.HTTP_200_OK)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class UserDetailView(APIView):
+    def get_object(self, pk):
+        try:
+            return User.objects.get(pk=pk)
+        except User.DoesNotExist:
+            return None
+
+    def get(self, request, pk):
+        user = self.get_object(pk)
+        if user is None:
+            return Response({"detail": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+        serializer = UserSerializer(user)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def patch(self, request, pk):
+        user = self.get_object(pk)
+        if user is None:
+            return Response({"detail": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = UserSerializer(user, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(UserSerializer(user).data, status=status.HTTP_200_OK)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def delete(self, request, pk):
+        user = self.get_object(pk)
+        if user is None:
+            return Response({"detail": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        user.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)

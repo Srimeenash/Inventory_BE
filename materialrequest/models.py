@@ -49,12 +49,16 @@ class MaterialRequest(models.Model):
         choices=[
             ("NOT_REQUESTED", "Not Requested"),
             ("REQUESTED", "Requested"),
+            ("MANAGER_APPROVED", "Manager Approved"),
             ("APPROVED", "Approved"),
             ("REJECTED", "Rejected"),
         ],
         default="NOT_REQUESTED"
     )
     
+    rejection_reason = models.TextField(blank=True, null=True, help_text="Reason for rejection")
+    
+    rejected_by = models.CharField(max_length=100, blank=True, null=True, help_text="Role or user who rejected")
 
     def save(self, *args, **kwargs):
         if not self.material_request_id:

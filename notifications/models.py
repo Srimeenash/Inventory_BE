@@ -10,6 +10,7 @@ class Notification(models.Model):
 
     STATUS_CHOICES = [
         ("PENDING", "Pending"),
+        ("MANAGER_APPROVED", "Manager Approved"),
         ("APPROVED", "Approved"),
         ("REJECTED", "Rejected"),
         ("DELIVERED", "Delivered"),

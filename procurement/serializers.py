@@ -68,7 +68,7 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
     total = serializers.SerializerMethodField()
 
     approval_status = serializers.ChoiceField(
-        choices=["NOT_REQUESTED", "REQUESTED", "APPROVED", "REJECTED"],
+        choices=["NOT_REQUESTED", "REQUESTED", "MANAGER_APPROVED", "APPROVED", "REJECTED"],
         required=False
     )
 
@@ -91,6 +91,8 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
             "qty",
             "unit_price",
             "total",
+            "rejection_reason",
+            "rejected_by",
         ]
 
     # ---------------- BASIC FIELDS ----------------

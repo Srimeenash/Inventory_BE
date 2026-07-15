@@ -95,6 +95,7 @@ class PurchaseOrder(models.Model):
     choices=[
         ("NOT_REQUESTED", "Not Requested"),
         ("REQUESTED", "Requested"),
+        ("MANAGER_APPROVED", "Manager Approved"),
         ("APPROVED", "Approved"),
         ("REJECTED", "Rejected"),
     ],
@@ -114,6 +115,10 @@ class PurchaseOrder(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="PENDING")
 
     created_at = models.DateTimeField(auto_now_add=True)
+    
+    rejection_reason = models.TextField(blank=True, null=True, help_text="Reason for rejection")
+    
+    rejected_by = models.CharField(max_length=100, blank=True, null=True, help_text="Role or user who rejected")
 
     @property
     def total_quantity(self):

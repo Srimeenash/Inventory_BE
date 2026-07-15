@@ -8,6 +8,14 @@ class OutwardEntry(models.Model):
         ('SALES', 'Sales'),
         ('EVENT', 'Event'),
     ]
+    
+    APPROVAL_STATUS_CHOICES = [
+        ('NOT_REQUESTED', 'Not Requested'),
+        ('REQUESTED', 'Requested'),
+        ('MANAGER_APPROVED', 'Manager Approved'),
+        ('APPROVED', 'Approved'),
+        ('REJECTED', 'Rejected'),
+    ]
 
     code = models.CharField(max_length=100, unique=True)
     outward_type = models.CharField(max_length=20, choices=OUTWARD_TYPE_CHOICES, default='SCRAP')
@@ -26,7 +34,10 @@ class OutwardEntry(models.Model):
     event_components = models.TextField(blank=True, null=True)
     is_returned = models.BooleanField(default=False)
     remarks = models.TextField(blank=True, null=True)
-    status = models.CharField(max_length=50, blank=True, null=True)
+    status = models.CharField(max_length=50, blank=True, null=True, default='NEW')
+    approval_status = models.CharField(max_length=30, choices=APPROVAL_STATUS_CHOICES, default='NOT_REQUESTED')
+    rejection_reason = models.TextField(blank=True, null=True)
+    rejected_by = models.CharField(max_length=50, blank=True, null=True)
     component = models.ForeignKey(Component, on_delete=models.PROTECT, blank=True, null=True, related_name='outward_entries')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

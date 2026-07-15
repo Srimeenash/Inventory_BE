@@ -56,13 +56,21 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
         return value
 
     def validate_approval_status(self, value):
-        allowed = ["NOT_REQUESTED", "REQUESTED", "APPROVED", "REJECTED"]
+        allowed = ["NOT_REQUESTED", "REQUESTED", "MANAGER_APPROVED", "APPROVED", "REJECTED"]
         if value not in allowed:
             raise serializers.ValidationError("Invalid approval_status")
         return value
 
     def update(self, instance, validated_data):
         approval_status = validated_data.get("approval_status")
+        rejection_reason = validated_data.get("rejection_reason")
+        rejected_by = validated_data.get("rejected_by")
+
+        if rejection_reason:
+            instance.rejection_reason = rejection_reason
+
+        if rejected_by:
+            instance.rejected_by = rejected_by
 
         if approval_status:
             instance.approval_status = approval_status
@@ -71,7 +79,7 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
                 instance.status = "APPROVED"
             elif approval_status == "REJECTED":
                 instance.status = "REJECTED"
-            elif approval_status == "REQUESTED":
+            elif approval_status == "REQUESTED" or approval_status == "MANAGER_APPROVED":
                 instance.status = "PENDING"
 
         instance.save()
