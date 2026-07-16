@@ -1,7 +1,7 @@
 from rest_framework import viewsets
 from .models import MaterialRequest
 from .serializers import MaterialRequestSerializer
-from notifications.models import Notification   # ✅ ADD THIS
+from notifications.models import Notification
 
 class MaterialRequestViewSet(viewsets.ModelViewSet):
     queryset = MaterialRequest.objects.all().order_by("-date")
@@ -21,3 +21,5 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
                 reference_module="MR",
                 reference_id=instance.id
             )
+
+            

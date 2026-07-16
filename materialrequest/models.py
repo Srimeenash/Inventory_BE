@@ -23,6 +23,7 @@ class MaterialRequest(models.Model):
     blank=True,
     null=True
 )
+    customized_bom = models.BooleanField(default=False)
     request_type = models.CharField(
         max_length=10,
         choices=[

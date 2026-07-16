@@ -3,6 +3,8 @@ from .models import MaterialRequest, BOMItem, RDItem
 
 
 class BOMItemSerializer(serializers.ModelSerializer):
+    material_request = serializers.PrimaryKeyRelatedField(read_only=True)
+
     class Meta:
         model = BOMItem
         fields = "__all__"
@@ -25,6 +27,11 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
     bom_items = BOMItemSerializer(many=True, required=False)
     rd_items = RDItemSerializer(many=True, required=False)
 
+    def validate(self, attrs):
+        if attrs.get("request_type") == "BOM" and not attrs.get("bom"):
+            raise serializers.ValidationError({"bom": ["Please select a BOM."]})
+        return attrs
+
     class Meta:
         model = MaterialRequest
         fields = "__all__"
@@ -33,18 +40,34 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
         bom_items = validated_data.pop("bom_items", [])
         rd_items = validated_data.pop("rd_items", [])
 
+        if validated_data.get("request_type") != "BOM":
+            validated_data["bom"] = ""
+
         material_request = MaterialRequest.objects.create(**validated_data)
 
         for item in bom_items:
             BOMItem.objects.create(
                 material_request=material_request,
-                **item
+                specification=item.get("specification", "N/A"),
+                unit=item.get("unit", "pc"),
+                quantity=item.get("quantity", 1),
+                vendor=item.get("vendor", "N/A"),
             )
 
         for item in rd_items:
             RDItem.objects.create(
                 material_request=material_request,
-                **item
+                component=item.get("component"),
+                category=item.get("category", ""),
+                specifications=item.get("specifications", ""),
+                quantity=item.get("quantity", 1),
+                unit_price=item.get("unit_price", 0),
+                unit=item.get("unit", "pc"),
+                price=item.get("price", 0),
+                tax=item.get("tax", 0),
+                total_price=item.get("total_price", 0),
+                vendor=item.get("vendor", "N/A"),
+                remarks=item.get("remarks", ""),
             )
 
         return material_request
