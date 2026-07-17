@@ -20,6 +20,26 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             removed_from_inventory=False
         ).order_by("-received_date")
 
+    @action(detail=False, methods=["get"], url_path="next-code")
+    def next_code(self, request):
+        last = InwardEntry.objects.order_by("-id").first()
+
+        if last and last.code:
+            try:
+                import re
+                match = re.search(r'\d+', last.code)
+                last_no = int(match.group()) if match else 0
+            except ValueError:
+                last_no = 0
+        else:
+            last_no = 0
+
+        next_code = f"INW-{last_no + 1:03d}"
+
+        return Response({
+            "inward_code": next_code
+        })
+
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
         instance.removed_from_inventory = True
