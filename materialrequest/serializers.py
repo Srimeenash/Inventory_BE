@@ -46,13 +46,19 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
         material_request = MaterialRequest.objects.create(**validated_data)
 
         for item in bom_items:
-            BOMItem.objects.create(
-                material_request=material_request,
-                specification=item.get("specification", "N/A"),
-                unit=item.get("unit", "pc"),
-                quantity=item.get("quantity", 1),
-                vendor=item.get("vendor", "N/A"),
-            )
+         BOMItem.objects.create(
+        material_request=material_request,
+        component_id=item.get("component_code"),
+        category=item.get("category", ""),
+        specification=item.get("specification", ""),
+        quantity=item.get("quantity", 1),
+        unit=item.get("unit", "pc"),
+        unit_price=item.get("unit_price", 0),
+        price=item.get("price", 0),
+        tax=item.get("tax", 0),
+        vendor=item.get("vendor", "N/A"),
+        remarks=item.get("remarks", ""),
+    )
 
         for item in rd_items:
             RDItem.objects.create(

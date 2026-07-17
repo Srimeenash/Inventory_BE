@@ -78,6 +78,59 @@ class MaterialRequest(models.Model):
      
 class BOMItem(models.Model):
     material_request = models.ForeignKey(
+        MaterialRequest,
+        related_name="bom_items",
+        on_delete=models.CASCADE
+    )
+
+    component = models.ForeignKey(
+    Component,
+    on_delete=models.CASCADE,
+    null=True,
+    blank=True,
+    related_name="material_request_bom_items",
+)
+
+    category = models.CharField(max_length=100, blank=True, null=True)
+
+    specification = models.TextField(blank=True, null=True)
+
+    quantity = models.PositiveIntegerField(default=1)
+
+    unit = models.CharField(max_length=20, default="pc")
+
+    unit_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0
+    )
+
+    price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0
+    )
+
+    tax = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=0
+    )
+
+    vendor = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True
+    )
+
+    remarks = models.TextField(
+        blank=True,
+        null=True
+    )
+
+    def __str__(self):
+        return f"{self.component} ({self.quantity})"
+    material_request = models.ForeignKey(
         MaterialRequest, related_name="bom_items", on_delete=models.CASCADE
     )
     specification = models.CharField(max_length=200)

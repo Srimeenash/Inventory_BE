@@ -4,6 +4,13 @@ from .models import BOMItem
 
 # BOMItem serializer – exclude 'bom' so frontend doesn’t need to send it
 class BOMItemSerializer(serializers.ModelSerializer):
+    component_name = serializers.CharField(
+        source="component.name",
+        read_only=True
+    )
+    class Meta:
+        model = BOMItem
+        fields = "__all__"
     bom = serializers.PrimaryKeyRelatedField(
         queryset=BOM.objects.all(),
         required=False,

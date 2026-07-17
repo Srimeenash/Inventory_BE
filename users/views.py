@@ -31,6 +31,46 @@ class LoginView(APIView):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     def post(self, request):
+        email = request.data.get("email", "").strip()
+        password = request.data.get("password", "")
+
+        # Check if email exists
+        try:
+            User.objects.get(email=email)
+        except User.DoesNotExist:
+            return Response(
+                {"detail": "No account found with this email address."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        serializer = EmailTokenSerializer(data=request.data)
+
+        if serializer.is_valid():
+            user = serializer.validated_data["user"]
+            refresh = RefreshToken.for_user(user)
+
+            return Response({
+                "access": str(refresh.access_token),
+                "refresh": str(refresh),
+                "user": {
+                    "id": user.id,
+                    "name": user.employee_name,
+                    "email": user.email,
+                    "role": user.role,
+                    "is_active": user.is_active,
+                }
+            }, status=status.HTTP_200_OK)
+
+        return Response(
+            {"detail": "Incorrect password."},
+            status=status.HTTP_401_UNAUTHORIZED,
+        )
+    def get(self, request):
+        users = User.objects.all().order_by("-created_at")
+        serializer = UserSerializer(users, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def post(self, request):
         serializer = EmailTokenSerializer(data=request.data)
         if serializer.is_valid():
             user = serializer.validated_data["user"]

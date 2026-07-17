@@ -54,13 +54,30 @@ class EmailTokenSerializer(serializers.Serializer):
         try:
             user = User.objects.get(email=email)
         except User.DoesNotExist:
-            raise serializers.ValidationError("Invalid email or password")
+            raise serializers.ValidationError({
+                "detail": "No account found with this email address."
+            })
+
+    def validate(self, data):
+        email = data.get("email")
+        password = data.get("password")
+
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            raise serializers.ValidationError({
+                "detail": "No account found with this email address."
+            })
 
         if not user.check_password(password):
-            raise serializers.ValidationError("Invalid email or password")
+            raise serializers.ValidationError({
+                "detail": "Incorrect password."
+            })
 
         if not user.is_active:
-            raise serializers.ValidationError("User is inactive")
+            raise serializers.ValidationError({
+                "detail": "User is inactive."
+            })
 
         data["user"] = user
-        return data       
+        return data
