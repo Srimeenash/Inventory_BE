@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from components.models import Component
 from .models import PurchaseOrder, PurchaseOrderItem, PurchaseRequest, PurchaseRequestItem
-
+from notifications.models import Notification
 
 # ---------------- COMPONENT ----------------
 class ComponentMiniSerializer(serializers.ModelSerializer):
@@ -35,7 +35,14 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
     component = ComponentMiniSerializer(read_only=True)
     component_id = serializers.IntegerField(write_only=True)
 
-    gst_percentage = serializers.FloatField(required=False, allow_null=True)
+    gst_percentage = serializers.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        required=False,
+        allow_null=True,
+        min_value=0,
+        max_value=100,
+    )
 
     subtotal = serializers.ReadOnlyField()
     gst_amount = serializers.ReadOnlyField()
@@ -55,6 +62,12 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
             "total_cost",
         ]
 
+    def validate_gst_percentage(self, value):
+        if value is not None and (value < 0 or value > 100):
+            raise serializers.ValidationError(
+                "GST percentage must be between 0 and 100."
+            )
+        return value
 
 # ---------------- PURCHASE ORDER ----------------
 class PurchaseOrderSerializer(serializers.ModelSerializer):
@@ -68,8 +81,15 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
     total = serializers.SerializerMethodField()
 
     approval_status = serializers.ChoiceField(
-        choices=["NOT_REQUESTED", "REQUESTED", "MANAGER_APPROVED", "APPROVED", "REJECTED"],
-        required=False
+        choices=[
+            "NOT_REQUESTED",
+            "PENDING",
+            "REQUESTED",
+            "MANAGER_APPROVED",
+            "APPROVED",
+            "REJECTED",
+        ],
+        required=False,
     )
 
     latest_approval = serializers.SerializerMethodField()
@@ -144,7 +164,13 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
             approval_status=approval_status,
             expected_delivery_date=validated_data.get("expected_delivery_date"),
         )
-
+        Notification.objects.create(
+            category="PO",
+            title=f"Purchase Order {po.po_number}",
+            message="New Purchase Order requires Admin approval",
+            reference_id=str(po.id),
+            status="PENDING_ADMIN"
+        )
         for item in items_data:
             PurchaseOrderItem.objects.create(
                 purchase_order=po,

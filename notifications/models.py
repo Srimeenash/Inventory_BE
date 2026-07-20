@@ -10,10 +10,11 @@ class Notification(models.Model):
 
     STATUS_CHOICES = [
         ("PENDING", "Pending"),
+        ("PENDING_ADMIN", "Pending Admin"),
+        ("PENDING_MANAGER", "Pending Manager"),
         ("MANAGER_APPROVED", "Manager Approved"),
         ("APPROVED", "Approved"),
         ("REJECTED", "Rejected"),
-        ("DELIVERED", "Delivered"),
     ]
 
     category = models.CharField(

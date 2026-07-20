@@ -39,6 +39,7 @@ class MaterialRequest(models.Model):
         max_length=20,
         choices=[
             ("PENDING", "Pending"),
+            ("PO_RAISED", "PO Raised"),
             ("APPROVED", "Approved"),
             ("REJECTED", "Rejected"),
         ],
@@ -60,6 +61,8 @@ class MaterialRequest(models.Model):
     rejection_reason = models.TextField(blank=True, null=True, help_text="Reason for rejection")
     
     rejected_by = models.CharField(max_length=100, blank=True, null=True, help_text="Role or user who rejected")
+
+    po_raised = models.BooleanField(default=False, help_text="Marks whether procurement has raised a purchase order for this request")
 
     def save(self, *args, **kwargs):
         if not self.material_request_id:
@@ -84,19 +87,16 @@ class BOMItem(models.Model):
     )
 
     component = models.ForeignKey(
-    Component,
-    on_delete=models.CASCADE,
-    null=True,
-    blank=True,
-    related_name="material_request_bom_items",
-)
+        Component,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="material_request_bom_items",
+    )
 
     category = models.CharField(max_length=100, blank=True, null=True)
-
     specification = models.TextField(blank=True, null=True)
-
     quantity = models.PositiveIntegerField(default=1)
-
     unit = models.CharField(max_length=20, default="pc")
 
     unit_price = models.DecimalField(
@@ -117,6 +117,8 @@ class BOMItem(models.Model):
         default=0
     )
 
+    inventory_quantity = models.PositiveIntegerField(default=0)
+
     vendor = models.CharField(
         max_length=255,
         blank=True,
@@ -130,17 +132,6 @@ class BOMItem(models.Model):
 
     def __str__(self):
         return f"{self.component} ({self.quantity})"
-    material_request = models.ForeignKey(
-        MaterialRequest, related_name="bom_items", on_delete=models.CASCADE
-    )
-    specification = models.CharField(max_length=200)
-    unit = models.CharField(max_length=50)
-    quantity = models.PositiveIntegerField()
-    vendor = models.CharField(max_length=100)
-
-    def __str__(self):
-        return f"{self.specification} ({self.quantity} {self.unit})"
-
 
 class RDItem(models.Model):
     material_request = models.ForeignKey(
@@ -164,6 +155,7 @@ class RDItem(models.Model):
     price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     tax = models.DecimalField(max_digits=5, decimal_places=2, default=0)
     total_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    inventory_quantity = models.PositiveIntegerField(default=0)
     vendor = models.CharField(max_length=255, blank=True, null=True)
     remarks = models.TextField(blank=True, null=True)
 

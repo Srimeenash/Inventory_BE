@@ -84,6 +84,8 @@ class PurchaseOrder(models.Model):
     STATUS_CHOICES = [
         ("DRAFT", "Draft"),
         ("PENDING", "Pending"),
+        ("PENDING_ADMIN", "Pending Admin"),
+        ("PENDING_MANAGER", "Pending Manager"),
         ("APPROVED", "Approved"),
         ("ORDERED", "Ordered"),
         ("DELIVERED", "Delivered"),
@@ -94,6 +96,7 @@ class PurchaseOrder(models.Model):
     max_length=20,
     choices=[
         ("NOT_REQUESTED", "Not Requested"),
+        ("PENDING", "Pending"),          # ADD THIS
         ("REQUESTED", "Requested"),
         ("MANAGER_APPROVED", "Manager Approved"),
         ("APPROVED", "Approved"),

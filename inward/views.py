@@ -4,8 +4,8 @@ from rest_framework.response import Response
 from .models import InwardEntry
 from .serializers import InwardEntrySerializer
 from django.db.models import Q
-
-
+from inventory.models import Inventory
+from decimal import Decimal
 class InwardQCSerializer(serializers.Serializer):
     passedRows = serializers.ListField(child=serializers.DictField(), required=False)
     failedRows = serializers.ListField(child=serializers.DictField(), required=False)
@@ -77,6 +77,56 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
         inward_entry.qc_failed_rows = failed_rows
         inward_entry.qc_timestamp = serializer.validated_data.get("timestamp")
         inward_entry.save()
+
+        # ---------------- Inventory Update ----------------
+
+        passed_qty = inward_entry.quantity_received
+
+        if passed_qty > 0:
+
+            inventory = Inventory.objects.filter(
+                component=inward_entry.component
+            ).first()
+
+            line = inward_entry.line_items.first()
+
+            amount = Decimal("0.00")
+
+            if line and line.grand_total:
+                amount = line.grand_total
+
+            if inventory:
+                # Component already exists → Update quantity
+                inventory.quantity += passed_qty
+                inventory.total_price += amount
+                inventory.save()
+
+            else:
+                # Create new inventory record
+
+                last = Inventory.objects.order_by("-id").first()
+
+                if last and last.inventory_code:
+                    try:
+                        number = int(last.inventory_code.replace("INV", ""))
+                    except ValueError:
+                        number = 0
+                else:
+                    number = 0
+
+                Inventory.objects.create(
+                    inventory_code=f"INV{number + 1:05d}",
+                    component=inward_entry.component,
+                    category=inward_entry.component.category,
+                    vendor=inward_entry.vendor.name,
+                    purchase_order=inward_entry.purchase_order.po_number if inward_entry.purchase_order else "",
+                    quantity=passed_qty,
+                    received_date=inward_entry.received_date,
+                    total_price=amount,
+                )
+
+        # ---------------- End Inventory Update ----------------
+
         return Response(
             {
                 'id': inward_entry.id,

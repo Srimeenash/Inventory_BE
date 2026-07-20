@@ -5,15 +5,44 @@ from .models import MaterialRequest, BOMItem, RDItem
 class BOMItemSerializer(serializers.ModelSerializer):
     material_request = serializers.PrimaryKeyRelatedField(read_only=True)
 
+    component_code = serializers.CharField(
+        source="component.component_id",
+        read_only=True
+    )
+
+    component_name = serializers.CharField(
+        source="component.name",
+        read_only=True
+    )
+
     class Meta:
         model = BOMItem
-        fields = "__all__"
-
+        # Hide pricing fields for BOM items in API responses
+        exclude = (
+    "unit_price",
+    "price",
+    "tax",
+)
 
 class RDItemSerializer(serializers.ModelSerializer):
+    component_code = serializers.CharField(
+        source="component.component_id",
+        read_only=True
+    )
+
+    component_name = serializers.CharField(
+        source="component.name",
+        read_only=True
+    )
+
     class Meta:
         model = RDItem
-        exclude = ["material_request"]
+        # Exclude material_request and pricing-related fields
+        exclude = (
+    "unit_price",
+    "price",
+    "tax",
+)
 
 
 class MaterialRequestSerializer(serializers.ModelSerializer):
@@ -44,21 +73,23 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
             validated_data["bom"] = ""
 
         material_request = MaterialRequest.objects.create(**validated_data)
-
+        print("BOM ITEMS:", bom_items)
+        
         for item in bom_items:
-         BOMItem.objects.create(
-        material_request=material_request,
-        component_id=item.get("component_code"),
-        category=item.get("category", ""),
-        specification=item.get("specification", ""),
-        quantity=item.get("quantity", 1),
-        unit=item.get("unit", "pc"),
-        unit_price=item.get("unit_price", 0),
-        price=item.get("price", 0),
-        tax=item.get("tax", 0),
-        vendor=item.get("vendor", "N/A"),
-        remarks=item.get("remarks", ""),
-    )
+            BOMItem.objects.create(
+                material_request=material_request,
+                component=item.get("component"),
+                category=item.get("category", ""),
+                specification=item.get("specification", ""),
+                quantity=item.get("quantity", 1),
+                inventory_quantity=item.get("inventory_quantity", 0),
+                unit=item.get("unit", "pc"),
+                unit_price=item.get("unit_price", 0),
+                price=item.get("price", 0),
+                tax=item.get("tax", 0),
+                vendor=item.get("vendor", "N/A"),
+                remarks=item.get("remarks", ""),
+            )
 
         for item in rd_items:
             RDItem.objects.create(
@@ -67,6 +98,7 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
                 category=item.get("category", ""),
                 specifications=item.get("specifications", ""),
                 quantity=item.get("quantity", 1),
+                inventory_quantity=item.get("inventory_quantity", 0),
                 unit_price=item.get("unit_price", 0),
                 unit=item.get("unit", "pc"),
                 price=item.get("price", 0),
@@ -79,7 +111,12 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
         return material_request
 
     def validate_status(self, value):
-        allowed = ["PENDING", "APPROVED", "REJECTED"]
+        allowed = [
+        "PENDING",
+        "APPROVED",
+        "REJECTED",
+        "PO_RAISED",
+    ]
         if value not in allowed:
             raise serializers.ValidationError("Invalid status")
         return value
@@ -94,12 +131,24 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
         approval_status = validated_data.get("approval_status")
         rejection_reason = validated_data.get("rejection_reason")
         rejected_by = validated_data.get("rejected_by")
+        po_raised = validated_data.get("po_raised")
 
-        if rejection_reason:
+        status = validated_data.get("status")
+
+        if status:
+            instance.status = status
+
+        if rejection_reason is not None:
             instance.rejection_reason = rejection_reason
 
-        if rejected_by:
+        if rejected_by is not None:
             instance.rejected_by = rejected_by
+
+        if po_raised is not None:
+            instance.po_raised = po_raised
+
+            if po_raised:
+                instance.status = "PO_RAISED"
 
         if approval_status:
             instance.approval_status = approval_status
