@@ -29,9 +29,6 @@ class BOMItem(models.Model):
     vendor = models.CharField(max_length=255, blank=True, null=True)
     remarks = models.TextField(blank=True, null=True)
 
-    @property
-    def total_cost(self):
-        return self.quantity * self.price
 
     def __str__(self):
         return self.component_code or (self.component.name if self.component else "Component")

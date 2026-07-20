@@ -25,6 +25,10 @@ class BOMItemSerializer(serializers.ModelSerializer):
 )
 
 class RDItemSerializer(serializers.ModelSerializer):
+    material_request = serializers.PrimaryKeyRelatedField(
+        read_only=True
+    )
+
     component_code = serializers.CharField(
         source="component.component_id",
         read_only=True
@@ -37,12 +41,11 @@ class RDItemSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = RDItem
-        # Exclude material_request and pricing-related fields
         exclude = (
-    "unit_price",
-    "price",
-    "tax",
-)
+            "unit_price",
+            "price",
+            "tax",
+        )
 
 
 class MaterialRequestSerializer(serializers.ModelSerializer):

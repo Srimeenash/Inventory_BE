@@ -3,13 +3,14 @@ from django.db import models
 
 class Component(models.Model):
     CATEGORY_CHOICES = [
-        ('ACCESSORIES', 'Accessories'),
-        ('AIRFRAMES', 'Airframes'),
-        ('COMMUNICATION', 'Communication'),
-        ('ELECTRICALS', 'Electricals'),
-        ('PAYLOAD', 'Payload'),
-        ('TOOLS', 'Tools'),
-    ]
+    ("ACCESSORIES", "Accessories"),
+    ("AIRFRAMES", "Airframes"),
+    ("COMMUNICATION", "Communication"),
+    ("ELECTRICALS", "Electricals"),
+    ("ELECTRONICS", "Electronics"),
+    ("PAYLOAD", "Payload"),
+    ("TOOLS", "Tools"),
+]
 
     component_id = models.CharField(max_length=100, unique=True)
     name = models.CharField(max_length=255)
