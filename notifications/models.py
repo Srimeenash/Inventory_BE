@@ -6,9 +6,11 @@ class Notification(models.Model):
         ("PO", "Purchase Order"),
         ("MR", "Material Request"),
         ("CU", "Component Usage"),
+        ("PROC", "Procurement"),
     ]
 
     STATUS_CHOICES = [
+        ("REQUESTED", "Requested"),
         ("PENDING", "Pending"),
         ("PENDING_ADMIN", "Pending Admin"),
         ("PENDING_MANAGER", "Pending Manager"),

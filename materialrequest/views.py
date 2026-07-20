@@ -3,6 +3,7 @@ from .models import MaterialRequest
 from .serializers import MaterialRequestSerializer
 from notifications.models import Notification
 
+
 class MaterialRequestViewSet(viewsets.ModelViewSet):
     queryset = MaterialRequest.objects.all().order_by("-date")
     serializer_class = MaterialRequestSerializer
@@ -11,23 +12,33 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         instance = serializer.save()
 
-        if self.request.user and self.request.user.is_authenticated and instance.approval_status == "REQUESTED":
-            shortage_items = []
-            for item in instance.bom_items.all():
-                if item.quantity > item.inventory_quantity:
-                    shortage_items.append(item.component.component_id if item.component else item.component_id or str(item.id))
-            for item in instance.rd_items.all():
-                if item.quantity > item.inventory_quantity:
-                    shortage_items.append(item.component.component_id if item.component else str(item.id))
+        shortage_items = []
 
-            details = " and ".join(shortage_items) if shortage_items else "components"
+        # BOM Items
+        for item in instance.bom_items.all():
+            if item.quantity > item.inventory_quantity:
+                shortage_items.append(
+                    item.component.component_id if item.component else str(item.id)
+                )
+
+        # R&D Items
+        for item in instance.rd_items.all():
+            if item.quantity > item.inventory_quantity:
+                shortage_items.append(
+                    item.component.component_id if item.component else str(item.id)
+                )
+
+        # Notify Procurement only if shortage exists
+        if shortage_items:
             Notification.objects.create(
-                category="MR",
-                title=f"MR {instance.material_request_id} requires procurement review",
-                message=f"Material request {instance.material_request_id} contains shortage items: {details}.",
+                category="PO",
+                title=f"Procurement Required - {instance.material_request_id}",
+                message=(
+                    f"Inventory is insufficient for "
+                    f"{', '.join(shortage_items)}. "
+                    "Please raise a Purchase Order."
+                ),
                 reference_id=str(instance.id),
                 status="PENDING",
                 is_read=False,
             )
-
-            

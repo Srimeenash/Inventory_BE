@@ -93,17 +93,18 @@ class PurchaseOrder(models.Model):
     ]
 
     approval_status = models.CharField(
-    max_length=20,
-    choices=[
-        ("NOT_REQUESTED", "Not Requested"),
-        ("PENDING", "Pending"),          # ADD THIS
-        ("REQUESTED", "Requested"),
-        ("MANAGER_APPROVED", "Manager Approved"),
-        ("APPROVED", "Approved"),
-        ("REJECTED", "Rejected"),
-    ],
-    default="NOT_REQUESTED"
-)
+        max_length=30,
+        choices=[
+            ("NOT_REQUESTED", "Not Requested"),
+            ("PENDING", "Pending"),
+            ("PENDING_ADMIN", "Pending Admin"),
+            ("PENDING_MANAGER", "Pending Manager"),
+            ("MANAGER_APPROVED", "Manager Approved"),
+            ("APPROVED", "Approved"),
+            ("REJECTED", "Rejected"),
+        ],
+        default="NOT_REQUESTED",
+    )
     po_number = models.CharField(max_length=50, unique=True)
 
     vendor_name = models.CharField(max_length=255)
@@ -190,6 +191,9 @@ class PurchaseOrderItem(models.Model):
 class PurchaseOrderApproval(models.Model):
     ACTION_CHOICES = [
         ("REQUESTED", "Requested"),
+        ("PENDING_ADMIN", "Pending Admin"),
+        ("PENDING_MANAGER", "Pending Manager"),
+        ("MANAGER_APPROVED", "Manager Approved"),
         ("APPROVED", "Approved"),
         ("REJECTED", "Rejected"),
     ]

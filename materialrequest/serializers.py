@@ -1,6 +1,8 @@
 from rest_framework import serializers
 from .models import MaterialRequest, BOMItem, RDItem
-
+from inventory.models import Inventory
+from notifications.models import Notification
+from django.db.models import Sum
 
 class BOMItemSerializer(serializers.ModelSerializer):
     material_request = serializers.PrimaryKeyRelatedField(read_only=True)
@@ -76,8 +78,11 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
             validated_data["bom"] = ""
 
         material_request = MaterialRequest.objects.create(**validated_data)
-        print("BOM ITEMS:", bom_items)
-        
+        print("========== BOM ITEMS ==========")
+        for item in bom_items:
+            print(item)
+            print("CATEGORY:", item.get("category"))
+            print("CATEGORY LENGTH:", len(str(item.get("category", ""))))
         for item in bom_items:
             BOMItem.objects.create(
                 material_request=material_request,
@@ -125,7 +130,15 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
         return value
 
     def validate_approval_status(self, value):
-        allowed = ["NOT_REQUESTED", "REQUESTED", "MANAGER_APPROVED", "APPROVED", "REJECTED"]
+        allowed = [
+            "PENDING",
+            "REQUESTED",
+            "MANAGER_APPROVED",
+            "MANAGER_REJECTED",
+            "ADMIN_APPROVED",
+            "ADMIN_REJECTED",
+            "PO_RAISED",
+        ]
         if value not in allowed:
             raise serializers.ValidationError("Invalid approval_status")
         return value
@@ -156,12 +169,69 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
         if approval_status:
             instance.approval_status = approval_status
 
-            if approval_status == "APPROVED":
-                instance.status = "APPROVED"
-            elif approval_status == "REJECTED":
-                instance.status = "REJECTED"
-            elif approval_status == "REQUESTED" or approval_status == "MANAGER_APPROVED":
+            if approval_status == "REQUESTED":
                 instance.status = "PENDING"
+
+                from notifications.models import Notification
+
+                shortage_items = []
+
+                # Check BOM items
+                for item in instance.bom_items.all():
+                    if item.quantity > item.inventory_quantity:
+                        shortage_items.append(
+                            item.component.component_id if item.component else str(item.id)
+                        )
+
+                # Check RD items
+                for item in instance.rd_items.all():
+                    if item.quantity > item.inventory_quantity:
+                        shortage_items.append(
+                            item.component.component_id if item.component else str(item.id)
+                        )
+
+                # ---------- Inventory Not Enough ----------
+                if shortage_items:
+                    Notification.objects.create(
+                        category="PO",
+                        title="Procurement Required",
+                        message=(
+                            f"Component quantity is insufficient for "
+                            f"{', '.join(shortage_items)}. "
+                            f"Please raise a Purchase Order for "
+                            f"{instance.material_request_id}."
+                        ),
+                        reference_id=str(instance.id),
+                        status="PENDING",
+                        is_read=False,
+                    )
+
+                # ---------- Inventory Available ----------
+                else:
+                    Notification.objects.create(
+                        category="MR",
+                        title="Material Request Approval",
+                        message=(
+                            f"Material Request "
+                            f"{instance.material_request_id} "
+                            f"is waiting for Admin approval."
+                        ),
+                        reference_id=str(instance.id),
+                        status="PENDING_ADMIN",
+                        is_read=False,
+                    )
+
+            elif approval_status == "MANAGER_APPROVED":
+                instance.status = "PENDING"
+
+            elif approval_status == "ADMIN_APPROVED":
+                instance.status = "APPROVED"
+
+            elif approval_status in ["MANAGER_REJECTED", "ADMIN_REJECTED"]:
+                instance.status = "REJECTED"
+
+            elif approval_status == "PO_RAISED":
+                instance.status = "PO_RAISED"
 
         instance.save()
         return instance

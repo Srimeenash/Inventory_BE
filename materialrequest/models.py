@@ -39,23 +39,25 @@ class MaterialRequest(models.Model):
         max_length=20,
         choices=[
             ("PENDING", "Pending"),
-            ("PO_RAISED", "PO Raised"),
             ("APPROVED", "Approved"),
             ("REJECTED", "Rejected"),
+            ("PO_RAISED", "PO Raised"),
         ],
-        default="PENDING"
+        default="PENDING",
     )
 
     approval_status = models.CharField(
-        max_length=20,
+        max_length=30,
         choices=[
-            ("NOT_REQUESTED", "Not Requested"),
+            ("PENDING", "Pending"),
             ("REQUESTED", "Requested"),
             ("MANAGER_APPROVED", "Manager Approved"),
-            ("APPROVED", "Approved"),
-            ("REJECTED", "Rejected"),
+            ("MANAGER_REJECTED", "Manager Rejected"),
+            ("ADMIN_APPROVED", "Admin Approved"),
+            ("ADMIN_REJECTED", "Admin Rejected"),
+            ("PO_RAISED", "PO Raised"),
         ],
-        default="NOT_REQUESTED"
+        default="PENDING",
     )
     
     rejection_reason = models.TextField(blank=True, null=True, help_text="Reason for rejection")

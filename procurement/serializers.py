@@ -84,7 +84,8 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
         choices=[
             "NOT_REQUESTED",
             "PENDING",
-            "REQUESTED",
+            "PENDING_ADMIN",
+            "PENDING_MANAGER",
             "MANAGER_APPROVED",
             "APPROVED",
             "REJECTED",
@@ -164,13 +165,7 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
             approval_status=approval_status,
             expected_delivery_date=validated_data.get("expected_delivery_date"),
         )
-        Notification.objects.create(
-            category="PO",
-            title=f"Purchase Order {po.po_number}",
-            message="New Purchase Order requires Admin approval",
-            reference_id=str(po.id),
-            status="PENDING_ADMIN"
-        )
+
         for item in items_data:
             PurchaseOrderItem.objects.create(
                 purchase_order=po,
@@ -198,8 +193,24 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
 
-        instance.save()
+        status = validated_data.get("status")
 
+        if status == "PENDING_ADMIN":
+            instance.approval_status = "PENDING"
+
+        elif status == "PENDING_MANAGER":
+            instance.approval_status = "PENDING"
+
+        elif status == "MANAGER_APPROVED":
+            instance.approval_status = "MANAGER_APPROVED"
+
+        elif status == "APPROVED":
+            instance.approval_status = "APPROVED"
+
+        elif status == "REJECTED":
+            instance.approval_status = "REJECTED"
+
+        instance.save()
         # 3. UPSERT ITEMS (THIS FIXES DUPLICATION)
         for item_data in items_data:
             item_id = item_data.get("id")
