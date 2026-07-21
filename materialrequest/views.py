@@ -10,35 +10,82 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
     pagination_class = None
 
     def perform_create(self, serializer):
-        instance = serializer.save()
+        mr = serializer.save()   # <-- Store the saved Material Request
 
-        shortage_items = []
+        Notification.objects.create(
+            category="MR",
+            title=f"MR Approval Request - {mr.material_request_id}",
+            message=f"Approval requested for MR {mr.material_request_id}",
+            reference_id=mr.id,
+            status="REQUESTED",
+            receiver="ADMIN",
+        )
+    def perform_update(self, serializer):
+        old = self.get_object()
 
-        # BOM Items
-        for item in instance.bom_items.all():
-            if item.quantity > item.inventory_quantity:
-                shortage_items.append(
-                    item.component.component_id if item.component else str(item.id)
+        old_status = old.status
+        old_approval = old.approval_status
+
+        mr = serializer.save()
+# When moved to Procurement
+# When moved to Procurement
+        if mr.status == "PO_RAISED":
+
+            # Delete ALL MR notifications for this Material Request
+            Notification.objects.filter(
+                category="MR",
+                reference_id=mr.id,
+            ).delete()
+
+            # Create Procurement notification only once
+            if not Notification.objects.filter(
+                category="PROC",
+                reference_id=mr.id,
+                receiver="PROCUREMENT",
+            ).exists():
+
+                Notification.objects.create(
+                    category="PROC",
+                    title=f"New Procurement Request - {mr.material_request_id}",
+                    message=f"{mr.material_request_id} has been moved to Procurement.",
+                    reference_id=mr.id,
+                    status="REQUESTED",
+                    receiver="PROCUREMENT",
                 )
-
-        # R&D Items
-        for item in instance.rd_items.all():
-            if item.quantity > item.inventory_quantity:
-                shortage_items.append(
-                    item.component.component_id if item.component else str(item.id)
-                )
-
-        # Notify Procurement only if shortage exists
-        if shortage_items:
+                # Admin approved -> send notification to Manager
+        if (
+            old_approval != "ADMIN_APPROVED"
+            and mr.approval_status == "ADMIN_APPROVED"
+        ):
             Notification.objects.create(
-                category="PO",
-                title=f"Procurement Required - {instance.material_request_id}",
-                message=(
-                    f"Inventory is insufficient for "
-                    f"{', '.join(shortage_items)}. "
-                    "Please raise a Purchase Order."
-                ),
-                reference_id=str(instance.id),
-                status="PENDING",
-                is_read=False,
+                category="MR",
+                title=f"MR Approval Request - {mr.material_request_id}",
+                message=f"Approval requested for MR {mr.material_request_id}",
+                reference_id=mr.id,
+                status="PENDING_MANAGER",
+                receiver="MANAGER",
+            )
+
+        # Manager approved -> update notification
+        if (
+            old_approval != "MANAGER_APPROVED"
+            and mr.approval_status == "MANAGER_APPROVED"
+        ):
+            Notification.objects.filter(
+                category="MR",
+                reference_id=mr.id,
+                receiver="MANAGER",
+            ).update(
+                status="APPROVED",
+                is_read=True,
+            )
+
+        # Rejected
+        if mr.status == "REJECTED":
+            Notification.objects.filter(
+                category="MR",
+                reference_id=mr.id,
+            ).update(
+                status="REJECTED",
+                is_read=True,
             )

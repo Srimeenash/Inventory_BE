@@ -27,10 +27,12 @@ class BOMItemSerializer(serializers.ModelSerializer):
             "remarks",
         ]
         extra_kwargs = {
-            "bom": {
-                "required": True
-            }
-        }
+    "bom": {
+        "required": False,
+        "read_only": True
+    }
+}
+        
         
 
 

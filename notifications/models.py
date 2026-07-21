@@ -18,6 +18,11 @@ class Notification(models.Model):
         ("APPROVED", "Approved"),
         ("REJECTED", "Rejected"),
     ]
+    ROLE_CHOICES = [
+        ("ADMIN", "Admin"),
+        ("PROCUREMENT", "Procurement"),
+        ("MANAGER", "Manager"),
+    ]
 
     category = models.CharField(
         max_length=10,
@@ -38,6 +43,12 @@ class Notification(models.Model):
         max_length=20,
         choices=STATUS_CHOICES,
         default="PENDING"
+    )
+    receiver = models.CharField(
+        max_length=20,
+        choices=ROLE_CHOICES,
+        blank=True,
+        null=True,
     )
 
     is_read = models.BooleanField(default=False)

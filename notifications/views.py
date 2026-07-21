@@ -9,8 +9,12 @@ class NotificationViewSet(viewsets.ModelViewSet):
         queryset = Notification.objects.all().order_by("-created_at")
 
         category = self.request.query_params.get("category")
+        receiver = self.request.query_params.get("receiver")
 
         if category:
             queryset = queryset.filter(category=category)
+
+        if receiver:
+            queryset = queryset.filter(receiver=receiver)
 
         return queryset

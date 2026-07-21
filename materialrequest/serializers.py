@@ -1,8 +1,7 @@
 from rest_framework import serializers
 from .models import MaterialRequest, BOMItem, RDItem
-from inventory.models import Inventory
-from notifications.models import Notification
-from django.db.models import Sum
+
+
 
 class BOMItemSerializer(serializers.ModelSerializer):
     material_request = serializers.PrimaryKeyRelatedField(read_only=True)
@@ -19,17 +18,15 @@ class BOMItemSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = BOMItem
-        # Hide pricing fields for BOM items in API responses
         exclude = (
-    "unit_price",
-    "price",
-    "tax",
-)
+            "unit_price",
+            "price",
+            "tax",
+        )
+
 
 class RDItemSerializer(serializers.ModelSerializer):
-    material_request = serializers.PrimaryKeyRelatedField(
-        read_only=True
-    )
+    material_request = serializers.PrimaryKeyRelatedField(read_only=True)
 
     component_code = serializers.CharField(
         source="component.component_id",
@@ -61,14 +58,16 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
     bom_items = BOMItemSerializer(many=True, required=False)
     rd_items = RDItemSerializer(many=True, required=False)
 
-    def validate(self, attrs):
-        if attrs.get("request_type") == "BOM" and not attrs.get("bom"):
-            raise serializers.ValidationError({"bom": ["Please select a BOM."]})
-        return attrs
-
     class Meta:
         model = MaterialRequest
         fields = "__all__"
+
+    def validate(self, attrs):
+        if attrs.get("request_type") == "BOM" and not attrs.get("bom"):
+            raise serializers.ValidationError(
+                {"bom": ["Please select a BOM."]}
+            )
+        return attrs
 
     def create(self, validated_data):
         bom_items = validated_data.pop("bom_items", [])
@@ -78,11 +77,7 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
             validated_data["bom"] = ""
 
         material_request = MaterialRequest.objects.create(**validated_data)
-        print("========== BOM ITEMS ==========")
-        for item in bom_items:
-            print(item)
-            print("CATEGORY:", item.get("category"))
-            print("CATEGORY LENGTH:", len(str(item.get("category", ""))))
+
         for item in bom_items:
             BOMItem.objects.create(
                 material_request=material_request,
@@ -107,8 +102,8 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
                 specifications=item.get("specifications", ""),
                 quantity=item.get("quantity", 1),
                 inventory_quantity=item.get("inventory_quantity", 0),
-                unit_price=item.get("unit_price", 0),
                 unit=item.get("unit", "pc"),
+                unit_price=item.get("unit_price", 0),
                 price=item.get("price", 0),
                 tax=item.get("tax", 0),
                 total_price=item.get("total_price", 0),
@@ -120,11 +115,14 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
 
     def validate_status(self, value):
         allowed = [
-        "PENDING",
-        "APPROVED",
-        "REJECTED",
-        "PO_RAISED",
-    ]
+            "PENDING",
+            "PENDING_MANAGER",
+            "APPROVED",
+            "ORDERED",
+            "ORDER_DELIVERED",
+            "REJECTED",
+            "PO_RAISED",
+        ]
         if value not in allowed:
             raise serializers.ValidationError("Invalid status")
         return value
@@ -133,10 +131,10 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
         allowed = [
             "PENDING",
             "REQUESTED",
-            "MANAGER_APPROVED",
-            "MANAGER_REJECTED",
             "ADMIN_APPROVED",
+            "MANAGER_APPROVED",
             "ADMIN_REJECTED",
+            "MANAGER_REJECTED",
             "PO_RAISED",
         ]
         if value not in allowed:
@@ -145,14 +143,14 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
 
     def update(self, instance, validated_data):
         approval_status = validated_data.get("approval_status")
+        status = validated_data.get("status")
         rejection_reason = validated_data.get("rejection_reason")
         rejected_by = validated_data.get("rejected_by")
         po_raised = validated_data.get("po_raised")
 
-        status = validated_data.get("status")
-
-        if status:
-            instance.status = status
+        # Update basic fields
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
 
         if rejection_reason is not None:
             instance.rejection_reason = rejection_reason
@@ -162,76 +160,31 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
 
         if po_raised is not None:
             instance.po_raised = po_raised
-
             if po_raised:
                 instance.status = "PO_RAISED"
 
+        # Handle approval workflow
         if approval_status:
             instance.approval_status = approval_status
 
             if approval_status == "REQUESTED":
                 instance.status = "PENDING"
 
-                from notifications.models import Notification
-
-                shortage_items = []
-
-                # Check BOM items
-                for item in instance.bom_items.all():
-                    if item.quantity > item.inventory_quantity:
-                        shortage_items.append(
-                            item.component.component_id if item.component else str(item.id)
-                        )
-
-                # Check RD items
-                for item in instance.rd_items.all():
-                    if item.quantity > item.inventory_quantity:
-                        shortage_items.append(
-                            item.component.component_id if item.component else str(item.id)
-                        )
-
-                # ---------- Inventory Not Enough ----------
-                if shortage_items:
-                    Notification.objects.create(
-                        category="PO",
-                        title="Procurement Required",
-                        message=(
-                            f"Component quantity is insufficient for "
-                            f"{', '.join(shortage_items)}. "
-                            f"Please raise a Purchase Order for "
-                            f"{instance.material_request_id}."
-                        ),
-                        reference_id=str(instance.id),
-                        status="PENDING",
-                        is_read=False,
-                    )
-
-                # ---------- Inventory Available ----------
-                else:
-                    Notification.objects.create(
-                        category="MR",
-                        title="Material Request Approval",
-                        message=(
-                            f"Material Request "
-                            f"{instance.material_request_id} "
-                            f"is waiting for Admin approval."
-                        ),
-                        reference_id=str(instance.id),
-                        status="PENDING_ADMIN",
-                        is_read=False,
-                    )
+            elif approval_status == "ADMIN_APPROVED":
+                instance.status = "PENDING_MANAGER"
 
             elif approval_status == "MANAGER_APPROVED":
-                instance.status = "PENDING"
-
-            elif approval_status == "ADMIN_APPROVED":
                 instance.status = "APPROVED"
 
-            elif approval_status in ["MANAGER_REJECTED", "ADMIN_REJECTED"]:
+            elif approval_status in ["ADMIN_REJECTED", "MANAGER_REJECTED"]:
                 instance.status = "REJECTED"
 
             elif approval_status == "PO_RAISED":
                 instance.status = "PO_RAISED"
+
+        # Allow explicit status updates if provided
+        if status:
+            instance.status = status
 
         instance.save()
         return instance

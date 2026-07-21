@@ -36,16 +36,18 @@ class MaterialRequest(models.Model):
     required_date = models.DateField()
     remarks = models.TextField(blank=True, null=True)
     status = models.CharField(
-        max_length=20,
+        max_length=30,
         choices=[
             ("PENDING", "Pending"),
+            ("PENDING_MANAGER", "Pending Manager"),
             ("APPROVED", "Approved"),
+            ("ORDERED", "Ordered"),
+            ("ORDER_DELIVERED", "Order Delivered"),
             ("REJECTED", "Rejected"),
             ("PO_RAISED", "PO Raised"),
         ],
         default="PENDING",
     )
-
     approval_status = models.CharField(
         max_length=30,
         choices=[
