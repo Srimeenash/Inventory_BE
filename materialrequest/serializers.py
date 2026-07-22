@@ -116,7 +116,9 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
     def validate_status(self, value):
         allowed = [
             "PENDING",
+            "REQUESTED",          # <-- ADD THIS
             "PENDING_MANAGER",
+            "MANAGER_APPROVED",   # <-- ADD THIS (if you're using it)
             "APPROVED",
             "ORDERED",
             "ORDER_DELIVERED",
@@ -129,14 +131,15 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
 
     def validate_approval_status(self, value):
         allowed = [
-            "PENDING",
-            "REQUESTED",
-            "ADMIN_APPROVED",
-            "MANAGER_APPROVED",
-            "ADMIN_REJECTED",
-            "MANAGER_REJECTED",
-            "PO_RAISED",
-        ]
+    "PENDING",
+    "REQUESTED",
+    "PENDING_MANAGER",
+    "ADMIN_APPROVED",
+    "MANAGER_APPROVED",
+    "ADMIN_REJECTED",
+    "MANAGER_REJECTED",
+    "PO_RAISED",
+]
         if value not in allowed:
             raise serializers.ValidationError("Invalid approval_status")
         return value
@@ -167,20 +170,20 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
         if approval_status:
             instance.approval_status = approval_status
 
-            if approval_status == "REQUESTED":
-                instance.status = "PENDING"
+        if approval_status == "REQUESTED":
+            instance.status = "REQUESTED"
 
-            elif approval_status == "ADMIN_APPROVED":
-                instance.status = "PENDING_MANAGER"
+        elif approval_status == "PENDING_MANAGER":
+            instance.status = "PENDING_MANAGER"
 
-            elif approval_status == "MANAGER_APPROVED":
-                instance.status = "APPROVED"
+        elif approval_status == "MANAGER_APPROVED":
+            instance.status = "MANAGER_APPROVED"
 
-            elif approval_status in ["ADMIN_REJECTED", "MANAGER_REJECTED"]:
-                instance.status = "REJECTED"
+        elif approval_status == "MANAGER_REJECTED":
+            instance.status = "REJECTED"
 
-            elif approval_status == "PO_RAISED":
-                instance.status = "PO_RAISED"
+        elif approval_status == "PO_RAISED":
+            instance.status = "PO_RAISED"
 
         # Allow explicit status updates if provided
         if status:

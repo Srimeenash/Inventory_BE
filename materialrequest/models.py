@@ -39,7 +39,9 @@ class MaterialRequest(models.Model):
         max_length=30,
         choices=[
             ("PENDING", "Pending"),
+            ("REQUESTED", "Requested"),      # <-- ADD
             ("PENDING_MANAGER", "Pending Manager"),
+            ("MANAGER_APPROVED", "Manager Approved"),  # <-- Optional, if used
             ("APPROVED", "Approved"),
             ("ORDERED", "Ordered"),
             ("ORDER_DELIVERED", "Order Delivered"),
@@ -53,10 +55,9 @@ class MaterialRequest(models.Model):
         choices=[
             ("PENDING", "Pending"),
             ("REQUESTED", "Requested"),
+            ("PENDING_MANAGER", "Pending Manager"),
             ("MANAGER_APPROVED", "Manager Approved"),
             ("MANAGER_REJECTED", "Manager Rejected"),
-            ("ADMIN_APPROVED", "Admin Approved"),
-            ("ADMIN_REJECTED", "Admin Rejected"),
             ("PO_RAISED", "PO Raised"),
         ],
         default="PENDING",

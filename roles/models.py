@@ -3,21 +3,23 @@ from django.db import models
 
 class Role(models.Model):
     ROLE_CHOICES = [
-        ('ADMIN', 'Admin'),
-        ('SUB_ADMIN', 'Sub Admin'),
+    ('ADMIN', 'Admin'),
+    ('SUB_ADMIN', 'Sub Admin'),
 
-        ('PROCUREMENT_MANAGER', 'Procurement Manager'),
-        ('PROCUREMENT_EXECUTIVE', 'Procurement Executive'),
+    ('MANAGER', 'Manager'),
 
-        ('INVENTORY_MANAGER', 'Inventory Manager'),
-        ('INVENTORY_EXECUTIVE', 'Inventory Executive'),
+    ('PROCUREMENT_MANAGER', 'Procurement Manager'),
+    ('PROCUREMENT_EXECUTIVE', 'Procurement Executive'),
 
-        ('ENGINEERING_MANAGER', 'Engineering Manager'),
-        ('ENGINEER', 'Engineer'),
+    ('INVENTORY_MANAGER', 'Inventory Manager'),
+    ('INVENTORY_EXECUTIVE', 'Inventory Executive'),
 
-        ('FINANCE_MANAGER', 'Finance Manager'),
-        ('FINANCE_EXECUTIVE', 'Finance Executive'),
-    ]
+    ('ENGINEERING_MANAGER', 'Engineering Manager'),
+    ('ENGINEER', 'Engineer'),
+
+    ('FINANCE_MANAGER', 'Finance Manager'),
+    ('FINANCE_EXECUTIVE', 'Finance Executive'),
+]
 
     module = models.CharField(
         max_length=50,
