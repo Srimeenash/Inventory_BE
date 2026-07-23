@@ -42,6 +42,7 @@ class MaterialRequest(models.Model):
             ("REQUESTED", "Requested"),      # <-- ADD
             ("PENDING_MANAGER", "Pending Manager"),
             ("MANAGER_APPROVED", "Manager Approved"),  # <-- Optional, if used
+            ("MANAGER_REJECTED", "Manager Rejected"),  # <-- Optional, if used
             ("APPROVED", "Approved"),
             ("ORDERED", "Ordered"),
             ("ORDER_DELIVERED", "Order Delivered"),

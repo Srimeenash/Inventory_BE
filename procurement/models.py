@@ -84,8 +84,9 @@ class PurchaseOrder(models.Model):
     STATUS_CHOICES = [
         ("DRAFT", "Draft"),
         ("PENDING", "Pending"),
-        ("PENDING_ADMIN", "Pending Admin"),
-        ("PENDING_MANAGER", "Pending Manager"),
+        ("PENDING_FINANCE", "Pending Finance"),
+        ("FINANCE_APPROVED", "Finance Approved"),
+        ("FINANCE_REJECTED", "Finance Rejected"),
         ("APPROVED", "Approved"),
         ("ORDERED", "Ordered"),
         ("DELIVERED", "Delivered"),
@@ -97,13 +98,11 @@ class PurchaseOrder(models.Model):
         choices=[
             ("NOT_REQUESTED", "Not Requested"),
             ("PENDING", "Pending"),
-            ("PENDING_ADMIN", "Pending Admin"),
-            ("PENDING_MANAGER", "Pending Manager"),
-            ("MANAGER_APPROVED", "Manager Approved"),
-            ("APPROVED", "Approved"),
-            ("REJECTED", "Rejected"),
+            ("PENDING_FINANCE", "Pending Finance"),
+            ("FINANCE_APPROVED", "Finance Approved"),
+            ("FINANCE_REJECTED", "Finance Rejected"),
         ],
-        default="NOT_REQUESTED",
+        default="PENDING",
     )
     po_number = models.CharField(max_length=50, unique=True)
 
@@ -115,15 +114,34 @@ class PurchaseOrder(models.Model):
     expected_delivery_date = models.DateField(null=True, blank=True)  # ✅ ADD THIS
 
     remarks = models.TextField(blank=True, null=True)
-
+    finance_remarks = models.TextField(
+        blank=True,
+        null=True,
+        help_text="Finance approval/rejection remarks"
+    )
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="PENDING")
+    rejection_reason = models.TextField(
+        blank=True,
+        null=True
+    )
 
+    rejected_by = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     
-    rejection_reason = models.TextField(blank=True, null=True, help_text="Reason for rejection")
-    
-    rejected_by = models.CharField(max_length=100, blank=True, null=True, help_text="Role or user who rejected")
+    approved_by = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True
+    )
 
+    approved_at = models.DateTimeField(
+        blank=True,
+        null=True
+    )
     @property
     def total_quantity(self):
         return sum(item.quantity for item in self.items.all())
@@ -189,13 +207,12 @@ class PurchaseOrderItem(models.Model):
         return self.subtotal + self.gst_amount
 
 class PurchaseOrderApproval(models.Model):
+
     ACTION_CHOICES = [
         ("REQUESTED", "Requested"),
-        ("PENDING_ADMIN", "Pending Admin"),
-        ("PENDING_MANAGER", "Pending Manager"),
-        ("MANAGER_APPROVED", "Manager Approved"),
-        ("APPROVED", "Approved"),
-        ("REJECTED", "Rejected"),
+        ("PENDING_FINANCE", "Pending Finance"),
+        ("FINANCE_APPROVED", "Finance Approved"),
+        ("FINANCE_REJECTED", "Finance Rejected"),
     ]
 
     purchase_order = models.ForeignKey(
@@ -205,13 +222,23 @@ class PurchaseOrderApproval(models.Model):
     )
 
     action = models.CharField(
-        max_length=20,
+        max_length=30,
         choices=ACTION_CHOICES,
         default="REQUESTED"
     )
 
     requested_by = models.CharField(max_length=100)
-    remarks = models.TextField(blank=True, null=True)
+
+    approved_by = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True
+    )
+
+    finance_remarks = models.TextField(
+        blank=True,
+        null=True
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
 

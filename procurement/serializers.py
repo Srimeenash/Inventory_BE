@@ -87,6 +87,9 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
             "PENDING_ADMIN",
             "PENDING_MANAGER",
             "MANAGER_APPROVED",
+            "PENDING_FINANCE",
+            "FINANCE_APPROVED",
+            "FINANCE_REJECTED",
             "APPROVED",
             "REJECTED",
         ],
@@ -194,21 +197,39 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
             setattr(instance, attr, value)
 
         status = validated_data.get("status")
+        approval_status = validated_data.get("approval_status")
 
-        if status == "PENDING_ADMIN":
-            instance.approval_status = "PENDING"
+        # Keep both fields in sync
 
-        elif status == "PENDING_MANAGER":
-            instance.approval_status = "PENDING"
+        if status == "PENDING_FINANCE":
+            instance.status = "PENDING_FINANCE"
+            instance.approval_status = "PENDING_FINANCE"
 
-        elif status == "MANAGER_APPROVED":
-            instance.approval_status = "MANAGER_APPROVED"
+        elif status == "FINANCE_APPROVED":
+            instance.status = "FINANCE_APPROVED"
+            instance.approval_status = "FINANCE_APPROVED"
+
+        elif status == "FINANCE_REJECTED":
+            instance.status = "FINANCE_REJECTED"
+            instance.approval_status = "FINANCE_REJECTED"
+
+        elif status == "ORDERED":
+            instance.status = "ORDERED"
+
+        elif status == "DELIVERED":
+            instance.status = "DELIVERED"
 
         elif status == "APPROVED":
+            instance.status = "APPROVED"
             instance.approval_status = "APPROVED"
 
         elif status == "REJECTED":
+            instance.status = "REJECTED"
             instance.approval_status = "REJECTED"
+
+        # If approval_status is sent directly
+        if approval_status:
+            instance.approval_status = approval_status
 
         instance.save()
         # 3. UPSERT ITEMS (THIS FIXES DUPLICATION)

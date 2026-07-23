@@ -85,13 +85,24 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
 # =============================================
 # Manager Approved
 # =============================================
+# =============================================
+# Manager Approved
+# =============================================
+
         if (
-            old_approval != "MANAGER_APPROVED"
-            and mr.approval_status == "MANAGER_APPROVED"
+            mr.status == "MANAGER_APPROVED"
+            or mr.approval_status == "MANAGER_APPROVED"
         ):
-            # Update MR status also
+
             mr.status = "MANAGER_APPROVED"
-            mr.save(update_fields=["status"])
+            mr.approval_status = "MANAGER_APPROVED"
+
+            mr.save(
+                update_fields=[
+                    "status",
+                    "approval_status"
+                ]
+            )
 
             Notification.objects.filter(
                 category="MR",
@@ -102,16 +113,52 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
                 is_read=True,
             )
 
+            Notification.objects.create(
+                category="MR",
+                title=f"MR Approved - {mr.material_request_id}",
+                message=f"{mr.material_request_id} approved by manager and ready for inventory.",
+                reference_id=mr.id,
+                status="MANAGER_APPROVED",
+                receiver="INVENTORY",
+                is_read=False,
+            )
+
         # =============================================
         # Rejected
         # =============================================
-        if mr.status == "REJECTED":
+        # =============================================
+        # Manager Rejected
+        # =============================================
+        # =============================================
+        # Manager Rejected
+        # =============================================
+# =============================================
+# Manager Rejected
+# =============================================
+        if (
+            mr.status == "MANAGER_REJECTED"
+            or mr.approval_status == "MANAGER_REJECTED"
+            or mr.status == "REJECTED"
+            or mr.approval_status == "REJECTED"
+        ):
 
+            mr.status = "MANAGER_REJECTED"
+            mr.approval_status = "MANAGER_REJECTED"
+
+            mr.save(
+                update_fields=[
+                    "status",
+                    "approval_status"
+                ]
+            )
+
+
+            # Update manager notification
             Notification.objects.filter(
                 category="MR",
                 reference_id=mr.id,
+                receiver="MANAGER",
             ).update(
-                status="REJECTED",
+                status="MANAGER_REJECTED",
                 is_read=True,
             )
-

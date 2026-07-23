@@ -116,9 +116,10 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
     def validate_status(self, value):
         allowed = [
             "PENDING",
-            "REQUESTED",          # <-- ADD THIS
+            "REQUESTED",
             "PENDING_MANAGER",
-            "MANAGER_APPROVED",   # <-- ADD THIS (if you're using it)
+            "MANAGER_APPROVED",
+            "MANAGER_REJECTED",
             "APPROVED",
             "ORDERED",
             "ORDER_DELIVERED",
@@ -180,7 +181,7 @@ class MaterialRequestSerializer(serializers.ModelSerializer):
             instance.status = "MANAGER_APPROVED"
 
         elif approval_status == "MANAGER_REJECTED":
-            instance.status = "REJECTED"
+            instance.status = "MANAGER_REJECTED"
 
         elif approval_status == "PO_RAISED":
             instance.status = "PO_RAISED"
