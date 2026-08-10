@@ -25,7 +25,20 @@ class Vendor(models.Model):
         blank=True,
         null=True
     )
+    payment_terms = models.TextField(
+        blank=True,
+        null=True,
+    )
 
+    shipping_terms = models.TextField(
+        blank=True,
+        null=True,
+    )
+
+    additional_notes = models.TextField(
+        blank=True,
+        null=True,
+    )
     email = models.EmailField(
         blank=True,
         null=True

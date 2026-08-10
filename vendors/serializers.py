@@ -25,10 +25,11 @@ class VendorProductSerializer(serializers.ModelSerializer):
 
 
 class VendorSerializer(serializers.ModelSerializer):
-    products = VendorProductSerializer(many=True)
+    products = VendorProductSerializer(
+        many=True,
+        required=False,
+    )
 
-    class Meta:
-        model = Vendor
     class Meta:
         model = Vendor
         fields = [
@@ -37,17 +38,27 @@ class VendorSerializer(serializers.ModelSerializer):
             "name",
             "contact_person",
             "phone_number",
+            "manager",
             "email",
             "gst_number",
             "pan_number",
             "address",
+            "payment_terms",
+            "shipping_terms",
+            "additional_notes",
             "rating",
             "is_active",
             "products",
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+
+        read_only_fields = [
+            "id",
+            "vendor_id",
+            "created_at",
+            "updated_at",
+        ]
 
     def create(self, validated_data):
         products_data = validated_data.pop("products", [])

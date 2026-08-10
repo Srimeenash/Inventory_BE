@@ -24,12 +24,16 @@ class VendorViewSet(viewsets.ModelViewSet):
     filterset_fields = ["is_active"]
 
     search_fields = [
+        "vendor_id",
         "name",
         "gst_number",
         "pan_number",
         "contact_person",
         "email",
-        "phone",
+        "phone_number",
+        "payment_terms",
+        "shipping_terms",
+        "additional_notes",
     ]
 
     ordering_fields = [

@@ -89,6 +89,7 @@ class PurchaseOrder(models.Model):
         ("FINANCE_REJECTED", "Finance Rejected"),
         ("APPROVED", "Approved"),
         ("ORDERED", "Ordered"),
+        ("PARTIALLY_DELIVERED", "Partially Delivered"),
         ("DELIVERED", "Delivered"),
         ("REJECTED", "Rejected"),
     ]
@@ -124,7 +125,12 @@ class PurchaseOrder(models.Model):
         blank=True,
         null=True
     )
-
+    source_mr_number = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+        help_text="Material Request number when this PO was created from an MR",
+    )
     rejected_by = models.CharField(
         max_length=100,
         blank=True,
@@ -172,32 +178,60 @@ class PurchaseOrderItem(models.Model):
     purchase_order = models.ForeignKey(
         PurchaseOrder,
         on_delete=models.CASCADE,
-        related_name="items"
+        related_name="items",
     )
 
-    component = models.ForeignKey(Component, on_delete=models.CASCADE)
+    component = models.ForeignKey(
+        Component,
+        on_delete=models.CASCADE,
+    )
 
     quantity = models.PositiveIntegerField()
-    unit_price = models.DecimalField(max_digits=12, decimal_places=2)
+
+    received_quantity = models.PositiveIntegerField(
+        default=0,
+        help_text="Total quantity received through inward entries",
+    )
+
+    unit_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+    )
 
     gst_percentage = models.DecimalField(
-    max_digits=5,
-    decimal_places=2,
-    null=True,
-    blank=True
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
     )
 
     @property
+    def remaining_quantity(self):
+        return max(
+            self.quantity - self.received_quantity,
+            0,
+        )
+
+    @property
+    def is_fully_received(self):
+        return self.received_quantity >= self.quantity
+
+    @property
     def subtotal(self):
-        return Decimal(self.quantity) * (self.unit_price or Decimal("0"))
+        return (
+            Decimal(self.quantity) *
+            (self.unit_price or Decimal("0"))
+        )
 
     @property
     def gst_amount(self):
         if self.gst_percentage is None:
             return None
 
-        return (self.subtotal * self.gst_percentage) / Decimal("100")
-
+        return (
+            self.subtotal *
+            self.gst_percentage
+        ) / Decimal("100")
 
     @property
     def total_cost(self):
@@ -205,7 +239,6 @@ class PurchaseOrderItem(models.Model):
             return None
 
         return self.subtotal + self.gst_amount
-
 class PurchaseOrderApproval(models.Model):
 
     ACTION_CHOICES = [

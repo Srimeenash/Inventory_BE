@@ -1,6 +1,15 @@
-from rest_framework import serializers
 from decimal import Decimal
 
+from django.db import transaction
+from rest_framework import serializers
+
+from components.models import Component
+from .models import (
+    PurchaseOrder,
+    PurchaseOrderItem,
+    PurchaseRequest,
+    PurchaseRequestItem,
+)
 from components.models import Component
 from .models import PurchaseOrder, PurchaseOrderItem, PurchaseRequest, PurchaseRequestItem
 from notifications.models import Notification
@@ -33,7 +42,20 @@ class PurchaseRequestSerializer(serializers.ModelSerializer):
 # ---------------- PURCHASE ORDER ITEM ----------------
 class PurchaseOrderItemSerializer(serializers.ModelSerializer):
     component = ComponentMiniSerializer(read_only=True)
-    component_id = serializers.IntegerField(write_only=True)
+
+    component_id = serializers.PrimaryKeyRelatedField(
+        source="component",
+        queryset=Component.objects.all(),
+        write_only=True,
+    )
+
+    received_quantity = serializers.IntegerField(
+        read_only=True
+    )
+
+    remaining_quantity = serializers.IntegerField(
+        read_only=True
+    )
 
     gst_percentage = serializers.DecimalField(
         max_digits=5,
@@ -50,11 +72,14 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = PurchaseOrderItem
+
         fields = [
             "id",
             "component",
             "component_id",
             "quantity",
+            "received_quantity",
+            "remaining_quantity",
             "unit_price",
             "gst_percentage",
             "subtotal",
@@ -62,87 +87,159 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
             "total_cost",
         ]
 
+        read_only_fields = [
+            "id",
+            "received_quantity",
+            "remaining_quantity",
+            "subtotal",
+            "gst_amount",
+            "total_cost",
+        ]
+
     def validate_gst_percentage(self, value):
-        if value is not None and (value < 0 or value > 100):
+        if value is not None and not 0 <= value <= 100:
             raise serializers.ValidationError(
                 "GST percentage must be between 0 and 100."
             )
+
         return value
+
 
 # ---------------- PURCHASE ORDER ----------------
 class PurchaseOrderSerializer(serializers.ModelSerializer):
-    items = PurchaseOrderItemSerializer(many=True, required=False)
+    items = PurchaseOrderItemSerializer(
+        many=True,
+        required=False,
+    )
+
+    deleted_items = serializers.ListField(
+        child=serializers.IntegerField(),
+        write_only=True,
+        required=False,
+    )
 
     po_date = serializers.SerializerMethodField()
-    expected_delivery_date = serializers.DateField(required=False, allow_null=True)
-
     qty = serializers.SerializerMethodField()
     unit_price = serializers.SerializerMethodField()
     total = serializers.SerializerMethodField()
 
-    approval_status = serializers.ChoiceField(
-        choices=[
-            "NOT_REQUESTED",
-            "PENDING",
-            "PENDING_ADMIN",
-            "PENDING_MANAGER",
-            "MANAGER_APPROVED",
-            "PENDING_FINANCE",
-            "FINANCE_APPROVED",
-            "FINANCE_REJECTED",
-            "APPROVED",
-            "REJECTED",
-        ],
-        required=False,
+    total_received_quantity = (
+        serializers.SerializerMethodField()
     )
 
-    latest_approval = serializers.SerializerMethodField()
+    total_remaining_quantity = (
+        serializers.SerializerMethodField()
+    )
+
+    latest_approval = (
+        serializers.SerializerMethodField()
+    )
 
     class Meta:
         model = PurchaseOrder
+
         fields = [
             "id",
             "po_number",
             "vendor_name",
             "gstin",
             "location",
+            "ordered_date",
             "po_date",
             "expected_delivery_date",
+            "remarks",
+            "finance_remarks",
             "status",
             "approval_status",
             "latest_approval",
+            "source_mr_number",
             "items",
+            "deleted_items",
             "qty",
             "unit_price",
             "total",
+            "total_received_quantity",
+            "total_remaining_quantity",
             "rejection_reason",
             "rejected_by",
+            "approved_by",
+            "approved_at",
+            "created_at",
         ]
 
-    # ---------------- BASIC FIELDS ----------------
+        read_only_fields = [
+            "id",
+            "po_date",
+            "qty",
+            "unit_price",
+            "total",
+            "total_received_quantity",
+            "total_remaining_quantity",
+            "latest_approval",
+            "created_at",
+        ]
+
+    # --------------------------------------------------
+    # Calculated fields
+    # --------------------------------------------------
     def get_po_date(self, obj):
-        return obj.created_at.date().isoformat()
+        if obj.ordered_date:
+            return obj.ordered_date.isoformat()
+
+        if obj.created_at:
+            return obj.created_at.date().isoformat()
+
+        return None
 
     def get_qty(self, obj):
-        return sum(i.quantity for i in obj.items.all())
+        return sum(
+            item.quantity
+            for item in obj.items.all()
+        )
 
     def get_unit_price(self, obj):
-        items = obj.items.all()
+        items = list(obj.items.all())
+
         if not items:
-            return 0
-        return sum(i.unit_price for i in items) / len(items)
+            return Decimal("0")
+
+        total_price = sum(
+            (
+                item.unit_price or Decimal("0")
+                for item in items
+            ),
+            Decimal("0"),
+        )
+
+        return total_price / len(items)
 
     def get_total(self, obj):
-        totals = [
-            item.total_cost
-            for item in obj.items.all()
-            if item.total_cost is not None
-        ]
-        return sum(totals, Decimal("0"))
+        return sum(
+            (
+                item.total_cost or Decimal("0")
+                for item in obj.items.all()
+            ),
+            Decimal("0"),
+        )
 
-    # ---------------- APPROVAL ----------------
+    def get_total_received_quantity(self, obj):
+        return sum(
+            item.received_quantity
+            for item in obj.items.all()
+        )
+
+    def get_total_remaining_quantity(self, obj):
+        return sum(
+            item.remaining_quantity
+            for item in obj.items.all()
+        )
+
     def get_latest_approval(self, obj):
-        latest = obj.approvals.order_by("-created_at").first()
+        latest = (
+            obj.approvals
+            .order_by("-created_at")
+            .first()
+        )
 
         if not latest:
             return None
@@ -151,123 +248,156 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
             "id": latest.id,
             "action": latest.action,
             "requested_by": latest.requested_by,
+            "approved_by": latest.approved_by,
+            "finance_remarks": latest.finance_remarks,
             "created_at": latest.created_at,
         }
 
-    # ---------------- CREATE ----------------
+    # --------------------------------------------------
+    # Create Purchase Order
+    # --------------------------------------------------
+    @transaction.atomic
     def create(self, validated_data):
-        items_data = validated_data.pop("items", [])
-        approval_status = validated_data.get("approval_status", "NOT_REQUESTED")
-
-        po = PurchaseOrder.objects.create(
-            po_number=validated_data.get("po_number"),
-            vendor_name=validated_data.get("vendor_name"),
-            gstin=validated_data.get("gstin", ""),
-            location=validated_data.get("location", ""),
-            status=validated_data.get("status", "PENDING"),
-            approval_status=approval_status,
-            expected_delivery_date=validated_data.get("expected_delivery_date"),
+        items_data = validated_data.pop(
+            "items",
+            [],
         )
 
-        for item in items_data:
+        validated_data.pop(
+            "deleted_items",
+            None,
+        )
+
+        if not validated_data.get(
+            "approval_status"
+        ):
+            validated_data[
+                "approval_status"
+            ] = "NOT_REQUESTED"
+
+        purchase_order = (
+            PurchaseOrder.objects.create(
+                **validated_data
+            )
+        )
+
+        for item_data in items_data:
             PurchaseOrderItem.objects.create(
-                purchase_order=po,
-                component_id=item["component_id"],
-                quantity=item["quantity"],
-                unit_price=item["unit_price"],
-                gst_percentage=item.get("gst_percentage"),
+                purchase_order=purchase_order,
+                **item_data,
             )
 
-        return po
+        return purchase_order
 
-    # ---------------- UPDATE (FIXED - NO DUPLICATES) ----------------
-    def update(self, instance, validated_data):
-        items_data = validated_data.pop("items", [])
-        deleted_items = validated_data.pop("deleted_items", [])
+    # --------------------------------------------------
+    # Update Purchase Order
+    # --------------------------------------------------
+    @transaction.atomic
+    def update(
+        self,
+        instance,
+        validated_data,
+    ):
+        items_data = validated_data.pop(
+            "items",
+            None,
+        )
 
-        # 1. DELETE removed items
+        deleted_items = validated_data.pop(
+            "deleted_items",
+            [],
+        )
+
         if deleted_items:
             PurchaseOrderItem.objects.filter(
                 id__in=deleted_items,
-                purchase_order=instance
+                purchase_order=instance,
             ).delete()
 
-        # 2. UPDATE PO fields
-        for attr, value in validated_data.items():
-            setattr(instance, attr, value)
-
-        status = validated_data.get("status")
-        approval_status = validated_data.get("approval_status")
-
-        # Keep both fields in sync
-
-        if status == "PENDING_FINANCE":
-            instance.status = "PENDING_FINANCE"
-            instance.approval_status = "PENDING_FINANCE"
-
-        elif status == "FINANCE_APPROVED":
-            instance.status = "FINANCE_APPROVED"
-            instance.approval_status = "FINANCE_APPROVED"
-
-        elif status == "FINANCE_REJECTED":
-            instance.status = "FINANCE_REJECTED"
-            instance.approval_status = "FINANCE_REJECTED"
-
-        elif status == "ORDERED":
-            instance.status = "ORDERED"
-
-        elif status == "DELIVERED":
-            instance.status = "DELIVERED"
-
-        elif status == "APPROVED":
-            instance.status = "APPROVED"
-            instance.approval_status = "APPROVED"
-
-        elif status == "REJECTED":
-            instance.status = "REJECTED"
-            instance.approval_status = "REJECTED"
-
-        # If approval_status is sent directly
-        if approval_status:
-            instance.approval_status = approval_status
+        for attribute, value in (
+            validated_data.items()
+        ):
+            setattr(
+                instance,
+                attribute,
+                value,
+            )
 
         instance.save()
-        # 3. UPSERT ITEMS (THIS FIXES DUPLICATION)
-        for item_data in items_data:
-            item_id = item_data.get("id")
-            component_id = item_data.get("component_id")
 
-            # 👉 IMPORTANT FIX: prevent duplicate component rows
+        # Do not modify PO items during a normal
+        # status-only PATCH request.
+        if items_data is None:
+            return instance
+
+        for item_data in items_data:
+            item_id = item_data.pop(
+                "id",
+                None,
+            )
+
+            component = item_data.get(
+                "component"
+            )
+
             existing_item = None
 
             if item_id:
-                existing_item = PurchaseOrderItem.objects.filter(
-                    id=item_id,
-                    purchase_order=instance
-                ).first()
+                existing_item = (
+                    PurchaseOrderItem.objects
+                    .filter(
+                        id=item_id,
+                        purchase_order=instance,
+                    )
+                    .first()
+                )
 
-            # fallback: check by component (prevents duplicate Propellers issue)
-            if not existing_item:
-                existing_item = PurchaseOrderItem.objects.filter(
-                    purchase_order=instance,
-                    component_id=component_id
-                ).first()
+            if (
+                not existing_item and
+                component
+            ):
+                existing_item = (
+                    PurchaseOrderItem.objects
+                    .filter(
+                        purchase_order=instance,
+                        component=component,
+                    )
+                    .first()
+                )
 
             if existing_item:
-                # UPDATE existing row
-                existing_item.quantity = item_data["quantity"]
-                existing_item.unit_price = item_data["unit_price"]
-                existing_item.gst_percentage = item_data.get("gst_percentage")
-                existing_item.save()
+                existing_item.quantity = (
+                    item_data.get(
+                        "quantity",
+                        existing_item.quantity,
+                    )
+                )
 
+                existing_item.unit_price = (
+                    item_data.get(
+                        "unit_price",
+                        existing_item.unit_price,
+                    )
+                )
+
+                existing_item.gst_percentage = (
+                    item_data.get(
+                        "gst_percentage",
+                        existing_item.gst_percentage,
+                    )
+                )
+
+                existing_item.save(
+                    update_fields=[
+                        "quantity",
+                        "unit_price",
+                        "gst_percentage",
+                    ]
+                )
             else:
-                # CREATE new row
                 PurchaseOrderItem.objects.create(
                     purchase_order=instance,
-                    component_id=component_id,
-                    quantity=item_data["quantity"],
-                    unit_price=item_data["unit_price"],
-                    gst_percentage=item_data.get("gst_percentage"),
+                    **item_data,
                 )
 
         return instance

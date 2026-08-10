@@ -1,0 +1,82 @@
+SALES / EVENT DIRECT STOCK FLOW - INSTALL STEPS
+================================================
+
+FILES TO REPLACE
+----------------
+Frontend:
+1. Replace the active InventoryPage file with:
+   InventoryPage_Sales_Event_Component_Drone_Direct_Stock_FINAL.jsx
+
+Backend - outward app:
+2. Replace outward/models.py with:
+   outward_models_Sales_Event_Direct_Stock_FINAL.py
+3. Replace outward/serializers.py with:
+   outward_serializers_Sales_Event_Direct_Stock_FINAL.py
+4. Replace outward/views.py with:
+   outward_views_Sales_Event_Direct_Stock_FINAL.py
+5. Replace outward/urls.py with:
+   outward_urls_Sales_Event_Direct_Stock_FINAL.py
+
+Backend - components app:
+6. Replace components/views.py with:
+   components_views_Sales_Event_Dropdown_FINAL.py
+
+NO REPLACEMENT IS REQUIRED FOR:
+- inventory/models.py
+- inventory/serializers.py
+- inventory/views.py
+- inventory/urls.py
+
+BACKEND COMMANDS
+----------------
+Open PowerShell in the backend folder containing manage.py:
+
+python manage.py makemigrations outward
+python manage.py migrate
+python manage.py check
+python manage.py runserver
+
+FRONTEND COMMANDS
+-----------------
+Stop Vite with Ctrl+C, then run:
+
+Remove-Item -Recurse -Force .\node_modules\.vite -ErrorAction SilentlyContinue
+npm run dev
+
+Hard refresh the browser:
+Ctrl + Shift + R
+
+FINAL BUSINESS FLOW
+-------------------
+SALES + COMPONENT
+- Select Component.
+- Dropdown contains only free In-Store stock.
+- MR-reserved stock is excluded.
+- Save deducts quantity immediately.
+- Exact serials are deducted automatically using FIFO.
+- Sold stock is not restored.
+
+SALES + DRONE
+- Select Drone.
+- Type drone name.
+- Save creates the Sales record only.
+- No MR link and no component Inventory change.
+
+EVENT + COMPONENT
+- Select Component.
+- Save deducts quantity and exact serials temporarily.
+- In Event Return, checked rows mean Returned Good.
+- Returned Good quantity/serials are restored to In Store.
+- Unchecked rows require remarks and are not restored.
+
+EVENT + DRONE
+- Select Drone.
+- Type drone name.
+- Save creates the Event record only.
+- Return updates only the Event record.
+
+NO APPROVAL FLOW
+----------------
+- No manager approval.
+- New records use approval_status = NOT_REQUESTED.
+- Stock movement happens immediately when Sales/Event is saved.
