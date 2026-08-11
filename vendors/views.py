@@ -31,6 +31,13 @@ class VendorViewSet(viewsets.ModelViewSet):
         "contact_person",
         "email",
         "phone_number",
+
+        "address",
+        "city",
+        "state",
+        "state_code",
+        "pincode",
+
         "payment_terms",
         "shipping_terms",
         "additional_notes",

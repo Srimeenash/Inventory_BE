@@ -32,6 +32,7 @@ class VendorSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Vendor
+
         fields = [
             "id",
             "vendor_id",
@@ -42,7 +43,13 @@ class VendorSerializer(serializers.ModelSerializer):
             "email",
             "gst_number",
             "pan_number",
+
             "address",
+            "city",
+            "state",
+            "state_code",
+            "pincode",
+
             "payment_terms",
             "shipping_terms",
             "additional_notes",
@@ -61,9 +68,14 @@ class VendorSerializer(serializers.ModelSerializer):
         ]
 
     def create(self, validated_data):
-        products_data = validated_data.pop("products", [])
+        products_data = validated_data.pop(
+            "products",
+            [],
+        )
 
-        vendor = Vendor.objects.create(**validated_data)
+        vendor = Vendor.objects.create(
+            **validated_data
+        )
 
         for product in products_data:
             VendorProduct.objects.create(
@@ -73,8 +85,15 @@ class VendorSerializer(serializers.ModelSerializer):
 
         return vendor
 
-    def update(self, instance, validated_data):
-        products_data = validated_data.pop("products", None)
+    def update(
+        self,
+        instance,
+        validated_data
+    ):
+        products_data = validated_data.pop(
+            "products",
+            None
+        )
 
         for attr, value in validated_data.items():
             setattr(instance, attr, value)

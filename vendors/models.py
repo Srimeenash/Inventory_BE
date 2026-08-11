@@ -2,29 +2,36 @@ from django.db import models
 
 
 class Vendor(models.Model):
-    name = models.CharField(max_length=255, unique=True)
+    name = models.CharField(
+        max_length=255,
+        unique=True
+    )
 
     contact_person = models.CharField(
         max_length=255,
         blank=True,
         null=True
     )
+
     vendor_id = models.CharField(
         max_length=20,
         editable=False,
         blank=True,
         null=True,
     )
+
     phone_number = models.CharField(
         max_length=30,
         blank=True,
         null=True
     )
+
     manager = models.CharField(
         max_length=255,
         blank=True,
         null=True
     )
+
     payment_terms = models.TextField(
         blank=True,
         null=True,
@@ -39,6 +46,7 @@ class Vendor(models.Model):
         blank=True,
         null=True,
     )
+
     email = models.EmailField(
         blank=True,
         null=True
@@ -57,6 +65,34 @@ class Vendor(models.Model):
     )
 
     address = models.TextField(
+        blank=True,
+        null=True
+    )
+
+    # NEW
+    city = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True
+    )
+
+    # NEW
+    state = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True
+    )
+
+    # NEW
+    state_code = models.CharField(
+        max_length=10,
+        blank=True,
+        null=True
+    )
+
+    # NEW
+    pincode = models.CharField(
+        max_length=10,
         blank=True,
         null=True
     )
@@ -81,19 +117,24 @@ class Vendor(models.Model):
 
     def __str__(self):
         return self.name
+
     def save(self, *args, **kwargs):
         if not self.vendor_id:
             last_vendor = Vendor.objects.order_by("-id").first()
 
             if last_vendor and last_vendor.vendor_id:
                 try:
-                    last_number = int(last_vendor.vendor_id.split("_")[1])
+                    last_number = int(
+                        last_vendor.vendor_id.split("_")[1]
+                    )
                 except (IndexError, ValueError):
                     last_number = 0
             else:
                 last_number = 0
 
-            self.vendor_id = f"VEN_{last_number + 1:04d}"
+            self.vendor_id = (
+                f"VEN_{last_number + 1:04d}"
+            )
 
         super().save(*args, **kwargs)
 

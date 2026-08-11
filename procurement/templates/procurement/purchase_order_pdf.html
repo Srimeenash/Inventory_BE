@@ -1,0 +1,1114 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+
+    <style>
+
+        @page {
+            size: A4;
+            margin: 8mm 10mm;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: Arial, Helvetica, sans-serif;
+            font-size: 11px;
+            color: #000;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        td,
+        th {
+            border: 1px solid #000;
+            padding: 4px;
+            vertical-align: top;
+            font-size: 11px;
+        }
+
+        .title {
+            text-align: center;
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 8px;
+        }
+
+        .page-break {
+            page-break-after: always;
+        }
+
+        .section-label {
+            font-size: 11px;
+            margin-bottom: 3px;
+        }
+
+        .company-name,
+        .vendor-name {
+            font-size: 11px;
+            font-weight: bold;
+            margin-bottom: 3px;
+        }
+
+        .left-column {
+            width: 50%;
+        }
+
+        .right-column {
+            width: 50%;
+            padding: 0;
+        }
+
+        .party-box {
+            min-height: 105px;
+        }
+
+        .supplier-box {
+            min-height: 130px;
+        }
+
+        .info-table td {
+            width: 50%;
+            height: 40px;
+        }
+
+        .info-label {
+            font-size: 11px;
+        }
+
+        .info-value {
+            margin-top: 3px;
+            font-size: 11px;
+            font-weight: bold;
+        }
+
+        .items-table th {
+            text-align: center;
+            font-size: 11px;
+            font-weight: normal;
+        }
+
+        .sl {
+            width: 5%;
+            text-align: center;
+        }
+
+        .description {
+            width: 40%;
+        }
+
+        .due {
+            width: 12%;
+            text-align: center;
+        }
+
+        .qty {
+            width: 10%;
+            text-align: right;
+        }
+
+        .rate {
+            width: 12%;
+            text-align: right;
+        }
+
+        .per {
+            width: 8%;
+            text-align: center;
+        }
+
+        .amount {
+            width: 13%;
+            text-align: right;
+        }
+
+        .item-name {
+            font-size: 11px;
+            font-weight: bold;
+        }
+
+        .item-spec {
+            font-size: 11px;
+            font-style: italic;
+            margin-left: 10px;
+            margin-top: 3px;
+        }
+
+        .money {
+            text-align: right;
+        }
+
+        .tax-label {
+            text-align: right;
+            font-weight: bold;
+            font-style: italic;
+        }
+
+        .total-label {
+            text-align: right;
+        }
+
+        .grand-total {
+            text-align: right;
+            font-size: 13px;
+            font-weight: bold;
+        }
+
+        .continued-box {
+            height: 210px;
+            text-align: right;
+            vertical-align: top;
+            padding-top: 45px;
+            padding-right: 35px;
+            font-style: italic;
+        }
+
+        .words-box {
+            height: 150px;
+        }
+
+        .amount-words {
+            margin-top: 7px;
+            font-weight: bold;
+        }
+
+        .eoe {
+            float: right;
+            font-style: italic;
+        }
+
+.signature-box {
+    width: 50%;
+    height: 75px;
+    text-align: right;
+    vertical-align: bottom;
+}
+
+.signature-company {
+    font-weight: bold;
+    margin-bottom: 22px;
+}
+
+.footer {
+    text-align: center;
+    margin-top: 7px;
+    font-size: 11px;
+}
+
+    </style>
+</head>
+
+<body>
+
+
+<!-- =====================================================
+     PAGE 1
+===================================================== -->
+
+<div class="title">
+    PURCHASE ORDER
+</div>
+
+
+<!-- ================= HEADER PAGE 1 ================= -->
+
+<table>
+    <tr>
+
+        <td class="left-column">
+
+            <div class="party-box">
+
+                <div class="section-label">
+                    Invoice To
+                </div>
+
+                <div class="company-name">
+                    {{ company.name }}
+                </div>
+
+                <div>{{ company.address_line_1 }}</div>
+                <div>{{ company.address_line_2 }}</div>
+                <div>{{ company.city }}</div>
+
+                <div>
+                    GSTIN/UIN: {{ company.gstin }}
+                </div>
+
+                <div>
+                    State Name : {{ company.state }},
+                    Code : {{ company.state_code }}
+                </div>
+
+                <div>
+                    E-Mail : {{ company.email }}
+                </div>
+
+            </div>
+
+
+            <hr>
+
+
+            <div class="party-box">
+
+                <div class="section-label">
+                    Consignee (Ship to)
+                </div>
+
+                <div class="company-name">
+                    {{ company.name }}
+                </div>
+
+                <div>{{ company.address_line_1 }}</div>
+                <div>{{ company.address_line_2 }}</div>
+                <div>{{ company.city }}</div>
+
+                <div>
+                    e-mail : {{ company.email }}
+                </div>
+
+                <div>
+                    GSTIN/UIN : {{ company.gstin }}
+                </div>
+
+                <div>
+                    State Name : {{ company.state }},
+                    Code : {{ company.state_code }}
+                </div>
+
+            </div>
+
+
+            <hr>
+
+
+            <div class="supplier-box">
+
+                <div class="section-label">
+                    Supplier (Bill from)
+                </div>
+
+                <div class="vendor-name">
+                    {{ vendor.name }}
+                </div>
+
+                {% if vendor.address %}
+                    <div>{{ vendor.address }}</div>
+                {% endif %}
+
+                {% if vendor.city %}
+                    <div>
+                        {{ vendor.city }}
+                        {% if vendor.pincode %}
+                            - {{ vendor.pincode }}
+                        {% endif %}
+                    </div>
+                {% endif %}
+
+                <div>
+                    GSTIN/UIN : {{ vendor.gstin|default:"-" }}
+                </div>
+
+                <div>
+                    State Name : {{ vendor.state|default:"-" }},
+                    Code : {{ vendor.state_code|default:"-" }}
+                </div>
+
+            </div>
+
+        </td>
+
+
+        <td class="right-column">
+
+            <table class="info-table">
+
+                <tr>
+
+                    <td>
+                        <div class="info-label">
+                            Voucher No.
+                        </div>
+
+                        <div class="info-value">
+                            {{ po_number }}
+                        </div>
+                    </td>
+
+                    <td>
+                        <div class="info-label">
+                            Dated
+                        </div>
+
+                        <div class="info-value">
+                            {% if po_date %}
+                                {{ po_date|date:"j-M-y" }}
+                            {% endif %}
+                        </div>
+                    </td>
+
+                </tr>
+
+
+                <tr>
+
+                    <td>
+                        <div class="info-label">
+                            Reference No. & Date.
+                        </div>
+
+                        <div class="info-value">
+                            {{ reference_number }}
+                        </div>
+                    </td>
+
+                    <td>
+                        <div class="info-label">
+                            Other References
+                        </div>
+
+                        <div class="info-value">
+                            {{ other_reference }}
+                        </div>
+                    </td>
+
+                </tr>
+
+
+                <tr>
+
+                    <td>
+                        <div class="info-label">
+                            Dispatched through
+                        </div>
+                    </td>
+
+                    <td>
+                        <div class="info-label">
+                            Destination
+                        </div>
+                    </td>
+
+                </tr>
+
+
+                <tr>
+
+                    <td colspan="2">
+
+                        <div class="info-label">
+                            Terms of Delivery
+                        </div>
+
+                        <div class="info-value">
+                            {{ purchase_order.remarks|default:"" }}
+                        </div>
+
+                    </td>
+
+                </tr>
+
+            </table>
+
+        </td>
+
+    </tr>
+</table>
+
+
+<!-- ================= ITEMS PAGE 1 ================= -->
+
+<table class="items-table">
+
+    <thead>
+
+        <tr>
+            <th class="sl">Sl<br>No.</th>
+            <th class="description">Description of Goods</th>
+            <th class="due">Due on</th>
+            <th class="qty">Quantity</th>
+            <th class="rate">Rate</th>
+            <th class="per">per</th>
+            <th class="amount">Amount</th>
+        </tr>
+
+    </thead>
+
+
+    <tbody>
+
+        {% for item in items %}
+
+        <tr>
+
+            <td class="sl">
+                {{ item.sl_no }}
+            </td>
+
+            <td class="description">
+
+                <div class="item-name">
+                    {{ item.name }}
+                </div>
+
+                {% if item.specification %}
+                    <div class="item-spec">
+                        {{ item.specification }}
+                    </div>
+                {% endif %}
+
+            </td>
+
+
+            <td class="due">
+
+                {% if item.due_date %}
+                    {{ item.due_date|date:"d-M-y" }}
+                {% endif %}
+
+            </td>
+
+
+            <td class="qty">
+                <strong>
+                    {{ item.quantity }} Nos
+                </strong>
+            </td>
+
+
+            <td class="rate">
+                {{ item.unit_price|floatformat:2 }}
+            </td>
+
+
+            <td class="per">
+                Nos
+            </td>
+
+
+            <td class="amount">
+                <strong>
+                    {{ item.subtotal|floatformat:2 }}
+                </strong>
+            </td>
+
+        </tr>
+
+        {% endfor %}
+
+
+        <tr>
+
+            <td colspan="6"
+                class="money">
+                Sub Total
+            </td>
+
+            <td class="money">
+                {{ subtotal|floatformat:2 }}
+            </td>
+
+        </tr>
+
+
+        {% if gst_total %}
+
+        <tr>
+
+            <td colspan="6"
+                class="tax-label">
+                Input GST
+            </td>
+
+            <td class="money">
+                <strong>
+                    {{ gst_total|floatformat:2 }}
+                </strong>
+            </td>
+
+        </tr>
+
+        {% endif %}
+
+    </tbody>
+
+</table>
+
+
+<table>
+
+    <tr>
+
+        <td class="continued-box">
+            continued ...
+        </td>
+
+    </tr>
+
+</table>
+
+
+<div class="footer">
+    This is a Computer Generated Document
+</div>
+
+
+<!-- FORCE PAGE 2 -->
+
+<div class="page-break"></div>
+
+
+
+<!-- =====================================================
+     PAGE 2
+===================================================== -->
+
+
+<div class="title">
+    PURCHASE ORDER(Page 2)
+</div>
+
+
+<!-- ================= HEADER PAGE 2 ================= -->
+
+<table>
+
+    <tr>
+
+
+        <td class="left-column">
+
+
+            <div class="party-box">
+
+                <div class="section-label">
+                    Invoice To
+                </div>
+
+                <div class="company-name">
+                    {{ company.name }}
+                </div>
+
+                <div>{{ company.address_line_1 }}</div>
+                <div>{{ company.address_line_2 }}</div>
+                <div>{{ company.city }}</div>
+
+                <div>
+                    GSTIN/UIN: {{ company.gstin }}
+                </div>
+
+                <div>
+                    State Name : {{ company.state }},
+                    Code : {{ company.state_code }}
+                </div>
+
+                <div>
+                    E-Mail : {{ company.email }}
+                </div>
+
+            </div>
+
+
+            <hr>
+
+
+            <div class="party-box">
+
+                <div class="section-label">
+                    Consignee (Ship to)
+                </div>
+
+                <div class="company-name">
+                    {{ company.name }}
+                </div>
+
+                <div>{{ company.address_line_1 }}</div>
+                <div>{{ company.address_line_2 }}</div>
+                <div>{{ company.city }}</div>
+
+                <div>
+                    e-mail : {{ company.email }}
+                </div>
+
+                <div>
+                    GSTIN/UIN : {{ company.gstin }}
+                </div>
+
+                <div>
+                    State Name : {{ company.state }},
+                    Code : {{ company.state_code }}
+                </div>
+
+            </div>
+
+
+            <hr>
+
+
+            <div class="supplier-box">
+
+                <div class="section-label">
+                    Supplier (Bill from)
+                </div>
+
+                <div class="vendor-name">
+                    {{ vendor.name }}
+                </div>
+
+                {% if vendor.address %}
+                    <div>
+                        {{ vendor.address }}
+                    </div>
+                {% endif %}
+
+                {% if vendor.city %}
+                    <div>
+                        {{ vendor.city }}
+
+                        {% if vendor.pincode %}
+                            - {{ vendor.pincode }}
+                        {% endif %}
+                    </div>
+                {% endif %}
+
+                <div>
+                    GSTIN/UIN :
+                    {{ vendor.gstin|default:"-" }}
+                </div>
+
+                <div>
+                    State Name :
+                    {{ vendor.state|default:"-" }},
+                    Code :
+                    {{ vendor.state_code|default:"-" }}
+                </div>
+
+            </div>
+
+        </td>
+
+
+        <td class="right-column">
+
+            <table class="info-table">
+
+
+                <tr>
+
+                    <td>
+
+                        <div class="info-label">
+                            Voucher No.
+                        </div>
+
+                        <div class="info-value">
+                            {{ po_number }}
+                        </div>
+
+                    </td>
+
+
+                    <td>
+
+                        <div class="info-label">
+                            Dated
+                        </div>
+
+                        <div class="info-value">
+
+                            {% if po_date %}
+                                {{ po_date|date:"j-M-y" }}
+                            {% endif %}
+
+                        </div>
+
+                    </td>
+
+                </tr>
+
+
+                <tr>
+
+                    <td>
+
+                        <div class="info-label">
+                            Reference No. & Date.
+                        </div>
+
+                        <div class="info-value">
+                            {{ reference_number }}
+                        </div>
+
+                    </td>
+
+
+                    <td>
+
+                        <div class="info-label">
+                            Other References
+                        </div>
+
+                        <div class="info-value">
+                            {{ other_reference }}
+                        </div>
+
+                    </td>
+
+                </tr>
+
+
+                <tr>
+
+                    <td>
+
+                        <div class="info-label">
+                            Dispatched through
+                        </div>
+
+                    </td>
+
+
+                    <td>
+
+                        <div class="info-label">
+                            Destination
+                        </div>
+
+                    </td>
+
+                </tr>
+
+
+                <tr>
+
+                    <td colspan="2">
+
+                        <div class="info-label">
+                            Terms of Delivery
+                        </div>
+
+                        <div class="info-value">
+                            {{ purchase_order.remarks|default:"" }}
+                        </div>
+
+                    </td>
+
+                </tr>
+
+
+            </table>
+
+        </td>
+
+
+    </tr>
+
+</table>
+
+
+
+<!-- ================= PAGE 2 CONTINUATION ================= -->
+
+<!-- ================= PAGE 2 CONTINUATION ================= -->
+
+<table
+    class="items-table"
+    width="100%"
+    cellspacing="0"
+    cellpadding="0"
+    style="width:100%; border-collapse:collapse;"
+>
+
+    <thead>
+
+        <tr>
+
+            <th
+                class="sl"
+                width="5%"
+                style="width:5%;"
+            >
+                Sl<br>No.
+            </th>
+
+            <th
+                class="description"
+                width="40%"
+                style="width:40%;"
+            >
+                Description of Goods
+            </th>
+
+            <th
+                class="due"
+                width="12%"
+                style="width:12%;"
+            >
+                Due on
+            </th>
+
+            <th
+                class="qty"
+                width="10%"
+                style="width:10%;"
+            >
+                Quantity
+            </th>
+
+            <th
+                class="rate"
+                width="12%"
+                style="width:12%;"
+            >
+                Rate
+            </th>
+
+            <th
+                class="per"
+                width="8%"
+                style="width:8%;"
+            >
+                per
+            </th>
+
+            <th
+                class="amount"
+                width="13%"
+                style="width:13%;"
+            >
+                Amount
+            </th>
+
+        </tr>
+
+    </thead>
+
+
+    <tbody>
+
+        <!-- ================= INPUT GST ================= -->
+
+        <tr>
+
+            <td
+                class="sl"
+                width="5%"
+                style="width:5%;"
+            >
+                &nbsp;
+            </td>
+
+            <td
+                class="description tax-label"
+                width="40%"
+                style="
+                    width:40%;
+                    text-align:right;
+                    font-weight:bold;
+                    font-style:italic;
+                "
+            >
+                Input GST
+            </td>
+
+            <td
+                class="due"
+                width="12%"
+                style="width:12%;"
+            >
+                &nbsp;
+            </td>
+
+            <td
+                class="qty"
+                width="10%"
+                style="width:10%;"
+            >
+                &nbsp;
+            </td>
+
+            <td
+                class="rate"
+                width="12%"
+                style="width:12%;"
+            >
+                &nbsp;
+            </td>
+
+            <td
+                class="per"
+                width="8%"
+                style="width:8%;"
+            >
+                &nbsp;
+            </td>
+
+            <td
+                class="amount money"
+                width="13%"
+                style="
+                    width:13%;
+                    text-align:right;
+                "
+            >
+                {{ gst_total|floatformat:2 }}
+            </td>
+
+        </tr>
+
+
+        <!-- ================= TOTAL ================= -->
+
+        <tr>
+
+            <td
+                class="sl"
+                width="5%"
+                style="width:5%;"
+            >
+                &nbsp;
+            </td>
+
+            <td
+                class="description total-label"
+                width="40%"
+                style="
+                    width:40%;
+                    text-align:right;
+                "
+            >
+                Total
+            </td>
+
+            <td
+                class="due"
+                width="12%"
+                style="width:12%;"
+            >
+                &nbsp;
+            </td>
+
+            <td
+                class="qty"
+                width="10%"
+                style="
+                    width:10%;
+                    text-align:right;
+                "
+            >
+                <strong>
+                    {{ total_quantity }} Nos
+                </strong>
+            </td>
+
+            <td
+                class="rate"
+                width="12%"
+                style="width:12%;"
+            >
+                &nbsp;
+            </td>
+
+            <td
+                class="per"
+                width="8%"
+                style="width:8%;"
+            >
+                &nbsp;
+            </td>
+
+            <td
+                class="amount grand-total"
+                width="13%"
+                style="
+                    width:13%;
+                    text-align:right;
+                    font-size:13px;
+                    font-weight:bold;
+                "
+            >
+                {{ grand_total|floatformat:2 }} /-
+            </td>
+
+        </tr>
+
+    </tbody>
+
+</table>
+
+
+
+<table>
+
+    <tr>
+
+        <td class="words-box">
+
+            <div>
+                Amount Chargeable (in words)
+
+                <span class="eoe">
+                    E. &amp; O.E
+                </span>
+            </div>
+
+
+            <div class="amount-words">
+                {{ amount_in_words }}
+            </div>
+
+        </td>
+
+    </tr>
+
+
+    <tr>
+
+        <td style="border:none; padding:0;">
+
+            <table>
+
+                <tr>
+
+                    <td style="
+                        width:50%;
+                        border:none;
+                    ">
+                    </td>
+
+
+                    <td class="signature-box">
+
+                        <div class="signature-company">
+                            for Dronix Technologies Private Limited
+                        </div>
+
+                        <div>
+                            Authorised Signatory
+                        </div>
+
+                    </td>
+
+                </tr>
+
+            </table>
+
+        </td>
+
+    </tr>
+
+</table>
+
+
+<div class="footer">
+    This is a Computer Generated Document
+</div>
+
+
+</body>
+</html>

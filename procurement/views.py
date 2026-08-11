@@ -6,11 +6,20 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
-
+from django.contrib.staticfiles import finders
 from inventory.models import InventoryReservation
 from materialrequest.models import MaterialRequest
 from notifications.models import Notification
+from decimal import Decimal
+from io import BytesIO
 
+from django.http import HttpResponse
+from django.template.loader import get_template
+
+from num2words import num2words
+from xhtml2pdf import pisa
+
+from vendors.models import Vendor
 from .models import (
     PurchaseOrder,
     PurchaseOrderItem,
@@ -20,8 +29,32 @@ from .serializers import (
     PurchaseOrderSerializer,
     PurchaseRequestSerializer,
 )
+from pathlib import Path
 
 
+def pdf_link_callback(uri, rel):
+    if uri == "font://pdfunicode":
+
+        font_path = Path(r"C:\Windows\Fonts\NotoSans-Regular.ttf")
+        if font_path.exists():
+            return font_path.as_uri()
+
+        possible_fonts = [
+            Path(r"C:\Windows\Fonts\arialuni.ttf"),
+            Path(r"C:\Windows\Fonts\arial.ttf"),
+            Path(r"C:\Windows\Fonts\seguisym.ttf"),
+            Path(r"C:\Windows\Fonts\segoeui.ttf"),
+        ]
+
+        for font_path in possible_fonts:
+            if font_path.exists():
+                return font_path.as_uri()
+
+        raise FileNotFoundError(
+            "No suitable Unicode font was found in C:\\Windows\\Fonts"
+        )
+
+    return uri
 class PurchaseRequestViewSet(viewsets.ModelViewSet):
     queryset = (
         PurchaseRequest.objects
@@ -46,6 +79,423 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
     serializer_class = PurchaseOrderSerializer
     permission_classes = [AllowAny]
 
+
+
+
+    # ==========================================================
+    # PURCHASE ORDER PDF
+    # ==========================================================
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="pdf",
+    )
+    def download_pdf(self, request, pk=None):
+        try:
+            purchase_order = (
+                PurchaseOrder.objects
+                .prefetch_related(
+                    "items",
+                    "items__component",
+                )
+                .get(pk=pk)
+            )
+
+        except PurchaseOrder.DoesNotExist:
+            return Response(
+                {
+                    "detail":
+                        "Purchase Order not found."
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # ------------------------------------------------------
+        # Find Vendor
+        # ------------------------------------------------------
+
+        vendor = (
+            Vendor.objects
+            .filter(
+                name__iexact=purchase_order.vendor_name
+            )
+            .first()
+        )
+
+        # ------------------------------------------------------
+        # Purchase Order Date
+        # ------------------------------------------------------
+
+        po_date = (
+            purchase_order.ordered_date
+            or (
+                purchase_order.created_at.date()
+                if purchase_order.created_at
+                else None
+            )
+        )
+
+        # ------------------------------------------------------
+        # Items / totals
+        # ------------------------------------------------------
+
+        pdf_items = []
+
+        subtotal = Decimal("0.00")
+        gst_total = Decimal("0.00")
+        total_quantity = 0
+
+        for index, item in enumerate(
+            purchase_order.items.all(),
+            start=1,
+        ):
+            component = item.component
+
+            quantity = int(
+                item.quantity or 0
+            )
+
+            unit_price = (
+                item.unit_price
+                or Decimal("0.00")
+            )
+
+            line_subtotal = (
+                Decimal(quantity) *
+                unit_price
+            )
+
+            gst_percentage = (
+                item.gst_percentage
+                or Decimal("0.00")
+            )
+
+            gst_amount = (
+                line_subtotal *
+                gst_percentage /
+                Decimal("100")
+            )
+
+            subtotal += line_subtotal
+            gst_total += gst_amount
+            total_quantity += quantity
+
+            pdf_items.append({
+                "sl_no": index,
+
+                "name":
+                    component.name
+                    if component
+                    else "Component",
+
+                "component_id":
+                    component.component_id
+                    if component
+                    else "",
+
+                "part_number":
+                    component.part_numbers
+                    if component
+                    else "",
+
+                "specification":
+                    component.specifications
+                    if component
+                    else "",
+
+                "hsn":
+                    component.hsn_numbers
+                    if component
+                    else "",
+
+"uom": "Nos",
+
+                "due_date":
+                    purchase_order.expected_delivery_date,
+
+                "quantity":
+                    quantity,
+
+                "unit_price":
+                    unit_price,
+
+                "gst_percentage":
+                    gst_percentage,
+
+                "subtotal":
+                    line_subtotal,
+            })
+
+        grand_total = (
+            subtotal +
+            gst_total
+        )
+
+        # ------------------------------------------------------
+        # GST split
+        #
+        # Dronix is Tamil Nadu - State code 33.
+        #
+        # Tamil Nadu vendor:
+        # CGST + SGST
+        #
+        # Outside Tamil Nadu:
+        # IGST
+        # ------------------------------------------------------
+
+        # ------------------------------------------------------
+        # GST FROM PURCHASE ORDER ONLY
+        # ------------------------------------------------------
+
+        gst_rates = []
+
+        for po_item in purchase_order.items.all():
+            rate = Decimal(
+                str(po_item.gst_percentage or 0)
+            )
+
+            if rate not in gst_rates:
+                gst_rates.append(rate)
+
+        # Do not display GST percentage in PDF.
+        gst_label = "Input CGST"
+
+
+        # ------------------------------------------------------
+        # Amount in words
+        # ------------------------------------------------------
+
+        rupees = int(grand_total)
+
+        paise = int(
+            round(
+                (
+                    grand_total -
+                    Decimal(rupees)
+                ) *
+                100
+            )
+        )
+
+        amount_in_words = (
+            "INR "
+            + num2words(
+                rupees,
+                lang="en_IN",
+            )
+            .title()
+        )
+
+        if paise:
+            amount_in_words += (
+                " And "
+                + num2words(
+                    paise,
+                    lang="en_IN",
+                )
+                .title()
+                + " Paise"
+            )
+
+        amount_in_words += " Only"
+
+        # ------------------------------------------------------
+        # Other Reference
+        # ------------------------------------------------------
+
+        other_reference = (
+            f"CFRE / DRONIX "
+            f"{purchase_order.po_number} / R0"
+        )
+
+        # ------------------------------------------------------
+        # Context
+        # ------------------------------------------------------
+
+        context = {
+            # Fixed Dronix company details
+            "company": {
+                "name":
+                    "Dronix Technologies Private Limited",
+
+                "address_line_1":
+                    "No.133, AC Complex, Ground Floor",
+
+                "address_line_2":
+                    "Gandhi Road, Alapakkam, Perungalathur",
+
+                "city":
+                    "Chennai",
+
+                "gstin":
+                    "33AAGCD1081K1ZS",
+
+                "state":
+                    "Tamil Nadu",
+
+                "state_code":
+                    "33",
+
+                "email":
+                    "finance@aero360.co.in",
+            },
+
+            # Vendor / Supplier details
+            "vendor": {
+                "name":
+                    (
+                        vendor.name
+                        if vendor
+                        else purchase_order.vendor_name
+                    ),
+
+                "address":
+                    (
+                        vendor.address
+                        if vendor
+                        else ""
+                    ),
+
+                "city":
+                    (
+                        getattr(
+                            vendor,
+                            "city",
+                            "",
+                        )
+                        if vendor
+                        else ""
+                    ),
+
+                "pincode":
+                    (
+                        getattr(
+                            vendor,
+                            "pincode",
+                            "",
+                        )
+                        if vendor
+                        else ""
+                    ),
+
+                "gstin":
+                    (
+                        vendor.gst_number
+                        if vendor
+                        else purchase_order.gstin
+                    ),
+
+                "state":
+                    (
+                        getattr(
+                            vendor,
+                            "state",
+                            "",
+                        )
+                        if vendor
+                        else ""
+                    ),
+"state_code": (
+    getattr(
+        vendor,
+        "state_code",
+        "",
+    )
+    if vendor
+    else ""
+),
+            },
+
+            "purchase_order":
+                purchase_order,
+
+            "po_number":
+                purchase_order.po_number,
+
+            "reference_number":
+                purchase_order.po_number,
+
+            "po_date":
+                po_date,
+
+            "other_reference":
+                other_reference,
+
+            "items":
+                pdf_items,
+
+            "subtotal":
+                subtotal,
+
+            "gst_total":
+                gst_total,
+
+            "gst_label":
+                gst_label,
+
+            "grand_total":
+                grand_total,
+
+            "total_quantity":
+                total_quantity,
+
+            "amount_in_words":
+                amount_in_words,
+        }
+
+        # ------------------------------------------------------
+        # Render HTML
+        # ------------------------------------------------------
+
+        template = get_template(
+            "procurement/purchase_order_pdf.html"
+        )
+
+        html = template.render(context)
+
+        result = BytesIO()
+
+        pdf_status = pisa.CreatePDF(
+            html,
+            dest=result,
+            encoding="UTF-8",
+            link_callback=pdf_link_callback,
+        )
+
+        if pdf_status.err:
+            return Response(
+                {
+                    "detail":
+                        "Unable to generate Purchase Order PDF."
+                },
+                status=
+                    status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        # ------------------------------------------------------
+        # Download response
+        # ------------------------------------------------------
+
+        safe_po_number = (
+            str(purchase_order.po_number)
+            .replace("/", "-")
+            .replace("\\", "-")
+        )
+
+        response = HttpResponse(
+            result.getvalue(),
+            content_type="application/pdf",
+        )
+
+        response[
+            "Content-Disposition"
+        ] = (
+            f'attachment; '
+            f'filename="PO_{safe_po_number}.pdf"'
+        )
+
+        return response
     # ==========================================================
     # MATERIAL REQUEST / PO WORKFLOW HELPERS
     # ==========================================================
