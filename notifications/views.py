@@ -12,47 +12,153 @@ class NotificationViewSet(
     serializer_class = NotificationSerializer
     pagination_class = None
 
+    @staticmethod
+    def get_user_display_name(user):
+        if (
+            not user
+            or not getattr(
+                user,
+                "is_authenticated",
+                False,
+            )
+        ):
+            return ""
+
+        candidates = [
+            getattr(
+                user,
+                "employee_name",
+                "",
+            ),
+            getattr(
+                user,
+                "employeeName",
+                "",
+            ),
+            getattr(
+                user,
+                "full_name",
+                "",
+            ),
+            getattr(
+                user,
+                "name",
+                "",
+            ),
+        ]
+
+        try:
+            candidates.append(
+                user.get_full_name()
+            )
+        except Exception:
+            pass
+
+        candidates.extend(
+            [
+                getattr(
+                    user,
+                    "username",
+                    "",
+                ),
+                getattr(
+                    user,
+                    "email",
+                    "",
+                ),
+            ]
+        )
+
+        for value in candidates:
+            raw = str(
+                value or ""
+            ).strip()
+
+            if not raw:
+                continue
+
+            # User name only; never store the full email.
+            if "@" in raw:
+                raw = (
+                    raw.split("@")[0]
+                    .strip()
+                )
+
+            if raw:
+                return raw[:150]
+
+        return ""
+
+    def perform_create(self, serializer):
+        requested_by = (
+            self.get_user_display_name(
+                self.request.user
+            )
+        )
+
+        if requested_by:
+            serializer.save(
+                requested_by=requested_by
+            )
+            return
+
+        # Fallback to requested_by sent by the authenticated frontend.
+        serializer.save()
+
     def get_queryset(self):
         queryset = (
             Notification.objects
             .all()
-            .order_by("-created_at", "-id")
+            .order_by(
+                "-created_at",
+                "-id",
+            )
         )
 
-        category = self.request.query_params.get(
-            "category"
+        category = (
+            self.request
+            .query_params
+            .get("category")
         )
 
-        receiver = self.request.query_params.get(
-            "receiver"
+        receiver = (
+            self.request
+            .query_params
+            .get("receiver")
         )
 
         notification_status = (
-            self.request.query_params.get(
-                "status"
-            )
+            self.request
+            .query_params
+            .get("status")
         )
 
         reference_id = (
-            self.request.query_params.get(
-                "reference_id"
-            )
+            self.request
+            .query_params
+            .get("reference_id")
         )
 
-        is_read = self.request.query_params.get(
-            "is_read"
+        is_read = (
+            self.request
+            .query_params
+            .get("is_read")
         )
 
         if category:
             queryset = queryset.filter(
-                category=str(category)
+                category=str(
+                    category
+                )
                 .strip()
                 .upper()
             )
 
         if receiver:
             queryset = queryset.filter(
-                receiver=str(receiver)
+                receiver=str(
+                    receiver
+                )
                 .strip()
                 .upper()
             )
@@ -88,8 +194,10 @@ class NotificationViewSet(
                 "1",
                 "yes",
             }:
-                queryset = queryset.filter(
-                    is_read=True
+                queryset = (
+                    queryset.filter(
+                        is_read=True
+                    )
                 )
 
             elif normalized_is_read in {
@@ -97,27 +205,43 @@ class NotificationViewSet(
                 "0",
                 "no",
             }:
-                queryset = queryset.filter(
-                    is_read=False
+                queryset = (
+                    queryset.filter(
+                        is_read=False
+                    )
                 )
 
         return queryset
 
     @action(
         detail=True,
-        methods=["patch", "post"],
+        methods=[
+            "patch",
+            "post",
+        ],
         url_path="mark-read",
     )
-    def mark_read(self, request, pk=None):
-        notification = self.get_object()
-
-        notification.is_read = True
-        notification.save(
-            update_fields=["is_read"]
+    def mark_read(
+        self,
+        request,
+        pk=None,
+    ):
+        notification = (
+            self.get_object()
         )
 
-        serializer = self.get_serializer(
-            notification
+        notification.is_read = True
+
+        notification.save(
+            update_fields=[
+                "is_read",
+            ]
+        )
+
+        serializer = (
+            self.get_serializer(
+                notification
+            )
         )
 
         return Response(
@@ -127,19 +251,33 @@ class NotificationViewSet(
 
     @action(
         detail=True,
-        methods=["patch", "post"],
+        methods=[
+            "patch",
+            "post",
+        ],
         url_path="mark-unread",
     )
-    def mark_unread(self, request, pk=None):
-        notification = self.get_object()
-
-        notification.is_read = False
-        notification.save(
-            update_fields=["is_read"]
+    def mark_unread(
+        self,
+        request,
+        pk=None,
+    ):
+        notification = (
+            self.get_object()
         )
 
-        serializer = self.get_serializer(
-            notification
+        notification.is_read = False
+
+        notification.save(
+            update_fields=[
+                "is_read",
+            ]
+        )
+
+        serializer = (
+            self.get_serializer(
+                notification
+            )
         )
 
         return Response(

@@ -105,11 +105,22 @@ class OutwardEntrySerializer(serializers.ModelSerializer):
         default="",
     )
 
-    code = serializers.CharField(required=False, read_only=True)
+    material_request_number = serializers.CharField(
+        source="material_request.material_request_id",
+        read_only=True,
+        default="",
+    )
+
+    code = serializers.CharField(
+        required=False,
+        read_only=True,
+    )
 
     class Meta:
         model = OutwardEntry
         fields = "__all__"
+
+        # Approval state is controlled by the backend workflow only.
         read_only_fields = [
             "id",
             "created_at",
@@ -119,6 +130,16 @@ class OutwardEntrySerializer(serializers.ModelSerializer):
             "stock_deducted",
             "stock_restored",
             "approval_status",
+            "rejected_by",
+
+            # Engineer Scrap staging fields are backend-owned.
+            "source",
+            "scrap_origin",
+            "material_request",
+            "requested_by",
+            "requested_by_user_id",
+            "moved_to_inventory",
+            "moved_at",
         ]
 
     @staticmethod
@@ -128,11 +149,14 @@ class OutwardEntrySerializer(serializers.ModelSerializer):
 
         result = []
         seen = set()
+
         for value in values:
             serial = str(value or "").strip()
+
             if serial and serial not in seen:
                 seen.add(serial)
                 result.append(serial)
+
         return result
 
     def validate(self, attrs):
@@ -143,7 +167,11 @@ class OutwardEntrySerializer(serializers.ModelSerializer):
         outward_type = str(
             attrs.get(
                 "outward_type",
-                getattr(self.instance, "outward_type", "SCRAP"),
+                getattr(
+                    self.instance,
+                    "outward_type",
+                    "SCRAP",
+                ),
             )
             or "SCRAP"
         ).strip().upper()
@@ -151,13 +179,15 @@ class OutwardEntrySerializer(serializers.ModelSerializer):
         item_type = str(
             attrs.get(
                 "item_type",
-                getattr(self.instance, "item_type", "COMPONENT"),
+                getattr(
+                    self.instance,
+                    "item_type",
+                    "COMPONENT",
+                ),
             )
             or "COMPONENT"
         ).strip().upper()
 
-        # On PATCH, do not inject immutable fields that were not supplied.
-        # The stock-aware ViewSet protects these fields after stock movement.
         if is_create or "outward_type" in attrs:
             attrs["outward_type"] = outward_type
 
@@ -165,14 +195,19 @@ class OutwardEntrySerializer(serializers.ModelSerializer):
             attrs["item_type"] = item_type
 
         quantity_was_supplied = (
-            "quantity" in attrs or "no_of_components" in attrs
+            "quantity" in attrs
+            or "no_of_components" in attrs
         )
 
         raw_quantity = attrs.get(
             "quantity",
             attrs.get(
                 "no_of_components",
-                getattr(self.instance, "quantity", 1),
+                getattr(
+                    self.instance,
+                    "quantity",
+                    1,
+                ),
             ),
         )
 
@@ -183,7 +218,10 @@ class OutwardEntrySerializer(serializers.ModelSerializer):
 
         if quantity <= 0:
             raise serializers.ValidationError(
-                {"quantity": "Quantity must be greater than zero."}
+                {
+                    "quantity":
+                        "Quantity must be greater than zero."
+                }
             )
 
         if is_create or quantity_was_supplied:
@@ -193,38 +231,74 @@ class OutwardEntrySerializer(serializers.ModelSerializer):
         if outward_type in {"SALES", "EVENT"}:
             component = attrs.get(
                 "component",
-                getattr(self.instance, "component", None),
+                getattr(
+                    self.instance,
+                    "component",
+                    None,
+                ),
             )
+
             product_name = str(
                 attrs.get(
                     "product_name",
-                    getattr(self.instance, "product_name", ""),
+                    getattr(
+                        self.instance,
+                        "product_name",
+                        "",
+                    ),
                 )
                 or ""
             ).strip()
+
             drone_name = str(
                 attrs.get(
                     "drone_name",
-                    getattr(self.instance, "drone_name", ""),
+                    getattr(
+                        self.instance,
+                        "drone_name",
+                        "",
+                    ),
                 )
                 or ""
             ).strip()
 
-            if item_type == "COMPONENT" and component is None:
+            if (
+                item_type == "COMPONENT"
+                and component is None
+            ):
                 raise serializers.ValidationError(
-                    {"component": "Select an In-Store component."}
+                    {
+                        "component":
+                            "Select an In-Store component."
+                    }
                 )
 
-            if item_type == "DRONE" and not (product_name or drone_name):
+            if (
+                item_type == "DRONE"
+                and not (
+                    product_name
+                    or drone_name
+                )
+            ):
                 raise serializers.ValidationError(
-                    {"product_name": "Enter the drone name."}
+                    {
+                        "product_name":
+                            "Enter the drone name."
+                    }
                 )
 
-        serials_were_supplied = "serial_numbers" in attrs
+        serials_were_supplied = (
+            "serial_numbers" in attrs
+        )
+
         serial_numbers = self.normalize_serials(
             attrs.get(
                 "serial_numbers",
-                getattr(self.instance, "serial_numbers", []),
+                getattr(
+                    self.instance,
+                    "serial_numbers",
+                    [],
+                ),
             )
         )
 
@@ -240,8 +314,8 @@ class OutwardEntrySerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {
                     "serial_numbers": (
-                        f"Select exactly {quantity} serial number(s) "
-                        "for this component."
+                        f"Select exactly {quantity} "
+                        "serial number(s) for this component."
                     )
                 }
             )
@@ -250,47 +324,157 @@ class OutwardEntrySerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         if not validated_data.get("code"):
-            stamp = timezone.now().strftime("%Y%m%d%H%M%S%f")
-            validated_data["code"] = (
-                f"OUT-{stamp}-{uuid4().hex[:6].upper()}"
+            stamp = timezone.now().strftime(
+                "%Y%m%d%H%M%S%f"
             )
 
-        if not validated_data.get("status"):
-            validated_data["status"] = "NEW"
+            validated_data["code"] = (
+                f"OUT-{stamp}-"
+                f"{uuid4().hex[:6].upper()}"
+            )
 
-        validated_data["approval_status"] = "NOT_REQUESTED"
+        outward_type = str(
+            validated_data.get(
+                "outward_type",
+                "SCRAP",
+            )
+            or "SCRAP"
+        ).strip().upper()
+
+        # ----------------------------------------------------
+        # SCRAP approval workflow
+        # ----------------------------------------------------
+        # A new Scrap is NOT approved immediately.
+        #
+        # approval_status = REQUESTED
+        # status          = PENDING_MANAGER
+        #
+        # Only the custom manager-approve / manager-reject
+        # ViewSet actions may move it out of this state.
+        # ----------------------------------------------------
+        if outward_type == "SCRAP":
+            validated_data[
+                "approval_status"
+            ] = "REQUESTED"
+
+            validated_data[
+                "status"
+            ] = "PENDING_MANAGER"
+
+            validated_data[
+                "rejection_reason"
+            ] = None
+
+            validated_data[
+                "rejected_by"
+            ] = None
+
+        else:
+            validated_data[
+                "approval_status"
+            ] = "NOT_REQUESTED"
+
+            if not validated_data.get("status"):
+                validated_data["status"] = "NEW"
+
         return super().create(validated_data)
 
-    def update(self, instance, validated_data):
-        # This workflow has no approval step.
-        validated_data["approval_status"] = "NOT_REQUESTED"
-        return super().update(instance, validated_data)
+    def update(
+        self,
+        instance,
+        validated_data,
+    ):
+        # IMPORTANT:
+        # Never reset approval_status here.
+        #
+        # The old code forced every PATCH back to
+        # NOT_REQUESTED, which breaks Scrap approval.
+        return super().update(
+            instance,
+            validated_data,
+        )
 
-    def to_representation(self, instance):
-        data = super().to_representation(instance)
+    def to_representation(
+        self,
+        instance,
+    ):
+        data = super().to_representation(
+            instance
+        )
 
-        data["outDate"] = data.get("out_date")
-        data["productName"] = data.get("product_name")
-        data["invoiceNumber"] = data.get("invoice_number")
-        data["gatePass"] = data.get("gate_pass")
-        data["eventName"] = data.get("event_name")
-        data["noOfComponents"] = data.get("no_of_components")
-        data["returnDate"] = data.get("return_date")
-        data["droneName"] = data.get("drone_name")
-        data["attendeeName"] = data.get("attendee_name")
-        data["eventComponents"] = data.get("event_components")
-        data["isReturned"] = data.get("is_returned")
-        data["typeOfOutward"] = data.get("outward_type")
-        data["itemType"] = data.get("item_type")
-        data["serialNumbers"] = data.get("serial_numbers") or []
-        data["returnedQuantity"] = data.get("returned_quantity") or 0
+        data["outDate"] = data.get(
+            "out_date"
+        )
+        data["productName"] = data.get(
+            "product_name"
+        )
+        data["invoiceNumber"] = data.get(
+            "invoice_number"
+        )
+        data["gatePass"] = data.get(
+            "gate_pass"
+        )
+        data["eventName"] = data.get(
+            "event_name"
+        )
+        data["noOfComponents"] = data.get(
+            "no_of_components"
+        )
+        data["returnDate"] = data.get(
+            "return_date"
+        )
+        data["droneName"] = data.get(
+            "drone_name"
+        )
+        data["attendeeName"] = data.get(
+            "attendee_name"
+        )
+        data["eventComponents"] = data.get(
+            "event_components"
+        )
+        data["isReturned"] = data.get(
+            "is_returned"
+        )
+        data["typeOfOutward"] = data.get(
+            "outward_type"
+        )
+        data["itemType"] = data.get(
+            "item_type"
+        )
+        data["serialNumbers"] = (
+            data.get("serial_numbers")
+            or []
+        )
+        data["returnedQuantity"] = (
+            data.get("returned_quantity")
+            or 0
+        )
         data["returnedSerialNumbers"] = (
-            data.get("returned_serial_numbers") or []
+            data.get(
+                "returned_serial_numbers"
+            )
+            or []
         )
         data["inventoryAllocations"] = (
-            data.get("inventory_allocations") or []
+            data.get(
+                "inventory_allocations"
+            )
+            or []
         )
-        data["stockDeducted"] = bool(data.get("stock_deducted"))
-        data["stockRestored"] = bool(data.get("stock_restored"))
+        data["stockDeducted"] = bool(
+            data.get("stock_deducted")
+        )
+        data["stockRestored"] = bool(
+            data.get("stock_restored")
+        )
+
+        data["scrapOrigin"] = (
+            data.get("scrap_origin")
+            or "OTHER"
+        )
+        data["materialRequestNumber"] = (
+            data.get("material_request_number")
+            or ""
+        )
 
         return data

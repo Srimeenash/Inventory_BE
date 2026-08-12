@@ -7,6 +7,8 @@ class Notification(models.Model):
         ("MR", "Material Request"),
         ("CU", "Component Usage"),
         ("PROC", "Procurement"),
+        ("SCRAP", "Scrap"),
+        ("BOM", "BOM"),
     ]
 
     STATUS_CHOICES = [
@@ -60,7 +62,9 @@ class Notification(models.Model):
         db_index=True,
     )
 
-    title = models.CharField(max_length=255)
+    title = models.CharField(
+        max_length=255,
+    )
 
     message = models.TextField(
         blank=True,
@@ -74,7 +78,15 @@ class Notification(models.Model):
         db_index=True,
     )
 
-    # PROJECT_INVENTORY_READY is longer than 20 characters.
+    # User name that created/requested the notification.
+    # This is what the Manager Scrap table displays.
+    requested_by = models.CharField(
+        max_length=150,
+        blank=True,
+        null=True,
+        db_index=True,
+    )
+
     status = models.CharField(
         max_length=40,
         choices=STATUS_CHOICES,
@@ -101,7 +113,10 @@ class Notification(models.Model):
     )
 
     class Meta:
-        ordering = ["-created_at", "-id"]
+        ordering = [
+            "-created_at",
+            "-id",
+        ]
 
         indexes = [
             models.Index(
@@ -123,4 +138,7 @@ class Notification(models.Model):
         ]
 
     def __str__(self):
-        return f"{self.category} - {self.title}"
+        return (
+            f"{self.category} - "
+            f"{self.title}"
+        )
