@@ -526,6 +526,12 @@ class RDItemSerializer(
 class MaterialRequestSerializer(
     serializers.ModelSerializer
 ):
+    # Actual logged-in user who created this MR.
+    # Backend sets this from request.user.
+    requester = serializers.PrimaryKeyRelatedField(
+        read_only=True
+    )
+
     # The New Material Request page generates the business MR ID.
     # Keep that exact value writable on CREATE so it is stored in DB.
     material_request_id = serializers.CharField(

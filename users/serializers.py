@@ -1,6 +1,10 @@
+from django.utils import timezone
 from rest_framework import serializers
 
-from .models import User
+from .models import (
+    LoginOTP,
+    User,
+)
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -31,6 +35,7 @@ class UserSerializer(serializers.ModelSerializer):
             "is_active",
             "is_staff",
             "is_superuser",
+            "email_verified",
             "created_at",
             "updated_at",
             "password",
@@ -40,6 +45,7 @@ class UserSerializer(serializers.ModelSerializer):
             "id",
             "is_staff",
             "is_superuser",
+            "email_verified",
             "created_at",
             "updated_at",
         ]
@@ -137,6 +143,9 @@ class UserSerializer(serializers.ModelSerializer):
             role == "admin"
         )
 
+        # User.email_verified uses model default=False.
+        # Therefore every Admin-created employee, including an Admin
+        # employee, must verify the official email on first login.
         return User.objects.create_user(
             password=password,
             **validated_data,
@@ -163,6 +172,23 @@ class UserSerializer(serializers.ModelSerializer):
             validated_data.get(
                 "profile_image"
             )
+        )
+
+        old_email = str(
+            instance.email or ""
+        ).strip().lower()
+
+        incoming_email = validated_data.get(
+            "email",
+            instance.email,
+        )
+
+        new_email = str(
+            incoming_email or ""
+        ).strip().lower()
+
+        email_changed = (
+            old_email != new_email
         )
 
         if (
@@ -205,7 +231,23 @@ class UserSerializer(serializers.ModelSerializer):
         if password:
             instance.set_password(password)
 
+        # If IPMS Admin changes the HR-provided employee email,
+        # the new address must be verified once on the next login.
+        if email_changed:
+            instance.email_verified = False
+
         instance.save()
+
+        if email_changed:
+            # An OTP previously sent to the old email address must
+            # never be allowed to verify the new email address.
+            LoginOTP.objects.filter(
+                user=instance,
+                used_at__isnull=True,
+            ).update(
+                used_at=timezone.now()
+            )
+
         return instance
 
 
@@ -256,3 +298,24 @@ class EmailTokenSerializer(
 
         data["user"] = user
         return data
+
+
+class LoginOTPVerifySerializer(
+    serializers.Serializer
+):
+    verification_id = serializers.UUIDField()
+
+    code = serializers.RegexField(
+        regex=r"^\d{6}$",
+        error_messages={
+            "invalid": (
+                "Enter the 6-digit verification code."
+            )
+        },
+    )
+
+
+class LoginOTPResendSerializer(
+    serializers.Serializer
+):
+    verification_id = serializers.UUIDField()

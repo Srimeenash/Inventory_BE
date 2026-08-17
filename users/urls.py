@@ -4,6 +4,8 @@ from rest_framework_simplejwt.views import (
 )
 
 from .views import (
+    LoginResendView,
+    LoginVerifyView,
     LoginView,
     ProfileView,
     RegisterView,
@@ -17,6 +19,16 @@ urlpatterns = [
         "login/",
         LoginView.as_view(),
         name="auth-login",
+    ),
+    path(
+        "login/verify/",
+        LoginVerifyView.as_view(),
+        name="auth-login-verify",
+    ),
+    path(
+        "login/resend/",
+        LoginResendView.as_view(),
+        name="auth-login-resend",
     ),
     path(
         "token/refresh/",

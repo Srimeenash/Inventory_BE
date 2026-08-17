@@ -1,5 +1,6 @@
 from datetime import datetime
 
+from django.conf import settings
 from django.db import models
 from components.models import Component
 
@@ -19,6 +20,14 @@ class MaterialRequest(models.Model):
         null=True,
     )
     requester_name = models.CharField(max_length=100)
+    
+    requester = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="material_requests",
+    )
 
     date = models.DateField()
     project = models.CharField(max_length=100)

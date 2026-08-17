@@ -1,6 +1,8 @@
 from collections import defaultdict
 
 from django.db import transaction
+from django.conf import settings
+from django.utils import timezone
 from django.db.models import Q
 
 from rest_framework import status, viewsets
@@ -10,6 +12,7 @@ from rest_framework.response import Response
 from inward.models import InwardEntry
 from materialrequest.models import MaterialRequest
 from notifications.models import Notification
+from notifications.email_service import send_ipms_email
 from procurement.models import PurchaseOrder
 
 from .models import (
@@ -95,6 +98,255 @@ class ProjectInventoryViewSet(
 
     serializer_class = ProjectInventorySerializer
     pagination_class = None
+
+
+    # ==========================================================
+    # MR REQUESTER - ALL COMPONENTS ISSUED EMAIL
+    # ==========================================================
+
+    @staticmethod
+    def get_user_display_name(
+        user,
+        fallback="User",
+    ):
+        if not user:
+            return fallback
+
+        return (
+            getattr(
+                user,
+                "employee_name",
+                "",
+            )
+            or getattr(
+                user,
+                "email",
+                "",
+            )
+            or fallback
+        )
+
+    @staticmethod
+    def get_ipms_base_url():
+        return str(
+            getattr(
+                settings,
+                "IPMS_BASE_URL",
+                "http://localhost:5173",
+            )
+            or "http://localhost:5173"
+        ).rstrip("/")
+
+    def send_requester_all_components_issued_email(
+        self,
+        material_request_id,
+        *,
+        issued_by_name="Inventory Team",
+    ):
+        """
+        Send the final Inventory completion email to the original
+        MR requester only after every ProjectInventory row is fulfilled.
+
+        The email summarizes ALL issued quantities for the MR, not only
+        the quantities from the last Provide Components action.
+        """
+        try:
+            material_request = (
+                MaterialRequest.objects
+                .select_related("requester")
+                .get(pk=material_request_id)
+            )
+        except MaterialRequest.DoesNotExist:
+            return False
+
+        requester = getattr(
+            material_request,
+            "requester",
+            None,
+        )
+
+        requester_email = str(
+            getattr(
+                requester,
+                "email",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if not requester_email:
+            return False
+
+        project_rows = list(
+            ProjectInventory.objects
+            .select_related("component")
+            .filter(
+                material_request=material_request
+            )
+            .order_by("id")
+        )
+
+        if not project_rows:
+            return False
+
+        if not all(
+            row.is_fulfilled
+            for row in project_rows
+        ):
+            return False
+
+        requester_name = (
+            material_request.requester_name
+            or self.get_user_display_name(
+                requester,
+                "Requester",
+            )
+        )
+
+        total_requested = sum(
+            max(
+                int(
+                    row.requested_quantity
+                    or 0
+                ),
+                0,
+            )
+            for row in project_rows
+        )
+
+        total_issued = sum(
+            max(
+                int(
+                    row.issued_quantity
+                    or 0
+                ),
+                0,
+            )
+            for row in project_rows
+        )
+
+        component_lines = []
+
+        for row in project_rows:
+            component = getattr(
+                row,
+                "component",
+                None,
+            )
+
+            component_code = (
+                getattr(
+                    component,
+                    "component_id",
+                    "",
+                )
+                or getattr(
+                    component,
+                    "id",
+                    "",
+                )
+                or ""
+            )
+
+            component_name = (
+                getattr(
+                    component,
+                    "name",
+                    "",
+                )
+                or "Component"
+            )
+
+            serials = self.normalize_serials(
+                list(
+                    row.issued_store_serials
+                    or []
+                )
+                + list(
+                    row.issued_purchased_serials
+                    or []
+                )
+            )
+
+            serial_text = (
+                ", ".join(serials)
+                if serials
+                else "-"
+            )
+
+            component_lines.append(
+                (
+                    f"{component_code} - "
+                    f"{component_name}: "
+                    f"Requested {int(row.requested_quantity or 0)}, "
+                    f"Issued {int(row.issued_quantity or 0)}, "
+                    f"Serial(s): {serial_text}"
+                ).strip()
+            )
+
+        component_summary = "; ".join(
+            component_lines
+        )
+
+        subject = (
+            f"Components issued for "
+            f"{material_request.material_request_id} "
+            f"- Inventory Update"
+        )
+
+        return send_ipms_email(
+            recipient_email=requester_email,
+            subject=subject,
+            context={
+                "recipient_name": requester_name,
+                "message": (
+                    f"All requested components for "
+                    f"{material_request.material_request_id} "
+                    f"have been issued by Inventory."
+                ),
+                "table_headers": [
+                    "MR ID",
+                    "Project",
+                    "Requested By",
+                    "Issued By",
+                    "Issued Date",
+                    "Requested Qty",
+                    "Issued Qty",
+                    "Components / Serials",
+                    "Status",
+                ],
+                "table_values": [
+                    material_request.material_request_id,
+                    material_request.project,
+                    requester_name,
+                    issued_by_name
+                    or "Inventory Team",
+                    timezone.localdate().strftime(
+                        "%d/%m/%Y"
+                    ),
+                    total_requested,
+                    total_issued,
+                    component_summary,
+                    "All Components Issued",
+                ],
+                "status": (
+                    "All Components Issued"
+                ),
+                "instruction": (
+                    "All requested quantities are now "
+                    "issued. Please review the completed "
+                    "Material Request in IPMS."
+                ),
+                "button_text": (
+                    "View Material Request in IPMS"
+                ),
+                "action_url": (
+                    f"{self.get_ipms_base_url()}"
+                    f"/material-requests"
+                ),
+            },
+        )
+
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -1156,6 +1408,13 @@ class ProjectInventoryViewSet(
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # Prevent duplicate completion emails if a completed MR is
+        # synchronized again without issuing any new quantity.
+        was_fully_issued = all(
+            row.is_fulfilled
+            for row in project_rows
+        )
+
         raw_allocations = request.data.get(
             "allocations"
         )
@@ -1360,6 +1619,44 @@ class ProjectInventoryViewSet(
                 ),
                 is_read=False,
             )
+
+            # Final return email -> original MR requester/Engineer.
+            # Send once, only on the transition from incomplete to fully issued.
+            if not was_fully_issued:
+                current_user = getattr(
+                    request,
+                    "user",
+                    None,
+                )
+
+                if (
+                    current_user
+                    and getattr(
+                        current_user,
+                        "is_authenticated",
+                        False,
+                    )
+                ):
+                    issued_by_name = (
+                        self.get_user_display_name(
+                            current_user,
+                            "Inventory Team",
+                        )
+                    )
+                else:
+                    issued_by_name = (
+                        "Inventory Team"
+                    )
+
+                transaction.on_commit(
+                    lambda mr_id=material_request.id,
+                    issuer=issued_by_name: (
+                        self.send_requester_all_components_issued_email(
+                            mr_id,
+                            issued_by_name=issuer,
+                        )
+                    )
+                )
         else:
             current_status = str(
                 material_request.status or ""

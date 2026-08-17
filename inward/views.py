@@ -1,5 +1,7 @@
 from collections import defaultdict
 
+from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models import Q, Sum
 from django.utils import timezone
@@ -14,6 +16,7 @@ from inventory.models import (
     ProjectInventory,
 )
 from materialrequest.models import MaterialRequest
+from notifications.email_service import send_ipms_email
 from notifications.models import Notification
 from procurement.models import (
     PurchaseOrder,
@@ -22,6 +25,9 @@ from procurement.models import (
 
 from .models import InwardEntry
 from .serializers import InwardEntrySerializer
+
+
+User = get_user_model()
 
 
 class InwardQCSerializer(serializers.Serializer):
@@ -165,6 +171,323 @@ class InwardQCSerializer(serializers.Serializer):
 
 class InwardEntryViewSet(viewsets.ModelViewSet):
     serializer_class = InwardEntrySerializer
+
+    # ==========================================================
+    # INVENTORY EMAIL - QC PASSED COMPONENTS READY
+    # ==========================================================
+
+    @staticmethod
+    def get_user_display_name(
+        user,
+        fallback="User",
+    ):
+        if not user:
+            return fallback
+
+        return (
+            getattr(
+                user,
+                "employee_name",
+                "",
+            )
+            or getattr(
+                user,
+                "email",
+                "",
+            )
+            or fallback
+        )
+
+    @staticmethod
+    def get_ipms_base_url():
+        return str(
+            getattr(
+                settings,
+                "IPMS_BASE_URL",
+                "http://localhost:5173",
+            )
+            or "http://localhost:5173"
+        ).rstrip("/")
+
+    def send_inventory_qc_ready_email(
+        self,
+        material_request_id,
+        *,
+        workflow_complete=False,
+    ):
+        """
+        Email Inventory when MR-linked QC makes components available
+        for 'Provide Components'.
+
+        Supports BOTH:
+        - Partial QC: one component can be provided while other
+          components are still awaiting delivery/QC.
+        - Complete QC: the complete MR QC stage is ready for Inventory.
+
+        The caller only invokes this when new QC-passed purchased stock
+        becomes available, or when the MR enters the final QC-ready state.
+        """
+        try:
+            material_request = (
+                MaterialRequest.objects
+                .select_related("requester")
+                .get(pk=material_request_id)
+            )
+        except MaterialRequest.DoesNotExist:
+            return False
+
+        inventory_users = (
+            User.objects
+            .filter(
+                role__iexact="inventory",
+                is_active=True,
+            )
+            .exclude(email__isnull=True)
+            .exclude(email="")
+            .order_by("id")
+        )
+
+        if not inventory_users.exists():
+            print(
+                "QC INVENTORY EMAIL SKIPPED:",
+                material_request.material_request_id,
+                "- no active Inventory user with email.",
+            )
+            return False
+
+        project_rows = list(
+            ProjectInventory.objects
+            .select_related("component")
+            .filter(
+                material_request=material_request
+            )
+            .order_by("id")
+        )
+
+        ready_rows = []
+        total_ready_to_issue = 0
+        total_qc_passed = 0
+        total_qc_failed = 0
+
+        for row in project_rows:
+            remaining_required = max(
+                int(
+                    row.remaining_quantity
+                    or 0
+                ),
+                0,
+            )
+
+            ready_store = max(
+                int(
+                    row.remaining_store_quantity
+                    or 0
+                ),
+                0,
+            )
+
+            ready_purchased = max(
+                int(
+                    row.remaining_purchased_quantity
+                    or 0
+                ),
+                0,
+            )
+
+            ready_now = min(
+                remaining_required,
+                ready_store
+                + ready_purchased,
+            )
+
+            total_qc_passed += max(
+                int(
+                    row.qc_passed_quantity
+                    or 0
+                ),
+                0,
+            )
+
+            total_qc_failed += max(
+                int(
+                    row.qc_failed_quantity
+                    or 0
+                ),
+                0,
+            )
+
+            if ready_now <= 0:
+                continue
+
+            total_ready_to_issue += (
+                ready_now
+            )
+
+            component = getattr(
+                row,
+                "component",
+                None,
+            )
+
+            component_code = (
+                getattr(
+                    component,
+                    "component_id",
+                    "",
+                )
+                or getattr(
+                    component,
+                    "id",
+                    "",
+                )
+                or ""
+            )
+
+            component_name = (
+                getattr(
+                    component,
+                    "name",
+                    "",
+                )
+                or "Component"
+            )
+
+            ready_rows.append(
+                (
+                    f"{component_code} - "
+                    f"{component_name}: "
+                    f"Store Ready {ready_store}, "
+                    f"QC-Passed Purchased Ready "
+                    f"{ready_purchased}, "
+                    f"Ready to Issue {ready_now}"
+                ).strip()
+            )
+
+        if total_ready_to_issue <= 0:
+            print(
+                "QC INVENTORY EMAIL SKIPPED:",
+                material_request.material_request_id,
+                "- no quantity is currently ready to issue.",
+            )
+            return False
+
+        requester_name = (
+            material_request.requester_name
+            or self.get_user_display_name(
+                material_request.requester,
+                "Requester",
+            )
+        )
+
+        if workflow_complete:
+            subject = (
+                f"{material_request.material_request_id} "
+                f"QC completed - Inventory Action Required"
+            )
+
+            message = (
+                f"QC is completed for "
+                f"{material_request.material_request_id}. "
+                f"QC-passed and reserved components are "
+                f"ready for Inventory to provide."
+            )
+
+            status_label = (
+                "QC Checked - Ready to Provide"
+            )
+        else:
+            subject = (
+                f"{material_request.material_request_id} "
+                f"components ready after QC - "
+                f"Inventory Action Required"
+            )
+
+            message = (
+                f"New QC-passed components for "
+                f"{material_request.material_request_id} "
+                f"are ready for partial issue. "
+                f"Other MR components may still be "
+                f"awaiting delivery or QC."
+            )
+
+            status_label = (
+                "Components Ready for Partial Issue"
+            )
+
+        component_summary = (
+            "; ".join(ready_rows)
+            if ready_rows
+            else "-"
+        )
+
+        action_url = (
+            f"{self.get_ipms_base_url()}"
+            f"/notifications"
+        )
+
+        sent_any = False
+
+        for inventory_user in inventory_users:
+            sent = send_ipms_email(
+                recipient_email=inventory_user.email,
+                subject=subject,
+                context={
+                    "recipient_name": (
+                        self.get_user_display_name(
+                            inventory_user,
+                            "Inventory",
+                        )
+                    ),
+                    "message": message,
+                    "table_headers": [
+                        "MR ID",
+                        "Project",
+                        "Requested By",
+                        "Ready to Issue",
+                        "QC Passed",
+                        "QC Failed",
+                        "Components",
+                        "Status",
+                    ],
+                    "table_values": [
+                        material_request.material_request_id,
+                        material_request.project,
+                        requester_name,
+                        total_ready_to_issue,
+                        total_qc_passed,
+                        total_qc_failed,
+                        component_summary,
+                        status_label,
+                    ],
+                    "status": status_label,
+                    "instruction": (
+                        "Please open the Inventory "
+                        "notification and provide only "
+                        "the quantities currently ready "
+                        "for this Material Request."
+                    ),
+                    "button_text": (
+                        "Provide Components in IPMS"
+                    ),
+                    "action_url": action_url,
+                },
+            )
+
+            if sent:
+                sent_any = True
+
+        print(
+            "QC INVENTORY EMAIL SENT =",
+            sent_any,
+            "| MR =",
+            material_request.material_request_id,
+            "| READY =",
+            total_ready_to_issue,
+            "| COMPLETE =",
+            workflow_complete,
+        )
+
+        return sent_any
 
     def get_queryset(self):
         return (
@@ -653,6 +976,36 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
         if not material_request:
             return None
 
+        # ---------------------------------------------------------
+        # Capture the state BEFORE this QC synchronization.
+        #
+        # This is used to avoid duplicate Inventory emails when the
+        # same QC data is saved again. An email is sent when newly
+        # QC-passed purchased quantity becomes available.
+        # ---------------------------------------------------------
+        previous_mr_status = str(
+            material_request.status or ""
+        ).strip().upper()
+
+        previous_project_rows = list(
+            ProjectInventory.objects
+            .select_for_update()
+            .filter(
+                material_request=material_request
+            )
+        )
+
+        previous_purchased_ready = sum(
+            max(
+                int(
+                    row.remaining_purchased_quantity
+                    or 0
+                ),
+                0,
+            )
+            for row in previous_project_rows
+        )
+
         canonical_mr_number = str(
             material_request.material_request_id
         ).strip()
@@ -1010,6 +1363,23 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             and int(row.remaining_quantity or 0) > 0
         )
 
+        current_purchased_ready = sum(
+            max(
+                int(
+                    row.remaining_purchased_quantity
+                    or 0
+                ),
+                0,
+            )
+            for row in current_project_rows
+        )
+
+        newly_qc_ready_quantity = max(
+            current_purchased_ready
+            - previous_purchased_ready,
+            0,
+        )
+
         any_delivery_progress = (
             any(
                 str(
@@ -1093,6 +1463,19 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                     is_read=False,
                 )
 
+                # Send an email only when THIS QC update added new
+                # QC-passed purchased quantity. Re-saving identical
+                # QC data will not resend the same email.
+                if newly_qc_ready_quantity > 0:
+                    transaction.on_commit(
+                        lambda mr_id=material_request.id: (
+                            self.send_inventory_qc_ready_email(
+                                mr_id,
+                                workflow_complete=False,
+                            )
+                        )
+                    )
+
             return material_request
 
         current_status = str(
@@ -1155,6 +1538,29 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             ),
             is_read=False,
         )
+
+        # Final QC-ready email:
+        # - send when QC has newly made purchased stock available, OR
+        # - send once when the MR first enters the complete QC stage
+        #   and there is something for Inventory to provide.
+        should_send_complete_qc_email = (
+            total_ready_to_issue > 0
+            and (
+                newly_qc_ready_quantity > 0
+                or previous_mr_status
+                != "QC_CHECKED"
+            )
+        )
+
+        if should_send_complete_qc_email:
+            transaction.on_commit(
+                lambda mr_id=material_request.id: (
+                    self.send_inventory_qc_ready_email(
+                        mr_id,
+                        workflow_complete=True,
+                    )
+                )
+            )
 
         return material_request
 

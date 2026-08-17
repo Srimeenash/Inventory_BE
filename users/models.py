@@ -1,3 +1,5 @@
+import uuid
+
 from django.contrib.auth.models import (
     AbstractBaseUser,
     BaseUserManager,
@@ -128,6 +130,22 @@ class User(
         default=False
     )
 
+    # ---------------------------------------------------------
+    # FIRST-LOGIN EMAIL VERIFICATION
+    # ---------------------------------------------------------
+    # False:
+    #   employee must verify the HR-provided official email once.
+    #
+    # True:
+    #   future logins use email + IPMS password directly,
+    #   without OTP.
+    #
+    # If Admin changes the employee email later, serializers.py
+    # automatically resets this field to False.
+    email_verified = models.BooleanField(
+        default=False
+    )
+
     created_at = models.DateTimeField(
         auto_now_add=True
     )
@@ -143,3 +161,67 @@ class User(
 
     def __str__(self):
         return self.email
+
+
+class LoginOTP(models.Model):
+    """
+    One-time verification challenge used to verify the employee's
+    official HR-provided email during first login.
+
+    The raw 6-digit code is never stored. Only a Django password hash
+    of the code is saved in otp_hash.
+    """
+
+    id = models.UUIDField(
+        primary_key=True,
+        default=uuid.uuid4,
+        editable=False,
+    )
+
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="login_otps",
+    )
+
+    otp_hash = models.CharField(
+        max_length=255
+    )
+
+    expires_at = models.DateTimeField()
+
+    attempts = models.PositiveSmallIntegerField(
+        default=0
+    )
+
+    max_attempts = models.PositiveSmallIntegerField(
+        default=5
+    )
+
+    used_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True
+    )
+
+    class Meta:
+        ordering = [
+            "-created_at"
+        ]
+        indexes = [
+            models.Index(
+                fields=[
+                    "user",
+                    "created_at",
+                ]
+            ),
+        ]
+
+    def __str__(self):
+        return (
+            f"LoginOTP({self.user.email}, "
+            f"{self.created_at:%Y-%m-%d %H:%M:%S})"
+        )

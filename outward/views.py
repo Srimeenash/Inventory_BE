@@ -1,5 +1,7 @@
 from uuid import uuid4
 
+from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
@@ -16,10 +18,14 @@ from inventory.models import (
     ProjectInventory,
 )
 from materialrequest.models import MaterialRequest
+from notifications.email_service import send_ipms_email
 from notifications.models import Notification
 
 from .models import OutwardEntry
 from .serializers import OutwardEntrySerializer
+
+
+User = get_user_model()
 
 
 class OutwardEntryViewSet(viewsets.ModelViewSet):
@@ -160,6 +166,806 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                 user,
                 "is_superuser",
                 False,
+            )
+        )
+
+    @staticmethod
+    def get_ipms_base_url():
+        return str(
+            getattr(
+                settings,
+                "IPMS_BASE_URL",
+                "http://localhost:5173",
+            )
+            or "http://localhost:5173"
+        ).rstrip("/")
+
+    @staticmethod
+    def get_mail_user_name(
+        user,
+        fallback="User",
+    ):
+        if not user:
+            return fallback
+
+        return (
+            getattr(
+                user,
+                "employee_name",
+                "",
+            )
+            or getattr(
+                user,
+                "name",
+                "",
+            )
+            or getattr(
+                user,
+                "username",
+                "",
+            )
+            or getattr(
+                user,
+                "email",
+                "",
+            )
+            or fallback
+        )
+
+    @classmethod
+    def get_scrap_reference(
+        cls,
+        instance,
+    ):
+        return (
+            str(
+                getattr(
+                    instance,
+                    "code",
+                    "",
+                )
+                or ""
+            ).strip()
+            or f"SCRAP-{instance.pk}"
+        )
+
+    @classmethod
+    def get_scrap_component_label(
+        cls,
+        instance,
+    ):
+        component = getattr(
+            instance,
+            "component",
+            None,
+        )
+
+        component_code = str(
+            getattr(
+                component,
+                "component_id",
+                "",
+            )
+            or ""
+        ).strip()
+
+        component_name = str(
+            getattr(
+                component,
+                "name",
+                "",
+            )
+            or ""
+        ).strip()
+
+        return (
+            " - ".join(
+                value
+                for value in [
+                    component_code,
+                    component_name,
+                ]
+                if value
+            )
+            or str(
+                getattr(
+                    instance,
+                    "product_name",
+                    "",
+                )
+                or ""
+            ).strip()
+            or "-"
+        )
+
+    @classmethod
+    def resolve_scrap_requester_user(
+        cls,
+        instance,
+    ):
+        """
+        Exact return-mail recipient resolution.
+
+        New Scrap records store requested_by_user_id from request.user.
+        Engineer Scrap already stores this field.
+
+        Safe fallbacks are used only for older rows.
+        No random user is ever selected.
+        """
+        requester_user_id = getattr(
+            instance,
+            "requested_by_user_id",
+            None,
+        )
+
+        if requester_user_id:
+            user = (
+                User.objects
+                .filter(
+                    pk=requester_user_id,
+                    is_active=True,
+                )
+                .first()
+            )
+
+            if user:
+                return user
+
+        # MR-linked Engineer Scrap compatibility fallback.
+        material_request = getattr(
+            instance,
+            "material_request",
+            None,
+        )
+
+        mr_requester = getattr(
+            material_request,
+            "requester",
+            None,
+        )
+
+        if (
+            mr_requester
+            and getattr(
+                mr_requester,
+                "is_active",
+                True,
+            )
+        ):
+            return mr_requester
+
+        requester_reference = str(
+            getattr(
+                instance,
+                "requested_by",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if not requester_reference:
+            return None
+
+        # Exact email fallback.
+        user = (
+            User.objects
+            .filter(
+                email__iexact=requester_reference,
+                is_active=True,
+            )
+            .first()
+        )
+
+        if user:
+            return user
+
+        # Employee-name fallback for old rows.
+        try:
+            user = (
+                User.objects
+                .filter(
+                    employee_name__iexact=(
+                        requester_reference
+                    ),
+                    is_active=True,
+                )
+                .first()
+            )
+
+            if user:
+                return user
+        except Exception:
+            pass
+
+        # Username compatibility fallback.
+        try:
+            user = (
+                User.objects
+                .filter(
+                    username__iexact=(
+                        requester_reference
+                    ),
+                    is_active=True,
+                )
+                .first()
+            )
+
+            if user:
+                return user
+        except Exception:
+            pass
+
+        return None
+
+    @classmethod
+    def ensure_scrap_manager_notification(
+        cls,
+        instance,
+        requester_name,
+    ):
+        """
+        Backend becomes the source of truth for the Manager Scrap
+        notification. Existing frontends already check whether the
+        notification exists, so they will not create duplicates.
+        """
+        requester_name = (
+            str(
+                requester_name
+                or "User"
+            ).strip()
+            or "User"
+        )
+
+        remarks = (
+            str(
+                getattr(
+                    instance,
+                    "remarks",
+                    "",
+                )
+                or "Scrap"
+            ).strip()
+            or "Scrap"
+        )
+
+        notification, created = (
+            Notification.objects
+            .get_or_create(
+                category="SCRAP",
+                receiver="MANAGER",
+                reference_id=str(
+                    instance.pk
+                ),
+                defaults={
+                    "title":
+                        requester_name,
+                    "requested_by":
+                        requester_name,
+                    "message":
+                        remarks,
+                    "status":
+                        "PENDING_MANAGER",
+                    "is_read":
+                        False,
+                },
+            )
+        )
+
+        if not created:
+            notification.title = (
+                requester_name
+            )
+            notification.requested_by = (
+                requester_name
+            )
+            notification.message = remarks
+            notification.status = (
+                "PENDING_MANAGER"
+            )
+            notification.is_read = False
+
+            notification.save(
+                update_fields=[
+                    "title",
+                    "requested_by",
+                    "message",
+                    "status",
+                    "is_read",
+                ]
+            )
+
+        return notification
+
+    @classmethod
+    def send_scrap_manager_approval_email(
+        cls,
+        outward_id,
+    ):
+        """
+        Approval-request email to every active Manager for:
+        - Inventory-created Scrap
+        - Outward-created Scrap
+        - Engineer-created Scrap
+        """
+        try:
+            instance = (
+                OutwardEntry.objects
+                .select_related(
+                    "component",
+                    "material_request",
+                )
+                .get(pk=outward_id)
+            )
+        except OutwardEntry.DoesNotExist:
+            return False
+
+        managers = (
+            User.objects
+            .filter(
+                role__iexact="manager",
+                is_active=True,
+            )
+            .exclude(email__isnull=True)
+            .exclude(email="")
+            .order_by("id")
+        )
+
+        if not managers.exists():
+            print(
+                "SCRAP MANAGER EMAIL SKIPPED:",
+                cls.get_scrap_reference(
+                    instance
+                ),
+                "- no active Manager user with email.",
+            )
+            return False
+
+        requester_user = (
+            cls.resolve_scrap_requester_user(
+                instance
+            )
+        )
+
+        requester_name = (
+            cls.get_mail_user_name(
+                requester_user,
+                getattr(
+                    instance,
+                    "requested_by",
+                    "",
+                )
+                or "User",
+            )
+        )
+
+        material_request = getattr(
+            instance,
+            "material_request",
+            None,
+        )
+
+        mr_number = (
+            getattr(
+                material_request,
+                "material_request_id",
+                "",
+            )
+            or "-"
+        )
+
+        source = str(
+            getattr(
+                instance,
+                "source",
+                "",
+            )
+            or "DIRECT"
+        ).strip().upper()
+
+        scrap_reference = (
+            cls.get_scrap_reference(
+                instance
+            )
+        )
+
+        component_label = (
+            cls.get_scrap_component_label(
+                instance
+            )
+        )
+
+        subject = (
+            f"{scrap_reference} submitted by "
+            f"{requester_name} - Approval Required"
+        )
+
+        sent_any = False
+
+        for manager in managers:
+            sent = send_ipms_email(
+                recipient_email=manager.email,
+                subject=subject,
+                context={
+                    "recipient_name":
+                        cls.get_mail_user_name(
+                            manager,
+                            "Manager",
+                        ),
+                    "message": (
+                        f"A Scrap request was "
+                        f"submitted by "
+                        f"{requester_name} and "
+                        f"requires Manager approval."
+                    ),
+                    "table_headers": [
+                        "Scrap Reference",
+                        "Requested By",
+                        "Source",
+                        "Material Request",
+                        "Component",
+                        "Quantity",
+                        "Scrap Date",
+                        "Remarks",
+                        "Status",
+                    ],
+                    "table_values": [
+                        scrap_reference,
+                        requester_name,
+                        source,
+                        mr_number,
+                        component_label,
+                        int(
+                            getattr(
+                                instance,
+                                "quantity",
+                                0,
+                            )
+                            or 0
+                        ),
+                        getattr(
+                            instance,
+                            "out_date",
+                            "",
+                        )
+                        or "-",
+                        getattr(
+                            instance,
+                            "remarks",
+                            "",
+                        )
+                        or "-",
+                        "Pending Manager Approval",
+                    ],
+                    "status":
+                        "Pending Manager Approval",
+                    "instruction": (
+                        "Please review this Scrap "
+                        "request from Manager "
+                        "Notifications in IPMS."
+                    ),
+                    "button_text":
+                        "Review Scrap in IPMS",
+                    "action_url": (
+                        f"{cls.get_ipms_base_url()}"
+                        f"/notifications"
+                    ),
+                },
+            )
+
+            if sent:
+                sent_any = True
+
+        print(
+            "SCRAP MANAGER EMAIL SENT =",
+            sent_any,
+            "| SCRAP =",
+            scrap_reference,
+            "| SOURCE =",
+            source,
+        )
+
+        return sent_any
+
+    @classmethod
+    def send_scrap_requester_result_email(
+        cls,
+        outward_id,
+        *,
+        outcome,
+        manager_name,
+        rejection_reason="",
+    ):
+        """
+        Return Manager Approved / Rejected result to the original
+        authenticated Scrap requester.
+        """
+        try:
+            instance = (
+                OutwardEntry.objects
+                .select_related(
+                    "component",
+                    "material_request",
+                )
+                .get(pk=outward_id)
+            )
+        except OutwardEntry.DoesNotExist:
+            return False
+
+        requester = (
+            cls.resolve_scrap_requester_user(
+                instance
+            )
+        )
+
+        if not requester:
+            print(
+                "SCRAP RESULT EMAIL SKIPPED:",
+                cls.get_scrap_reference(
+                    instance
+                ),
+                "- original requester could not be resolved.",
+            )
+            return False
+
+        recipient_email = str(
+            getattr(
+                requester,
+                "email",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if not recipient_email:
+            print(
+                "SCRAP RESULT EMAIL SKIPPED:",
+                cls.get_scrap_reference(
+                    instance
+                ),
+                "- requester email is empty.",
+            )
+            return False
+
+        requester_name = (
+            cls.get_mail_user_name(
+                requester,
+                "User",
+            )
+        )
+
+        scrap_reference = (
+            cls.get_scrap_reference(
+                instance
+            )
+        )
+
+        component_label = (
+            cls.get_scrap_component_label(
+                instance
+            )
+        )
+
+        normalized_outcome = str(
+            outcome or ""
+        ).strip().lower()
+
+        if normalized_outcome == "rejected":
+            subject = (
+                f"{scrap_reference} - "
+                f"Manager Rejected"
+            )
+            status_label = (
+                "Manager Rejected"
+            )
+            message = (
+                f"Manager has rejected your "
+                f"Scrap request "
+                f"{scrap_reference}."
+            )
+            instruction = (
+                "Please review the Manager "
+                "rejection reason in IPMS."
+            )
+        else:
+            subject = (
+                f"{scrap_reference} - "
+                f"Manager Approved"
+            )
+            status_label = (
+                "Manager Approved"
+            )
+            message = (
+                f"Manager has approved your "
+                f"Scrap request "
+                f"{scrap_reference}."
+            )
+            instruction = (
+                "Your Scrap request has been "
+                "approved by Manager."
+            )
+
+        sent = send_ipms_email(
+            recipient_email=recipient_email,
+            subject=subject,
+            context={
+                "recipient_name":
+                    requester_name,
+                "message":
+                    message,
+                "table_headers": [
+                    "Scrap Reference",
+                    "Component",
+                    "Quantity",
+                    "Scrap Date",
+                    "Decision",
+                    "Decision By",
+                    "Rejection Reason",
+                    "Remarks",
+                ],
+                "table_values": [
+                    scrap_reference,
+                    component_label,
+                    int(
+                        getattr(
+                            instance,
+                            "quantity",
+                            0,
+                        )
+                        or 0
+                    ),
+                    getattr(
+                        instance,
+                        "out_date",
+                        "",
+                    )
+                    or "-",
+                    status_label,
+                    manager_name
+                    or "Manager",
+                    (
+                        rejection_reason
+                        if normalized_outcome
+                        == "rejected"
+                        else "-"
+                    ),
+                    getattr(
+                        instance,
+                        "remarks",
+                        "",
+                    )
+                    or "-",
+                ],
+                "status":
+                    status_label,
+                "instruction":
+                    instruction,
+                "button_text":
+                    "View Scrap in IPMS",
+                "action_url": (
+                    f"{cls.get_ipms_base_url()}"
+                    f"/outward"
+                ),
+            },
+        )
+
+        print(
+            "SCRAP RESULT EMAIL SENT =",
+            sent,
+            "| SCRAP =",
+            scrap_reference,
+            "| TO =",
+            recipient_email,
+            "| OUTCOME =",
+            status_label,
+        )
+
+        return sent
+
+    @classmethod
+    def register_new_scrap_workflow(
+        cls,
+        instance,
+        user,
+    ):
+        """
+        Called only after a new Scrap OutwardEntry exists.
+
+        Stores requester identity, creates/refreshes Manager notification,
+        and queues Manager approval-request mail after transaction commit.
+        """
+        if (
+            str(
+                getattr(
+                    instance,
+                    "outward_type",
+                    "",
+                )
+                or ""
+            ).strip().upper()
+            != "SCRAP"
+        ):
+            return
+
+        authenticated_user = (
+            user
+            if (
+                user
+                and getattr(
+                    user,
+                    "is_authenticated",
+                    False,
+                )
+            )
+            else None
+        )
+
+        requester_name = (
+            cls.get_actor_name(
+                authenticated_user
+            )
+            if authenticated_user
+            else (
+                str(
+                    getattr(
+                        instance,
+                        "requested_by",
+                        "",
+                    )
+                    or "User"
+                ).strip()
+                or "User"
+            )
+        )
+
+        update_fields = []
+
+        instance.requested_by = (
+            requester_name
+        )
+        update_fields.append(
+            "requested_by"
+        )
+
+        if authenticated_user:
+            instance.requested_by_user_id = (
+                authenticated_user.pk
+            )
+            update_fields.append(
+                "requested_by_user_id"
+            )
+
+        if not str(
+            getattr(
+                instance,
+                "source",
+                "",
+            )
+            or ""
+        ).strip():
+            instance.source = "DIRECT"
+            update_fields.append(
+                "source"
+            )
+
+        instance.save(
+            update_fields=list(
+                dict.fromkeys(
+                    update_fields
+                    + ["updated_at"]
+                )
+            )
+        )
+
+        cls.ensure_scrap_manager_notification(
+            instance,
+            requester_name,
+        )
+
+        transaction.on_commit(
+            lambda outward_id=instance.pk: (
+                cls.send_scrap_manager_approval_email(
+                    outward_id
+                )
             )
         )
 
@@ -1058,7 +1864,18 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
 
         with transaction.atomic():
-            instance = self.save_stock_aware_entry(serializer)
+            instance = self.save_stock_aware_entry(
+                serializer
+            )
+
+            self.register_new_scrap_workflow(
+                instance,
+                getattr(
+                    request,
+                    "user",
+                    None,
+                ),
+            )
 
         output = self.get_serializer(instance)
         headers = self.get_success_headers(output.data)
@@ -1101,8 +1918,23 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
 
                 try:
                     serializer.is_valid(raise_exception=True)
+                    created_instance = (
+                        self.save_stock_aware_entry(
+                            serializer
+                        )
+                    )
+
+                    self.register_new_scrap_workflow(
+                        created_instance,
+                        getattr(
+                            request,
+                            "user",
+                            None,
+                        ),
+                    )
+
                     created.append(
-                        self.save_stock_aware_entry(serializer)
+                        created_instance
                     )
                 except ValidationError as error:
                     raise ValidationError(
@@ -1568,20 +2400,14 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                 "material_request", "requested_by", "requested_by_user_id",
                 "moved_to_inventory", "moved_at", "approval_status", "status", "updated_at",
             ])
-            notification, created = Notification.objects.get_or_create(
-                category="SCRAP", receiver="MANAGER", reference_id=str(instance.pk),
-                defaults={
-                    "title": actor_name, "requested_by": actor_name,
-                    "message": remarks, "status": "PENDING_MANAGER", "is_read": False,
-                },
+            # Backend-owned Manager notification + approval email.
+            # requested_by/requested_by_user_id were already set above,
+            # so the later Approved/Rejected return mail goes to this
+            # exact Engineer.
+            self.register_new_scrap_workflow(
+                instance,
+                user,
             )
-            if not created:
-                notification.title = actor_name
-                notification.requested_by = actor_name
-                notification.message = remarks
-                notification.status = "PENDING_MANAGER"
-                notification.is_read = False
-                notification.save(update_fields=["title", "requested_by", "message", "status", "is_read"])
 
         return Response(
             self.get_serializer(instance).data,
@@ -2125,6 +2951,42 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                 ]
             )
 
+            manager_name = (
+                self.get_actor_name(
+                    user
+                )
+            )
+
+            Notification.objects.filter(
+                category="SCRAP",
+                receiver="MANAGER",
+                reference_id=str(
+                    instance.pk
+                ),
+            ).update(
+                status=(
+                    "MANAGER_APPROVED"
+                    if is_engineer_staged
+                    else "APPROVED"
+                ),
+                is_read=True,
+                message=(
+                    f"Scrap approved by "
+                    f"{manager_name}."
+                ),
+            )
+
+            transaction.on_commit(
+                lambda outward_id=instance.pk,
+                actor=manager_name: (
+                    self.send_scrap_requester_result_email(
+                        outward_id,
+                        outcome="approved",
+                        manager_name=actor,
+                    )
+                )
+            )
+
         return Response(
             self.get_serializer(
                 instance
@@ -2217,6 +3079,43 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                     "rejected_by",
                     "updated_at",
                 ]
+            )
+
+            manager_name = (
+                self.get_actor_name(
+                    user
+                )
+            )
+
+            Notification.objects.filter(
+                category="SCRAP",
+                receiver="MANAGER",
+                reference_id=str(
+                    instance.pk
+                ),
+            ).update(
+                status="REJECTED",
+                is_read=True,
+                message=(
+                    f"Scrap rejected by "
+                    f"{manager_name}. "
+                    f"Reason: {reason}"
+                ),
+            )
+
+            transaction.on_commit(
+                lambda outward_id=instance.pk,
+                actor=manager_name,
+                reject_reason=reason: (
+                    self.send_scrap_requester_result_email(
+                        outward_id,
+                        outcome="rejected",
+                        manager_name=actor,
+                        rejection_reason=(
+                            reject_reason
+                        ),
+                    )
+                )
             )
 
         return Response(

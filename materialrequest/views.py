@@ -1,8 +1,11 @@
 from collections import defaultdict
 
+from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models import Q, Sum
-
+from rest_framework.permissions import IsAuthenticated
+from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework import status, viewsets
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
@@ -12,6 +15,7 @@ from inventory.models import (
     InventoryReservation,
     ProjectInventory,
 )
+from notifications.email_service import send_ipms_email
 from notifications.models import Notification
 from procurement.models import (
     PurchaseOrder,
@@ -28,6 +32,8 @@ ACTIVE_RESERVATION_STATUSES = {
     "PARTIAL",
 }
 
+User = get_user_model()
+
 
 class MaterialRequestViewSet(viewsets.ModelViewSet):
     """
@@ -43,6 +49,9 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
     Inventory team provides the component.
     """
 
+
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
     queryset = (
         MaterialRequest.objects
         .prefetch_related(
@@ -458,6 +467,598 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
         queryset.exclude(pk=notification.pk).delete()
         return notification
 
+
+    @staticmethod
+    def get_user_display_name(user, fallback="User"):
+        if user is None:
+            return fallback
+
+        return (
+            getattr(user, "employee_name", None)
+            or getattr(user, "email", None)
+            or fallback
+        )
+
+    @staticmethod
+    def get_ipms_base_url():
+        return str(
+            getattr(
+                settings,
+                "IPMS_BASE_URL",
+                "http://localhost:5173",
+            )
+            or "http://localhost:5173"
+        ).rstrip("/")
+
+    @staticmethod
+    def format_mail_date(value):
+        if not value:
+            return "-"
+
+        try:
+            return value.strftime("%d/%m/%Y")
+        except Exception:
+            return str(value)
+
+    def send_manager_approval_email(
+        self,
+        material_request_id,
+    ):
+        """
+        Send the MR approval-request email to every active Manager account.
+        This method is called only after the database transaction commits.
+        """
+        try:
+            material_request = (
+                MaterialRequest.objects
+                .select_related("requester")
+                .get(pk=material_request_id)
+            )
+        except MaterialRequest.DoesNotExist:
+            return
+
+        managers = (
+            User.objects
+            .filter(
+                role__iexact="manager",
+                is_active=True,
+            )
+            .exclude(email__isnull=True)
+            .exclude(email="")
+            .order_by("id")
+        )
+
+        requester_name = (
+            material_request.requester_name
+            or self.get_user_display_name(
+                material_request.requester,
+                "User",
+            )
+        )
+
+        subject = (
+            f"{material_request.material_request_id} "
+            f"submitted by {requester_name} "
+            f"- Approval Required"
+        )
+
+        action_url = (
+            f"{self.get_ipms_base_url()}/notifications"
+        )
+
+        for manager in managers:
+            send_ipms_email(
+                recipient_email=manager.email,
+                subject=subject,
+                context={
+                    "recipient_name": (
+                        self.get_user_display_name(
+                            manager,
+                            "Manager",
+                        )
+                    ),
+                    "message": (
+                        f"The following Material Request "
+                        f"submitted by {requester_name} "
+                        f"is awaiting your approval."
+                    ),
+                    "table_headers": [
+                        "MR ID",
+                        "Request Type",
+                        "Project",
+                        "Submitted By",
+                        "Required Date",
+                        "Status",
+                    ],
+                    "table_values": [
+                        material_request.material_request_id,
+                        material_request.request_type,
+                        material_request.project,
+                        requester_name,
+                        self.format_mail_date(
+                            material_request.required_date
+                        ),
+                        "Pending Manager",
+                    ],
+                    "status": "Pending Manager",
+                    "instruction": (
+                        "Please review the request and take "
+                        "the appropriate action in IPMS."
+                    ),
+                    "button_text": (
+                        "Review Request in IPMS"
+                    ),
+                    "action_url": action_url,
+                },
+            )
+
+    def send_requester_result_email(
+        self,
+        material_request_id,
+        *,
+        outcome,
+        action_role="Manager",
+    ):
+        """
+        Email the original MR requester after Manager approval/rejection.
+        """
+        try:
+            material_request = (
+                MaterialRequest.objects
+                .select_related("requester")
+                .get(pk=material_request_id)
+            )
+        except MaterialRequest.DoesNotExist:
+            return
+
+        requester = material_request.requester
+
+        if (
+            requester is None
+            or not getattr(requester, "email", None)
+        ):
+            # Existing old MRs may have requester_name only.
+            # Do not guess an email address from a free-text name.
+            return
+
+        requester_name = (
+            material_request.requester_name
+            or self.get_user_display_name(
+                requester,
+                "User",
+            )
+        )
+
+        normalized_outcome = str(
+            outcome or ""
+        ).strip().lower()
+
+        approved = normalized_outcome == "approved"
+
+        if approved:
+            subject = (
+                f"{material_request.material_request_id} "
+                f"has been approved by {action_role}"
+            )
+
+            message = (
+                f"Your Material Request "
+                f"{material_request.material_request_id} "
+                f"has been approved by {action_role}."
+            )
+
+            mail_status = "Approved"
+
+            instruction = (
+                "Your request has moved to the next "
+                "stage of the IPMS workflow."
+            )
+
+            table_headers = [
+                "MR ID",
+                "Request Type",
+                "Project",
+                "Submitted By",
+                "Approved By",
+                "Status",
+            ]
+
+            table_values = [
+                material_request.material_request_id,
+                material_request.request_type,
+                material_request.project,
+                requester_name,
+                action_role,
+                mail_status,
+            ]
+
+        else:
+            subject = (
+                f"{material_request.material_request_id} "
+                f"has been rejected by {action_role}"
+            )
+
+            message = (
+                f"Your Material Request "
+                f"{material_request.material_request_id} "
+                f"has been rejected by {action_role}."
+            )
+
+            mail_status = "Rejected"
+
+            instruction = (
+                "Please review the rejection reason "
+                "and make the required correction."
+            )
+
+            table_headers = [
+                "MR ID",
+                "Request Type",
+                "Project",
+                "Submitted By",
+                "Rejected By",
+                "Status",
+                "Rejection Reason",
+            ]
+
+            table_values = [
+                material_request.material_request_id,
+                material_request.request_type,
+                material_request.project,
+                requester_name,
+                (
+                    material_request.rejected_by
+                    or action_role
+                ),
+                mail_status,
+                (
+                    material_request.rejection_reason
+                    or "-"
+                ),
+            ]
+
+        send_ipms_email(
+            recipient_email=requester.email,
+            subject=subject,
+            context={
+                "recipient_name": requester_name,
+                "message": message,
+                "table_headers": table_headers,
+                "table_values": table_values,
+                "status": mail_status,
+                "instruction": instruction,
+                "button_text": "View Request in IPMS",
+                "action_url": (
+                    f"{self.get_ipms_base_url()}"
+                    f"/material-requests"
+                ),
+            },
+        )
+
+    def send_procurement_required_email(
+        self,
+        material_request_id,
+    ):
+        """
+        Email every active Procurement user after Manager approval when the
+        Material Request still has an unreserved shortage that requires a PO.
+        """
+        try:
+            material_request = (
+                MaterialRequest.objects
+                .select_related("requester")
+                .get(pk=material_request_id)
+            )
+        except MaterialRequest.DoesNotExist:
+            return
+
+        reservations = list(
+            InventoryReservation.objects
+            .select_related("component")
+            .filter(
+                material_request=material_request,
+                procurement_shortage_quantity__gt=0,
+            )
+            .order_by("id")
+        )
+
+        if not reservations:
+            return
+
+        procurement_users = (
+            User.objects
+            .filter(
+                role__iexact="procurement",
+                is_active=True,
+            )
+            .exclude(email__isnull=True)
+            .exclude(email="")
+            .order_by("id")
+        )
+
+        if not procurement_users.exists():
+            return
+
+        requester_name = (
+            material_request.requester_name
+            or self.get_user_display_name(
+                material_request.requester,
+                "User",
+            )
+        )
+
+        total_shortage = sum(
+            max(
+                int(
+                    reservation.procurement_shortage_quantity
+                    or 0
+                ),
+                0,
+            )
+            for reservation in reservations
+        )
+
+        component_lines = []
+
+        for reservation in reservations:
+            component_code, component_name = (
+                self.get_component_identity(
+                    reservation.component
+                )
+            )
+
+            component_lines.append(
+                (
+                    f"{component_code} "
+                    f"{component_name} - "
+                    f"Purchase: "
+                    f"{int(reservation.procurement_shortage_quantity or 0)}"
+                ).strip()
+            )
+
+        component_summary = "; ".join(
+            component_lines
+        )
+
+        subject = (
+            f"{material_request.material_request_id} "
+            f"approved - Procurement Action Required"
+        )
+
+        action_url = (
+            f"{self.get_ipms_base_url()}"
+            f"/materialsnotifications"
+        )
+
+        for procurement_user in procurement_users:
+            send_ipms_email(
+                recipient_email=procurement_user.email,
+                subject=subject,
+                context={
+                    "recipient_name": (
+                        self.get_user_display_name(
+                            procurement_user,
+                            "Procurement",
+                        )
+                    ),
+                    "message": (
+                        f"Material Request "
+                        f"{material_request.material_request_id} "
+                        f"has been approved by Manager and "
+                        f"requires procurement."
+                    ),
+                    "table_headers": [
+                        "MR ID",
+                        "Project",
+                        "Requested By",
+                        "Purchase Qty",
+                        "Components",
+                        "Status",
+                    ],
+                    "table_values": [
+                        material_request.material_request_id,
+                        material_request.project,
+                        requester_name,
+                        total_shortage,
+                        component_summary,
+                        "Procurement Pending",
+                    ],
+                    "status": "Procurement Pending",
+                    "instruction": (
+                        "Please review the shortage and raise "
+                        "the required Purchase Order in IPMS."
+                    ),
+                    "button_text": (
+                        "Open Procurement in IPMS"
+                    ),
+                    "action_url": action_url,
+                },
+            )
+
+
+
+    def send_inventory_required_email(
+        self,
+        material_request_id,
+    ):
+        """
+        Email every active Inventory user after Manager approval when
+        existing In-Store stock has been reserved for this MR.
+
+        This intentionally works alongside Procurement:
+        a partially available MR can send BOTH Inventory and Procurement
+        emails from the same Manager approval.
+        """
+        try:
+            material_request = (
+                MaterialRequest.objects
+                .select_related("requester")
+                .get(pk=material_request_id)
+            )
+        except MaterialRequest.DoesNotExist:
+            return False
+
+        reservations = list(
+            InventoryReservation.objects
+            .select_related("component")
+            .filter(
+                material_request=material_request,
+                reserved_store_quantity__gt=0,
+            )
+            .order_by("id")
+        )
+
+        reservation_rows = []
+
+        for reservation in reservations:
+            reserved = max(
+                int(
+                    reservation.reserved_store_quantity
+                    or 0
+                ),
+                0,
+            )
+
+            issued = max(
+                int(
+                    reservation.issued_store_quantity
+                    or 0
+                ),
+                0,
+            )
+
+            remaining = max(
+                reserved - issued,
+                0,
+            )
+
+            if remaining <= 0:
+                continue
+
+            reservation_rows.append(
+                (
+                    reservation,
+                    remaining,
+                )
+            )
+
+        if not reservation_rows:
+            return False
+
+        inventory_users = (
+            User.objects
+            .filter(
+                role__iexact="inventory",
+                is_active=True,
+            )
+            .exclude(email__isnull=True)
+            .exclude(email="")
+            .order_by("id")
+        )
+
+        if not inventory_users.exists():
+            return False
+
+        requester_name = (
+            material_request.requester_name
+            or self.get_user_display_name(
+                material_request.requester,
+                "User",
+            )
+        )
+
+        total_ready = sum(
+            remaining
+            for _, remaining
+            in reservation_rows
+        )
+
+        component_lines = []
+
+        for reservation, remaining in reservation_rows:
+            component_code, component_name = (
+                self.get_component_identity(
+                    reservation.component
+                )
+            )
+
+            component_lines.append(
+                (
+                    f"{component_code} "
+                    f"{component_name} - "
+                    f"Ready to Issue: {remaining}"
+                ).strip()
+            )
+
+        component_summary = "; ".join(
+            component_lines
+        )
+
+        subject = (
+            f"{material_request.material_request_id} "
+            f"approved - Inventory Action Required"
+        )
+
+        action_url = (
+            f"{self.get_ipms_base_url()}"
+            f"/notifications"
+        )
+
+        sent_any = False
+
+        for inventory_user in inventory_users:
+            sent = send_ipms_email(
+                recipient_email=inventory_user.email,
+                subject=subject,
+                context={
+                    "recipient_name": (
+                        self.get_user_display_name(
+                            inventory_user,
+                            "Inventory",
+                        )
+                    ),
+                    "message": (
+                        f"Material Request "
+                        f"{material_request.material_request_id} "
+                        f"has been approved by Manager. "
+                        f"Existing In-Store stock is reserved "
+                        f"and ready to issue."
+                    ),
+                    "table_headers": [
+                        "MR ID",
+                        "Project",
+                        "Requested By",
+                        "Ready Qty",
+                        "Components",
+                        "Status",
+                    ],
+                    "table_values": [
+                        material_request.material_request_id,
+                        material_request.project,
+                        requester_name,
+                        total_ready,
+                        component_summary,
+                        "Inventory Pending",
+                    ],
+                    "status": "Inventory Pending",
+                    "instruction": (
+                        "Please review the reserved components "
+                        "and provide the available quantities "
+                        "to this Material Request in IPMS."
+                    ),
+                    "button_text": (
+                        "Open Inventory Request in IPMS"
+                    ),
+                    "action_url": action_url,
+                },
+            )
+
+            if sent:
+                sent_any = True
+
+        return sent_any
+
+
     def create_manager_notification(self, material_request):
         self.upsert_notification(
             material_request,
@@ -727,13 +1328,39 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
 
     @transaction.atomic
     def perform_create(self, serializer):
+        current_user = self.request.user
+
+        requester_name = (
+            getattr(
+                current_user,
+                "employee_name",
+                None,
+            )
+            or getattr(
+                current_user,
+                "email",
+                None,
+            )
+            or "User"
+        )
+
         material_request = serializer.save(
+            requester=current_user,
+            requester_name=requester_name,
             status="PENDING_MANAGER",
             approval_status="PENDING_MANAGER",
         )
 
         self.create_manager_notification(
             material_request
+        )
+
+        transaction.on_commit(
+            lambda mr_id=material_request.id: (
+                self.send_manager_approval_email(
+                    mr_id
+                )
+            )
         )
 
     @transaction.atomic
@@ -802,15 +1429,28 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
             material_request.status = (
                 "PENDING_MANAGER"
             )
+
             material_request.save(
                 update_fields=[
                     "status",
                     "approval_status",
                 ]
             )
+
             self.create_manager_notification(
                 material_request
             )
+
+            # Re-send approval email when MR is
+            # submitted again to Manager.
+            transaction.on_commit(
+                lambda mr_id=material_request.id: (
+                    self.send_manager_approval_email(
+                        mr_id
+                    )
+                )
+            )
+
             return
 
         if (
@@ -832,6 +1472,52 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
             self.route_after_manager_approval(
                 material_request
             )
+
+            transaction.on_commit(
+                lambda mr_id=material_request.id: (
+                    self.send_requester_result_email(
+                        mr_id,
+                        outcome="approved",
+                        action_role="Manager",
+                    )
+                )
+            )
+
+            if (
+                str(
+                    material_request.status or ""
+                ).strip().upper()
+                == "PROCUREMENT_PENDING"
+            ):
+                transaction.on_commit(
+                    lambda mr_id=material_request.id: (
+                        self.send_procurement_required_email(
+                            mr_id
+                        )
+                    )
+                )
+
+            # Inventory and Procurement are independent source-wise routes.
+            # If any existing stock is reserved, Inventory must receive an
+            # email even when this same MR also has a Procurement shortage.
+            has_inventory_allocation = (
+                InventoryReservation.objects
+                .filter(
+                    material_request=material_request,
+                    reserved_store_quantity__gt=0,
+                )
+                .exists()
+            )
+
+            if has_inventory_allocation:
+                transaction.on_commit(
+                    lambda mr_id=material_request.id: (
+                        self.send_inventory_required_email(
+                            mr_id
+                        )
+                    )
+                )
+
             return
 
         if (
@@ -879,6 +1565,16 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
                     "INVENTORY",
                 ],
             ).delete()
+
+            transaction.on_commit(
+                lambda mr_id=material_request.id: (
+                    self.send_requester_result_email(
+                        mr_id,
+                        outcome="rejected",
+                        action_role="Manager",
+                    )
+                )
+            )
             return
 
     @transaction.atomic

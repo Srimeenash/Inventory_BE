@@ -6,10 +6,14 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
+from rest_framework_simplejwt.authentication import JWTAuthentication
 from django.contrib.staticfiles import finders
 from inventory.models import InventoryReservation
 from materialrequest.models import MaterialRequest
 from notifications.models import Notification
+from notifications.email_service import send_ipms_email
+from users.models import User
+from django.conf import settings
 from decimal import Decimal
 from io import BytesIO
 
@@ -77,9 +81,1162 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
     )
 
     serializer_class = PurchaseOrderSerializer
+
+    # Parse JWT when the caller sends one, but preserve the
+    # existing AllowAny behavior for routes that still rely on it.
+    authentication_classes = [JWTAuthentication]
     permission_classes = [AllowAny]
 
+    # ==========================================================
+    # ORIGINAL PO SENDER / FINANCE NOTIFICATION HELPERS
+    # ==========================================================
 
+    def get_authenticated_po_sender_name(self):
+        """
+        Return a stable identity for the user who creates/raises the PO.
+
+        IMPORTANT:
+        Prefer the authenticated user's email because employee display
+        names can differ (for example "Karthik" vs "Karthik S").
+        Notification.requested_by can store up to 150 characters, so the
+        company email is safe and gives us an exact user match later.
+        """
+        user = getattr(
+            self.request,
+            "user",
+            None,
+        )
+
+        if (
+            not user
+            or not getattr(
+                user,
+                "is_authenticated",
+                False,
+            )
+        ):
+            return ""
+
+        email = str(
+            getattr(
+                user,
+                "email",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if email:
+            return email[:150]
+
+        return str(
+            self.get_user_display_name(
+                user,
+                "",
+            )
+            or ""
+        ).strip()[:150]
+
+    def save_finance_notification_with_sender(
+        self,
+        purchase_order,
+    ):
+        """
+        Create/update the Finance notification WITHOUT losing the
+        Procurement user who raised/sent the PO.
+
+        The previous implementation deleted the old Finance
+        notification and recreated it without requested_by. That
+        erased the sender identity, so Finance's Approved/Rejected
+        email had nobody to return to.
+        """
+        queryset = (
+            Notification.objects
+            .filter(
+                category="PO",
+                receiver="FINANCE",
+                reference_id=str(
+                    purchase_order.id
+                ),
+            )
+            .order_by(
+                "-created_at",
+                "-id",
+            )
+        )
+
+        # Keep any sender already stored by an earlier notification.
+        preserved_sender = (
+            queryset
+            .exclude(
+                requested_by__isnull=True
+            )
+            .exclude(
+                requested_by=""
+            )
+            .values_list(
+                "requested_by",
+                flat=True,
+            )
+            .first()
+            or ""
+        )
+
+        # Prefer the currently authenticated PO-raising user.
+        actor_name = (
+            self.get_authenticated_po_sender_name()
+        )
+
+        requested_by = (
+            actor_name
+            or str(
+                preserved_sender or ""
+            ).strip()
+        )
+
+        notification = queryset.first()
+
+        if notification:
+            notification.title = (
+                "PO Approval Request - "
+                f"{purchase_order.po_number}"
+            )
+
+            notification.message = (
+                "Approval requested for PO "
+                f"{purchase_order.po_number}"
+            )
+
+            notification.status = (
+                "PENDING_FINANCE"
+            )
+            notification.receiver = "FINANCE"
+            notification.is_read = False
+
+            # Never overwrite a valid original sender with blank.
+            if requested_by:
+                notification.requested_by = (
+                    requested_by
+                )
+
+            notification.save(
+                update_fields=[
+                    "title",
+                    "message",
+                    "status",
+                    "receiver",
+                    "is_read",
+                    "requested_by",
+                ]
+                if requested_by
+                else [
+                    "title",
+                    "message",
+                    "status",
+                    "receiver",
+                    "is_read",
+                ]
+            )
+
+            # Keep only one Finance notification per PO.
+            queryset.exclude(
+                pk=notification.pk
+            ).delete()
+
+            return notification
+
+        create_kwargs = {
+            "category": "PO",
+            "title": (
+                "PO Approval Request - "
+                f"{purchase_order.po_number}"
+            ),
+            "message": (
+                "Approval requested for PO "
+                f"{purchase_order.po_number}"
+            ),
+            "reference_id": str(
+                purchase_order.id
+            ),
+            "status": "PENDING_FINANCE",
+            "receiver": "FINANCE",
+            "is_read": False,
+        }
+
+        if requested_by:
+            create_kwargs[
+                "requested_by"
+            ] = requested_by
+
+        return Notification.objects.create(
+            **create_kwargs
+        )
+
+
+    # ==========================================================
+    # FINANCE APPROVAL EMAIL
+    # ==========================================================
+
+    @staticmethod
+    def get_user_display_name(user, fallback="User"):
+        if not user:
+            return fallback
+
+        return (
+            getattr(user, "employee_name", "")
+            or getattr(user, "name", "")
+            or getattr(user, "username", "")
+            or getattr(user, "email", "")
+            or fallback
+        )
+
+    @staticmethod
+    def get_ipms_base_url():
+        return str(
+            getattr(
+                settings,
+                "IPMS_BASE_URL",
+                "http://localhost:5173",
+            )
+        ).rstrip("/")
+
+    def send_finance_approval_email(
+        self,
+        purchase_order_id,
+    ):
+        """
+        Send one Finance approval-request email to every active
+        Finance user.
+
+        Works for:
+        - Direct Purchase Orders.
+        - Purchase Orders raised from an approved Material Request.
+        """
+        try:
+            purchase_order = (
+                PurchaseOrder.objects
+                .prefetch_related(
+                    "items",
+                    "items__component",
+                )
+                .get(pk=purchase_order_id)
+            )
+        except PurchaseOrder.DoesNotExist:
+            return False
+
+        finance_users = (
+            User.objects
+            .filter(
+                role__iexact="finance",
+                is_active=True,
+            )
+            .exclude(email__isnull=True)
+            .exclude(email="")
+            .order_by("id")
+        )
+
+        if not finance_users.exists():
+            print(
+                "FINANCE EMAIL SKIPPED: "
+                "No active Finance user with an email address."
+            )
+            return False
+
+        items = list(
+            purchase_order.items.all()
+        )
+
+        total_quantity = 0
+        subtotal = Decimal("0.00")
+        gst_total = Decimal("0.00")
+        component_lines = []
+
+        for item in items:
+            quantity = max(
+                int(item.quantity or 0),
+                0,
+            )
+
+            unit_price = Decimal(
+                str(
+                    item.unit_price
+                    or Decimal("0.00")
+                )
+            )
+
+            gst_percentage = Decimal(
+                str(
+                    item.gst_percentage
+                    or Decimal("0.00")
+                )
+            )
+
+            line_subtotal = (
+                Decimal(quantity)
+                * unit_price
+            )
+
+            line_gst = (
+                line_subtotal
+                * gst_percentage
+                / Decimal("100")
+            )
+
+            total_quantity += quantity
+            subtotal += line_subtotal
+            gst_total += line_gst
+
+            component = getattr(
+                item,
+                "component",
+                None,
+            )
+
+            component_code = (
+                getattr(
+                    component,
+                    "component_id",
+                    "",
+                )
+                or getattr(
+                    component,
+                    "id",
+                    "",
+                )
+                or ""
+            )
+
+            component_name = (
+                getattr(
+                    component,
+                    "name",
+                    "",
+                )
+                or "Component"
+            )
+
+            component_lines.append(
+                (
+                    f"{component_code} - "
+                    f"{component_name} "
+                    f"(Qty: {quantity})"
+                ).strip()
+            )
+
+        grand_total = (
+            subtotal + gst_total
+        )
+
+        source_mr = str(
+            purchase_order.source_mr_number
+            or ""
+        ).strip()
+
+        mr_display = (
+            source_mr
+            if source_mr
+            else "Direct PO"
+        )
+
+        po_date = (
+            purchase_order.ordered_date
+            or (
+                purchase_order.created_at.date()
+                if purchase_order.created_at
+                else None
+            )
+        )
+
+        expected_delivery = (
+            purchase_order.expected_delivery_date
+            or "-"
+        )
+
+        components_display = (
+            "; ".join(component_lines)
+            if component_lines
+            else "-"
+        )
+
+        subject = (
+            f"{purchase_order.po_number} "
+            "- Finance Approval Required"
+        )
+
+        action_url = (
+            f"{self.get_ipms_base_url()}"
+            "/finance/notifications"
+        )
+
+        sent_any = False
+
+        for finance_user in finance_users:
+            sent = send_ipms_email(
+                recipient_email=finance_user.email,
+                subject=subject,
+                context={
+                    "recipient_name":
+                        self.get_user_display_name(
+                            finance_user,
+                            "Finance",
+                        ),
+
+                    "message": (
+                        "A Purchase Order has been "
+                        "raised in IPMS and is "
+                        "awaiting Finance approval."
+                    ),
+
+                    "table_headers": [
+                        "PO Number",
+                        "MR ID",
+                        "Vendor",
+                        "Quantity",
+                        "Order Total",
+                        "PO Date",
+                        "Expected Delivery",
+                        "Status",
+                    ],
+
+                    "table_values": [
+                        purchase_order.po_number,
+                        mr_display,
+                        purchase_order.vendor_name
+                        or "-",
+                        total_quantity,
+                        f"INR {grand_total:.2f}",
+                        str(po_date or "-"),
+                        str(expected_delivery),
+                        "Pending Finance",
+                    ],
+
+                    "status":
+                        "Pending Finance",
+
+                    "instruction": (
+                        "Please review the Purchase "
+                        "Order in IPMS and approve "
+                        "or reject it."
+                    ),
+
+                    "button_text":
+                        "Review PO in IPMS",
+
+                    "action_url":
+                        action_url,
+
+                    "components":
+                        components_display,
+                },
+            )
+
+            if sent:
+                sent_any = True
+
+        return sent_any
+
+
+
+    # ==========================================================
+    # MR REQUESTER - PO RAISED EMAIL
+    # ==========================================================
+
+    def send_mr_requester_po_raised_email(
+        self,
+        purchase_order_id,
+    ):
+        """
+        Inform the original MR requester whenever Procurement raises a
+        Purchase Order linked to that Material Request.
+
+        Direct Purchase Orders are intentionally excluded because they
+        have no Material Request requester.
+        """
+        try:
+            purchase_order = (
+                PurchaseOrder.objects
+                .prefetch_related(
+                    "items",
+                    "items__component",
+                )
+                .get(pk=purchase_order_id)
+            )
+        except PurchaseOrder.DoesNotExist:
+            return False
+
+        source_mr_number = str(
+            purchase_order.source_mr_number
+            or ""
+        ).strip()
+
+        if not source_mr_number:
+            return False
+
+        material_request = (
+            self.get_source_material_request(
+                source_mr_number
+            )
+        )
+
+        if not material_request:
+            return False
+
+        requester = getattr(
+            material_request,
+            "requester",
+            None,
+        )
+
+        requester_email = str(
+            getattr(
+                requester,
+                "email",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if not requester_email:
+            # Do not guess an address from requester_name.
+            return False
+
+        requester_name = (
+            material_request.requester_name
+            or self.get_user_display_name(
+                requester,
+                "Requester",
+            )
+        )
+
+        items = list(
+            purchase_order.items.all()
+        )
+
+        total_quantity = sum(
+            max(
+                int(item.quantity or 0),
+                0,
+            )
+            for item in items
+        )
+
+        component_lines = []
+
+        for item in items:
+            component = getattr(
+                item,
+                "component",
+                None,
+            )
+
+            component_code = (
+                getattr(
+                    component,
+                    "component_id",
+                    "",
+                )
+                or getattr(
+                    component,
+                    "id",
+                    "",
+                )
+                or ""
+            )
+
+            component_name = (
+                getattr(
+                    component,
+                    "name",
+                    "",
+                )
+                or "Component"
+            )
+
+            component_lines.append(
+                (
+                    f"{component_code} - "
+                    f"{component_name} "
+                    f"(Qty: {int(item.quantity or 0)})"
+                ).strip()
+            )
+
+        component_summary = (
+            "; ".join(component_lines)
+            if component_lines
+            else "-"
+        )
+
+        raised_by = (
+            self.get_authenticated_po_sender_name()
+            or "Procurement"
+        )
+
+        subject = (
+            f"{purchase_order.po_number} raised for "
+            f"{material_request.material_request_id} "
+            f"- Procurement Update"
+        )
+
+        approval_state = str(
+            purchase_order.approval_status
+            or purchase_order.status
+            or "PO_RAISED"
+        ).strip().upper()
+
+        if approval_state == "PENDING_FINANCE":
+            status_label = (
+                "PO Raised - Pending Finance"
+            )
+        else:
+            status_label = "PO Raised"
+
+        return send_ipms_email(
+            recipient_email=requester_email,
+            subject=subject,
+            context={
+                "recipient_name": requester_name,
+                "message": (
+                    f"Procurement has raised Purchase Order "
+                    f"{purchase_order.po_number} for your "
+                    f"Material Request "
+                    f"{material_request.material_request_id}."
+                ),
+                "table_headers": [
+                    "MR ID",
+                    "PO Number",
+                    "Project",
+                    "Vendor",
+                    "PO Quantity",
+                    "Components",
+                    "Raised By",
+                    "Status",
+                ],
+                "table_values": [
+                    material_request.material_request_id,
+                    purchase_order.po_number,
+                    material_request.project,
+                    purchase_order.vendor_name
+                    or "-",
+                    total_quantity,
+                    component_summary,
+                    raised_by,
+                    status_label,
+                ],
+                "status": status_label,
+                "instruction": (
+                    "This is an informational update. "
+                    "You can continue tracking the Material "
+                    "Request and its Purchase Order in IPMS."
+                ),
+                "button_text": (
+                    "View Material Request in IPMS"
+                ),
+                "action_url": (
+                    f"{self.get_ipms_base_url()}"
+                    f"/material-requests"
+                ),
+            },
+        )
+
+
+    # ==========================================================
+    # PO REQUESTER RESULT EMAIL
+    # ==========================================================
+
+    def resolve_po_requester_user(
+        self,
+        purchase_order,
+    ):
+        """
+        Resolve the exact user who created/raised the PO.
+
+        Preferred source:
+        Notification.requested_by for the Finance notification.
+
+        New PO records store the creator's company email there.
+        Older records may contain only an employee name or an email
+        local-part, so several safe matching fallbacks are supported.
+        """
+
+        notification = (
+            Notification.objects
+            .filter(
+                category="PO",
+                receiver="FINANCE",
+                reference_id=str(
+                    purchase_order.id
+                ),
+            )
+            .exclude(
+                requested_by__isnull=True
+            )
+            .exclude(
+                requested_by=""
+            )
+            .order_by(
+                "-created_at",
+                "-id",
+            )
+            .first()
+        )
+
+        requested_by = ""
+
+        if notification:
+            requested_by = str(
+                getattr(
+                    notification,
+                    "requested_by",
+                    "",
+                )
+                or ""
+            ).strip()
+
+        # Older records may have the sender in PurchaseOrderApproval.
+        if not requested_by:
+            try:
+                latest_approval = (
+                    purchase_order
+                    .approvals
+                    .exclude(
+                        requested_by__isnull=True
+                    )
+                    .exclude(
+                        requested_by=""
+                    )
+                    .order_by(
+                        "-created_at",
+                        "-id",
+                    )
+                    .first()
+                )
+            except Exception:
+                latest_approval = None
+
+            if latest_approval:
+                requested_by = str(
+                    getattr(
+                        latest_approval,
+                        "requested_by",
+                        "",
+                    )
+                    or ""
+                ).strip()
+
+        if not requested_by:
+            print(
+                "PO RESULT EMAIL: no original sender stored for",
+                purchase_order.po_number,
+            )
+            return None
+
+        # ---------------------------------------------------------
+        # 1. Exact company email match.
+        # ---------------------------------------------------------
+        if "@" in requested_by:
+            user = (
+                User.objects
+                .filter(
+                    email__iexact=requested_by,
+                    is_active=True,
+                )
+                .first()
+            )
+
+            if user:
+                return user
+
+        # ---------------------------------------------------------
+        # 2. Exact employee-name match.
+        # ---------------------------------------------------------
+        user = (
+            User.objects
+            .filter(
+                employee_name__iexact=requested_by,
+                is_active=True,
+            )
+            .first()
+        )
+
+        if user:
+            return user
+
+        # ---------------------------------------------------------
+        # 3. Exact username match, if this custom User has username.
+        # ---------------------------------------------------------
+        try:
+            user = (
+                User.objects
+                .filter(
+                    username__iexact=requested_by,
+                    is_active=True,
+                )
+                .first()
+            )
+        except Exception:
+            user = None
+
+        if user:
+            return user
+
+        # ---------------------------------------------------------
+        # 4. Email local-part match.
+        #    Example: requested_by="karthik.s"
+        #             email="karthik.s@aero360.co.in"
+        # ---------------------------------------------------------
+        requested_lower = requested_by.lower()
+
+        for candidate in (
+            User.objects
+            .filter(is_active=True)
+            .exclude(email__isnull=True)
+            .exclude(email="")
+        ):
+            email = str(
+                getattr(
+                    candidate,
+                    "email",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            if (
+                email
+                and email.split("@")[0].lower()
+                == requested_lower
+            ):
+                return candidate
+
+        # ---------------------------------------------------------
+        # 5. Normalized employee-name fallback.
+        #    This handles harmless spacing/punctuation differences,
+        #    but does not choose a user unless the match is unique.
+        # ---------------------------------------------------------
+        def normalize_identity(value):
+            return "".join(
+                ch
+                for ch in str(
+                    value or ""
+                ).lower()
+                if ch.isalnum()
+            )
+
+        requested_normalized = normalize_identity(
+            requested_by
+        )
+
+        matches = []
+
+        if requested_normalized:
+            for candidate in (
+                User.objects
+                .filter(is_active=True)
+            ):
+                employee_name = normalize_identity(
+                    getattr(
+                        candidate,
+                        "employee_name",
+                        "",
+                    )
+                )
+
+                if (
+                    employee_name
+                    and employee_name
+                    == requested_normalized
+                ):
+                    matches.append(
+                        candidate
+                    )
+
+        if len(matches) == 1:
+            return matches[0]
+
+        print(
+            "PO RESULT EMAIL: unable to resolve original sender",
+            requested_by,
+            "for",
+            purchase_order.po_number,
+        )
+
+        return None
+
+    def send_po_requester_result_email(
+        self,
+        purchase_order_id,
+        *,
+        outcome,
+    ):
+        """
+        After Finance approves or rejects a PO, send the result
+        back to the user who originally sent that PO for Finance
+        approval.
+        """
+        try:
+            purchase_order = (
+                PurchaseOrder.objects
+                .prefetch_related(
+                    "items",
+                    "items__component",
+                )
+                .get(
+                    pk=purchase_order_id
+                )
+            )
+        except PurchaseOrder.DoesNotExist:
+            return False
+
+        requester = (
+            self.resolve_po_requester_user(
+                purchase_order
+            )
+        )
+
+        if (
+            not requester
+            or not str(
+                getattr(
+                    requester,
+                    "email",
+                    "",
+                )
+                or ""
+            ).strip()
+        ):
+            print(
+                "PO RESULT EMAIL SKIPPED:",
+                purchase_order.po_number,
+                "- original PO sender could "
+                "not be resolved from the "
+                "Finance notification.",
+            )
+            return False
+
+        normalized_outcome = str(
+            outcome or ""
+        ).strip().lower()
+
+        is_approved = (
+            normalized_outcome
+            == "approved"
+        )
+
+        result_label = (
+            "Finance Approved"
+            if is_approved
+            else "Finance Rejected"
+        )
+
+        items = list(
+            purchase_order.items.all()
+        )
+
+        total_quantity = 0
+        subtotal = Decimal("0.00")
+        gst_total = Decimal("0.00")
+
+        for item in items:
+            quantity = max(
+                int(item.quantity or 0),
+                0,
+            )
+
+            unit_price = Decimal(
+                str(
+                    item.unit_price
+                    or Decimal("0.00")
+                )
+            )
+
+            gst_percentage = Decimal(
+                str(
+                    item.gst_percentage
+                    or Decimal("0.00")
+                )
+            )
+
+            line_subtotal = (
+                Decimal(quantity)
+                * unit_price
+            )
+
+            line_gst = (
+                line_subtotal
+                * gst_percentage
+                / Decimal("100")
+            )
+
+            total_quantity += quantity
+            subtotal += line_subtotal
+            gst_total += line_gst
+
+        grand_total = (
+            subtotal + gst_total
+        )
+
+        source_mr = str(
+            purchase_order.source_mr_number
+            or ""
+        ).strip()
+
+        mr_display = (
+            source_mr
+            if source_mr
+            else "Direct PO"
+        )
+
+        finance_remarks = str(
+            getattr(
+                purchase_order,
+                "finance_remarks",
+                "",
+            )
+            or ""
+        ).strip()
+
+        rejection_reason = str(
+            getattr(
+                purchase_order,
+                "rejection_reason",
+                "",
+            )
+            or ""
+        ).strip()
+
+        decision_reason = (
+            finance_remarks
+            or rejection_reason
+            or "-"
+        )
+
+        decision_by = (
+            getattr(
+                purchase_order,
+                "approved_by",
+                "",
+            )
+            if is_approved
+            else getattr(
+                purchase_order,
+                "rejected_by",
+                "",
+            )
+        )
+
+        decision_by = str(
+            decision_by or "Finance"
+        ).strip()
+
+        if is_approved:
+            subject = (
+                f"{purchase_order.po_number} "
+                "- Finance Approved"
+            )
+
+            message = (
+                "Your Purchase Order has been "
+                "approved by Finance."
+            )
+
+            instruction = (
+                "You can now continue the "
+                "approved Purchase Order workflow "
+                "in IPMS."
+            )
+        else:
+            subject = (
+                f"{purchase_order.po_number} "
+                "- Finance Rejected"
+            )
+
+            message = (
+                "Your Purchase Order has been "
+                "rejected by Finance."
+            )
+
+            instruction = (
+                "Please review the Finance "
+                "remarks/rejection reason in IPMS "
+                "before taking further action."
+            )
+
+        action_url = (
+            f"{self.get_ipms_base_url()}"
+            "/purchase-orders"
+        )
+
+        print(
+            "PO RESULT EMAIL:",
+            purchase_order.po_number,
+            "->",
+            requester.email,
+            "(" + result_label + ")",
+        )
+
+        sent = send_ipms_email(
+            recipient_email=
+                requester.email,
+            subject=subject,
+            context={
+                "recipient_name":
+                    self.get_user_display_name(
+                        requester,
+                        "Procurement",
+                    ),
+
+                "message":
+                    message,
+
+                "table_headers": [
+                    "PO Number",
+                    "MR ID",
+                    "Vendor",
+                    "Quantity",
+                    "Order Total",
+                    "Finance Decision",
+                    "Decision By",
+                    (
+                        "Finance Remarks"
+                        if is_approved
+                        else "Rejection Reason"
+                    ),
+                ],
+
+                "table_values": [
+                    purchase_order.po_number,
+                    mr_display,
+                    purchase_order.vendor_name
+                    or "-",
+                    total_quantity,
+                    f"INR {grand_total:.2f}",
+                    result_label,
+                    decision_by,
+                    decision_reason,
+                ],
+
+                "status":
+                    result_label,
+
+                "instruction":
+                    instruction,
+
+                "button_text":
+                    "Open Purchase Order in IPMS",
+
+                "action_url":
+                    action_url,
+            },
+        )
+
+        print(
+            "PO RESULT EMAIL SENT =",
+            sent,
+            "for",
+            purchase_order.po_number,
+        )
+
+        return sent
 
 
     # ==========================================================
@@ -1152,6 +2309,47 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 purchase_order.source_mr_number
             )
 
+            # Return a Procurement progress email to the original
+            # MR requester/Engineer after this linked PO commits.
+            transaction.on_commit(
+                lambda po_id=purchase_order.id: (
+                    self.send_mr_requester_po_raised_email(
+                        po_id
+                    )
+                )
+            )
+
+        # Finance email for BOTH Direct PO and MR-linked PO.
+        create_approval_status = str(
+            purchase_order.approval_status
+            or ""
+        ).strip().upper()
+
+        create_status = str(
+            purchase_order.status
+            or ""
+        ).strip().upper()
+
+        if (
+            create_approval_status
+            == "PENDING_FINANCE"
+            or create_status
+            == "PENDING_FINANCE"
+        ):
+            # Store exactly who raised/created this PO before
+            # Finance receives it. Works for Direct PO and MR PO.
+            self.save_finance_notification_with_sender(
+                purchase_order
+            )
+
+            transaction.on_commit(
+                lambda po_id=purchase_order.id: (
+                    self.send_finance_approval_email(
+                        po_id
+                    )
+                )
+            )
+
     @transaction.atomic
     def perform_update(self, serializer):
         """
@@ -1180,26 +2378,11 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             and new_approval_status
             == "PENDING_FINANCE"
         ):
-            Notification.objects.filter(
-                category="PO",
-                reference_id=purchase_order.id,
-                receiver="FINANCE",
-            ).delete()
-
-            Notification.objects.create(
-                category="PO",
-                title=(
-                    "PO Approval Request - "
-                    f"{purchase_order.po_number}"
-                ),
-                message=(
-                    "Approval requested for PO "
-                    f"{purchase_order.po_number}"
-                ),
-                reference_id=purchase_order.id,
-                status="PENDING_FINANCE",
-                receiver="FINANCE",
-                is_read=False,
+            # Preserve the original Procurement sender.
+            # Do not delete/recreate the Finance notification because
+            # that would erase requested_by.
+            self.save_finance_notification_with_sender(
+                purchase_order
             )
 
             if (
@@ -1212,6 +2395,14 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 purchase_order.save(
                     update_fields=["status"]
                 )
+
+            transaction.on_commit(
+                lambda po_id=purchase_order.id: (
+                    self.send_finance_approval_email(
+                        po_id
+                    )
+                )
+            )
 
         # ---------------------------------------------------------
         # Finance approved
@@ -1258,6 +2449,17 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                     update_fields=update_fields
                 )
 
+            # Return Finance approval result to the Procurement
+            # user who originally sent this PO for approval.
+            transaction.on_commit(
+                lambda po_id=purchase_order.id: (
+                    self.send_po_requester_result_email(
+                        po_id,
+                        outcome="approved",
+                    )
+                )
+            )
+
         # ---------------------------------------------------------
         # Finance rejected
         # ---------------------------------------------------------
@@ -1302,6 +2504,17 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 purchase_order.save(
                     update_fields=update_fields
                 )
+
+            # Return Finance rejection result to the Procurement
+            # user who originally sent this PO for approval.
+            transaction.on_commit(
+                lambda po_id=purchase_order.id: (
+                    self.send_po_requester_result_email(
+                        po_id,
+                        outcome="rejected",
+                    )
+                )
+            )
 
         if purchase_order.source_mr_number:
             self.sync_material_request_po_progress(

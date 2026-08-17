@@ -1,0 +1,23 @@
+Dear {{ recipient_name }},
+
+{{ message }}
+
+Request Details
+------------------------------------------------------------
+
+{% for header in table_headers %}{{ header }}{% if not forloop.last %} | {% endif %}{% endfor %}
+{% for value in table_values %}{{ value }}{% if not forloop.last %} | {% endif %}{% endfor %}
+
+Status: {{ status }}
+
+Please review the request and take the appropriate action in IPMS.
+
+{{ button_text }}
+
+{{ action_url }}
+
+Regards,
+IPMS
+Inventory & Procurement Management System
+
+This is an automated notification. Please do not reply to this email.

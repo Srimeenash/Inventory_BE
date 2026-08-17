@@ -1,0 +1,11 @@
+Hello {{ recipient_name }},
+
+Your IPMS login verification code is:
+
+{{ code }}
+
+This code expires in {{ expiry_minutes }} minutes.
+
+If you did not attempt to sign in to IPMS, please contact your IPMS administrator.
+
+IPMS
