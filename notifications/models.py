@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db import models
 
 
@@ -33,7 +34,10 @@ class Notification(models.Model):
 
         # QC / Inventory flow
         ("INVENTORY_PENDING", "Inventory Pending"),
-        ("INVENTORY_CHECK_PENDING", "Inventory Check Pending"),
+        (
+            "INVENTORY_CHECK_PENDING",
+            "Inventory Check Pending",
+        ),
         ("QC_CHECKED", "QC Checked"),
         (
             "PROJECT_INVENTORY_READY",
@@ -78,8 +82,8 @@ class Notification(models.Model):
         db_index=True,
     )
 
-    # User name that created/requested the notification.
-    # This is what the Manager Scrap table displays.
+    # Display/audit name of the user who originally created
+    # or requested this notification.
     requested_by = models.CharField(
         max_length=150,
         blank=True,
@@ -94,11 +98,40 @@ class Notification(models.Model):
         db_index=True,
     )
 
+    # Role-level destination.
+    #
+    # Examples:
+    #   FINANCE -> every Finance user can see it
+    #   MANAGER -> every Manager can see it
+    #
+    # For a notification addressed to one exact user,
+    # receiver can remain NULL and recipient_user is used.
     receiver = models.CharField(
         max_length=20,
         choices=ROLE_CHOICES,
         blank=True,
         null=True,
+        db_index=True,
+    )
+
+    # Exact-user destination.
+    #
+    # This is required for the Scrap workflow:
+    #
+    # Inventory / Engineer creates Scrap
+    #        ↓
+    # Finance approves
+    #        ↓
+    # Manager approves
+    #        ↓
+    # Final notification goes ONLY to the user
+    # who originally created that Scrap.
+    recipient_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        blank=True,
+        null=True,
+        related_name="ipms_notifications",
         db_index=True,
     )
 
@@ -119,6 +152,7 @@ class Notification(models.Model):
         ]
 
         indexes = [
+            # Fast role-based notification lookup.
             models.Index(
                 fields=[
                     "receiver",
@@ -127,6 +161,8 @@ class Notification(models.Model):
                 ],
                 name="notif_recv_stat_idx",
             ),
+
+            # Fast workflow-reference lookup.
             models.Index(
                 fields=[
                     "category",
@@ -134,6 +170,16 @@ class Notification(models.Model):
                     "receiver",
                 ],
                 name="notif_ref_recv_idx",
+            ),
+
+            # Fast exact-user notification lookup.
+            models.Index(
+                fields=[
+                    "recipient_user",
+                    "category",
+                    "status",
+                ],
+                name="notif_user_cat_stat_idx",
             ),
         ]
 

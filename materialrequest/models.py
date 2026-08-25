@@ -2,6 +2,7 @@ from datetime import datetime
 
 from django.conf import settings
 from django.db import models
+
 from components.models import Component
 
 
@@ -20,7 +21,6 @@ class MaterialRequest(models.Model):
         null=True,
     )
     requester_name = models.CharField(max_length=100)
-    
     requester = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -28,14 +28,9 @@ class MaterialRequest(models.Model):
         blank=True,
         related_name="material_requests",
     )
-
     date = models.DateField()
     project = models.CharField(max_length=100)
-    bom = models.CharField(
-        max_length=100,
-        blank=True,
-        null=True,
-    )
+    bom = models.CharField(max_length=100, blank=True, null=True)
     customized_bom = models.BooleanField(default=False)
     request_type = models.CharField(
         max_length=10,
@@ -48,52 +43,63 @@ class MaterialRequest(models.Model):
     required_quantity = models.PositiveIntegerField()
     required_date = models.DateField()
     remarks = models.TextField(blank=True, null=True)
-
     status = models.CharField(
-        max_length=30,
+        max_length=40,
         choices=[
             ("PENDING", "Pending"),
             ("REQUESTED", "Requested"),
             ("PENDING_MANAGER", "Pending Manager"),
             ("MANAGER_APPROVED", "Manager Approved"),
             ("MANAGER_REJECTED", "Manager Rejected"),
-
             ("PROCUREMENT_PENDING", "Procurement Pending"),
             ("INVENTORY_PENDING", "Inventory Pending"),
-
             ("APPROVED", "Approved"),
             ("ORDERED", "Ordered"),
-
-            # Procurement and delivery flow
+            # Procurement and delivery flow.
             ("PO_RAISED", "PO Raised"),
-            (
-                "PARTIALLY_DELIVERED",
-                "Partially Delivered",
-            ),
+            ("PARTIALLY_DELIVERED", "Partially Delivered"),
             ("PO_DELIVERED", "PO Delivered"),
-
-            # Inward and QC flow
+            # Inward/QC flow.
             ("QC_CHECKED", "QC Checked"),
-
-            # Inventory flow
+            (
+                "QC_FAILED_ACTION_REQUIRED",
+                "QC Failed - Action Required",
+            ),
+            # QC replacement flow.
+            (
+                "AWAITING_REPLACEMENT_APPROVAL",
+                "Awaiting Replacement Approval",
+            ),
+            (
+                "REPLACEMENT_APPROVAL_REJECTED",
+                "Replacement Approval Rejected",
+            ),
+            ("REPLACEMENT_APPROVED", "Replacement Approved"),
+            (
+                "AWAITING_REPLACEMENT_DELIVERY",
+                "Awaiting Replacement Delivery",
+            ),
+            (
+                "REPLACEMENT_PARTIALLY_RECEIVED",
+                "Replacement Partially Received",
+            ),
+            (
+                "REPLACEMENT_RECEIVED",
+                "Replacement Received - QC Pending",
+            ),
+            # Inventory flow.
             (
                 "PROJECT_INVENTORY_READY",
                 "Project Inventory Ready",
             ),
             ("INVENTORY_ISSUED", "Inventory Issued"),
             ("MR_COMPLETED", "MR Completed"),
-
             ("REJECTED", "Rejected"),
-
-            # Keep temporarily for existing old records
-            (
-                "ORDER_DELIVERED",
-                "Order Delivered - Legacy",
-            ),
+            # Keep temporarily for existing old records.
+            ("ORDER_DELIVERED", "Order Delivered - Legacy"),
         ],
         default="PENDING",
     )
-
     approval_status = models.CharField(
         max_length=30,
         choices=[
@@ -106,20 +112,17 @@ class MaterialRequest(models.Model):
         ],
         default="PENDING",
     )
-
     rejection_reason = models.TextField(
         blank=True,
         null=True,
         help_text="Reason for rejection",
     )
-
     rejected_by = models.CharField(
         max_length=100,
         blank=True,
         null=True,
         help_text="Role or user who rejected",
     )
-
     po_raised = models.BooleanField(
         default=False,
         help_text=(
@@ -133,15 +136,12 @@ class MaterialRequest(models.Model):
             base_id = generate_material_request_id()
             candidate = base_id
             suffix = 1
-
             while MaterialRequest.objects.filter(
                 material_request_id=candidate
             ).exists():
                 candidate = f"{base_id}-{suffix}"
                 suffix += 1
-
             self.material_request_id = candidate
-
         super().save(*args, **kwargs)
 
     def __str__(self):
@@ -157,7 +157,6 @@ class BOMItem(models.Model):
         related_name="bom_items",
         on_delete=models.CASCADE,
     )
-
     component = models.ForeignKey(
         Component,
         on_delete=models.CASCADE,
@@ -165,76 +164,29 @@ class BOMItem(models.Model):
         blank=True,
         related_name="material_request_bom_items",
     )
-
-    category = models.CharField(
-        max_length=100,
-        blank=True,
-        null=True,
-    )
-    specification = models.TextField(
-        blank=True,
-        null=True,
-    )
+    category = models.CharField(max_length=100, blank=True, null=True)
+    specification = models.TextField(blank=True, null=True)
     quantity = models.PositiveIntegerField(default=1)
     unit = models.CharField(max_length=20, default="pc")
-
     unit_price = models.DecimalField(
         max_digits=12,
         decimal_places=2,
         default=0,
     )
-
     price = models.DecimalField(
         max_digits=12,
         decimal_places=2,
         default=0,
     )
-
-    tax = models.DecimalField(
-        max_digits=5,
-        decimal_places=2,
-        default=0,
-    )
-
-    inventory_quantity = models.PositiveIntegerField(
-        default=0,
-    )
-
-    # Quantity for which PO has been generated.
-    po_raised_quantity = models.PositiveIntegerField(
-        default=0,
-    )
-
-    # Quantity received against the PO.
-    delivered_quantity = models.PositiveIntegerField(
-        default=0,
-    )
-
-    # Quantity passed during QC.
-    qc_passed_quantity = models.PositiveIntegerField(
-        default=0,
-    )
-
-    # Quantity failed during QC.
-    qc_failed_quantity = models.PositiveIntegerField(
-        default=0,
-    )
-
-    # Quantity transferred to this MR's Project Inventory.
-    project_inventory_quantity = models.PositiveIntegerField(
-        default=0,
-    )
-
-    vendor = models.CharField(
-        max_length=255,
-        blank=True,
-        null=True,
-    )
-
-    remarks = models.TextField(
-        blank=True,
-        null=True,
-    )
+    tax = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    inventory_quantity = models.PositiveIntegerField(default=0)
+    po_raised_quantity = models.PositiveIntegerField(default=0)
+    delivered_quantity = models.PositiveIntegerField(default=0)
+    qc_passed_quantity = models.PositiveIntegerField(default=0)
+    qc_failed_quantity = models.PositiveIntegerField(default=0)
+    project_inventory_quantity = models.PositiveIntegerField(default=0)
+    vendor = models.CharField(max_length=255, blank=True, null=True)
+    remarks = models.TextField(blank=True, null=True)
 
     def __str__(self):
         return f"{self.component} ({self.quantity})"
@@ -246,23 +198,14 @@ class RDItem(models.Model):
         related_name="rd_items",
         on_delete=models.CASCADE,
     )
-
     component = models.ForeignKey(
         "components.Component",
         on_delete=models.CASCADE,
         null=True,
         blank=True,
     )
-
-    category = models.CharField(
-        max_length=100,
-        blank=True,
-        null=True,
-    )
-    specifications = models.TextField(
-        blank=True,
-        null=True,
-    )
+    category = models.CharField(max_length=100, blank=True, null=True)
+    specifications = models.TextField(blank=True, null=True)
     quantity = models.PositiveIntegerField(default=1)
     unit_price = models.DecimalField(
         max_digits=12,
@@ -275,54 +218,24 @@ class RDItem(models.Model):
         decimal_places=2,
         default=0,
     )
-    tax = models.DecimalField(
-        max_digits=5,
-        decimal_places=2,
-        default=0,
-    )
+    tax = models.DecimalField(max_digits=5, decimal_places=2, default=0)
     total_price = models.DecimalField(
         max_digits=12,
         decimal_places=2,
         default=0,
     )
-    inventory_quantity = models.PositiveIntegerField(
-        default=0,
-    )
-
-    po_raised_quantity = models.PositiveIntegerField(
-        default=0,
-    )
-
-    delivered_quantity = models.PositiveIntegerField(
-        default=0,
-    )
-
-    qc_passed_quantity = models.PositiveIntegerField(
-        default=0,
-    )
-
-    qc_failed_quantity = models.PositiveIntegerField(
-        default=0,
-    )
-
-    project_inventory_quantity = models.PositiveIntegerField(
-        default=0,
-    )
-
-    vendor = models.CharField(
-        max_length=255,
-        blank=True,
-        null=True,
-    )
-    remarks = models.TextField(
-        blank=True,
-        null=True,
-    )
+    inventory_quantity = models.PositiveIntegerField(default=0)
+    po_raised_quantity = models.PositiveIntegerField(default=0)
+    delivered_quantity = models.PositiveIntegerField(default=0)
+    qc_passed_quantity = models.PositiveIntegerField(default=0)
+    qc_failed_quantity = models.PositiveIntegerField(default=0)
+    project_inventory_quantity = models.PositiveIntegerField(default=0)
+    vendor = models.CharField(max_length=255, blank=True, null=True)
+    remarks = models.TextField(blank=True, null=True)
 
     def __str__(self):
         if self.component:
             return str(self.component)
-
         return (
             f"R&D Item - "
             f"{self.material_request.material_request_id}"

@@ -3,43 +3,36 @@ from rest_framework import serializers
 from .models import Notification
 
 
-class NotificationSerializer(
-    serializers.ModelSerializer
-):
+class NotificationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Notification
         fields = "__all__"
 
+        # Exact-user routing is backend-owned. The frontend must never be able
+        # to choose another user's recipient_user value.
         read_only_fields = [
             "id",
             "created_at",
+            "recipient_user",
         ]
 
     def validate_category(self, value):
-        return str(
-            value or ""
-        ).strip().upper()
+        return str(value or "").strip().upper()
 
     def validate_status(self, value):
-        return str(
-            value or ""
-        ).strip().upper()
+        return str(value or "").strip().upper()
 
     def validate_receiver(self, value):
         if value in (None, ""):
             return None
 
-        return str(
-            value
-        ).strip().upper()
+        return str(value).strip().upper()
 
     def validate_reference_id(self, value):
         if value in (None, ""):
             return None
 
-        return str(
-            value
-        ).strip()
+        return str(value).strip()
 
     def validate_requested_by(self, value):
         if value in (None, ""):
@@ -51,6 +44,4 @@ class NotificationSerializer(
         if "@" in raw:
             raw = raw.split("@")[0].strip()
 
-        return (
-            raw or None
-        )
+        return raw or None

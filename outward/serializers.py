@@ -344,30 +344,18 @@ class OutwardEntrySerializer(serializers.ModelSerializer):
         # ----------------------------------------------------
         # SCRAP approval workflow
         # ----------------------------------------------------
-        # A new Scrap is NOT approved immediately.
+        # Every new Scrap starts with Manager approval:
         #
-        # approval_status = REQUESTED
-        # status          = PENDING_MANAGER
+        # PENDING_MANAGER -> PENDING_FINANCE -> APPROVED
         #
-        # Only the custom manager-approve / manager-reject
-        # ViewSet actions may move it out of this state.
+        # Manager approval moves the Scrap to PENDING_FINANCE.
+        # Finance approval is the final APPROVED state.
         # ----------------------------------------------------
         if outward_type == "SCRAP":
-            validated_data[
-                "approval_status"
-            ] = "REQUESTED"
-
-            validated_data[
-                "status"
-            ] = "PENDING_MANAGER"
-
-            validated_data[
-                "rejection_reason"
-            ] = None
-
-            validated_data[
-                "rejected_by"
-            ] = None
+            validated_data["approval_status"] = "PENDING_MANAGER"
+            validated_data["status"] = "PENDING_MANAGER"
+            validated_data["rejection_reason"] = None
+            validated_data["rejected_by"] = None
 
         else:
             validated_data[

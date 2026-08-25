@@ -4,15 +4,16 @@ from django.db import transaction
 from rest_framework import serializers
 
 from components.models import Component
+from notifications.models import Notification
+from vendors.models import Vendor, VendorProduct
+
 from .models import (
     PurchaseOrder,
     PurchaseOrderItem,
     PurchaseRequest,
     PurchaseRequestItem,
 )
-from components.models import Component
-from .models import PurchaseOrder, PurchaseOrderItem, PurchaseRequest, PurchaseRequestItem
-from notifications.models import Notification
+
 
 # ---------------- COMPONENT ----------------
 class ComponentMiniSerializer(serializers.ModelSerializer):
@@ -32,7 +33,10 @@ class PurchaseRequestItemSerializer(serializers.ModelSerializer):
 
 # ---------------- PURCHASE REQUEST ----------------
 class PurchaseRequestSerializer(serializers.ModelSerializer):
-    items = PurchaseRequestItemSerializer(many=True, read_only=True)
+    items = PurchaseRequestItemSerializer(
+        many=True,
+        read_only=True,
+    )
 
     class Meta:
         model = PurchaseRequest
@@ -41,7 +45,9 @@ class PurchaseRequestSerializer(serializers.ModelSerializer):
 
 # ---------------- PURCHASE ORDER ITEM ----------------
 class PurchaseOrderItemSerializer(serializers.ModelSerializer):
-    component = ComponentMiniSerializer(read_only=True)
+    component = ComponentMiniSerializer(
+        read_only=True,
+    )
 
     component_id = serializers.PrimaryKeyRelatedField(
         source="component",
@@ -50,11 +56,11 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
     )
 
     received_quantity = serializers.IntegerField(
-        read_only=True
+        read_only=True,
     )
 
     remaining_quantity = serializers.IntegerField(
-        read_only=True
+        read_only=True,
     )
 
     gst_percentage = serializers.DecimalField(
@@ -97,7 +103,10 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
         ]
 
     def validate_gst_percentage(self, value):
-        if value is not None and not 0 <= value <= 100:
+        if (
+            value is not None
+            and not 0 <= value <= 100
+        ):
             raise serializers.ValidationError(
                 "GST percentage must be between 0 and 100."
             )
@@ -135,6 +144,10 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
         serializers.SerializerMethodField()
     )
 
+    replacement_for_po_number = (
+        serializers.SerializerMethodField()
+    )
+
     class Meta:
         model = PurchaseOrder
 
@@ -153,6 +166,11 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
             "approval_status",
             "latest_approval",
             "source_mr_number",
+            "order_type",
+            "replacement_for",
+            "replacement_for_po_number",
+            "replacement_round",
+            "replacement_source_inward_id",
             "items",
             "deleted_items",
             "qty",
@@ -176,6 +194,11 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
             "total_received_quantity",
             "total_remaining_quantity",
             "latest_approval",
+            "order_type",
+            "replacement_for",
+            "replacement_for_po_number",
+            "replacement_round",
+            "replacement_source_inward_id",
             "created_at",
         ]
 
@@ -205,7 +228,8 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
 
         total_price = sum(
             (
-                item.unit_price or Decimal("0")
+                item.unit_price
+                or Decimal("0")
                 for item in items
             ),
             Decimal("0"),
@@ -216,7 +240,8 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
     def get_total(self, obj):
         return sum(
             (
-                item.total_cost or Decimal("0")
+                item.total_cost
+                or Decimal("0")
                 for item in obj.items.all()
             ),
             Decimal("0"),
@@ -234,10 +259,27 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
             for item in obj.items.all()
         )
 
+    def get_replacement_for_po_number(self, obj):
+        replacement_for = getattr(
+            obj,
+            "replacement_for",
+            None,
+        )
+
+        if not replacement_for:
+            return ""
+
+        return str(
+            replacement_for.po_number
+            or ""
+        ).strip()
+
     def get_latest_approval(self, obj):
         latest = (
             obj.approvals
-            .order_by("-created_at")
+            .order_by(
+                "-created_at"
+            )
             .first()
         )
 
@@ -253,6 +295,130 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
             "created_at": latest.created_at,
         }
 
+    # --------------------------------------------------
+    # NEW: Sync PO component names into Vendor Details
+    # --------------------------------------------------
+    def sync_vendor_components(self, purchase_order):
+        """
+        Automatically sync components used in a Purchase Order
+        into the selected Vendor's component list.
+
+        Prevents duplicate component names and safely copies
+        component version when available.
+        """
+
+        vendor_name = str(
+            purchase_order.vendor_name or ""
+        ).strip()
+
+        if not vendor_name:
+            return
+
+        vendor = (
+            Vendor.objects
+            .filter(
+                name__iexact=vendor_name,
+                is_active=True,
+            )
+            .first()
+        )
+
+        if not vendor:
+            return
+
+        po_items = (
+            purchase_order.items
+            .select_related("component")
+            .all()
+        )
+
+        for po_item in po_items:
+
+            component = getattr(
+                po_item,
+                "component",
+                None,
+            )
+
+            if not component:
+                continue
+
+            # -----------------------------
+            # Component name
+            # -----------------------------
+            component_name = str(
+                getattr(component, "name", "")
+                or getattr(
+                    component,
+                    "component_name",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            if not component_name:
+                continue
+
+            # -----------------------------
+            # Component version
+            # IMPORTANT:
+            # Always initialise this variable.
+            # -----------------------------
+            component_version = str(
+                getattr(component, "version", "")
+                or getattr(
+                    component,
+                    "component_version",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            # -----------------------------
+            # Check whether this component
+            # already exists for vendor
+            # -----------------------------
+            existing_product = (
+                VendorProduct.objects
+                .filter(
+                    vendor=vendor,
+                    product__iexact=component_name,
+                )
+                .first()
+            )
+
+            if existing_product:
+
+                # Update version only when a version exists
+                if (
+                    component_version
+                    and existing_product.product_version
+                    != component_version
+                ):
+                    existing_product.product_version = (
+                        component_version
+                    )
+
+                    existing_product.save(
+                        update_fields=[
+                            "product_version"
+                        ]
+                    )
+
+                continue
+
+            # -----------------------------
+            # New vendor component
+            # -----------------------------
+            VendorProduct.objects.create(
+                vendor=vendor,
+                product=component_name,
+                product_version=(
+                    component_version
+                    if component_version
+                    else None
+                ),
+            )
     # --------------------------------------------------
     # Create Purchase Order
     # --------------------------------------------------
@@ -286,6 +452,13 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
                 purchase_order=purchase_order,
                 **item_data,
             )
+
+        # NEW:
+        # Automatically add any new PO component names
+        # into the selected vendor's component list.
+        self.sync_vendor_components(
+            purchase_order
+        )
 
         return purchase_order
 
@@ -325,8 +498,8 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
 
         instance.save()
 
-        # Do not modify PO items during a normal
-        # status-only PATCH request.
+        # Normal status-only PATCH:
+        # don't modify PO items.
         if items_data is None:
             return instance
 
@@ -353,8 +526,8 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
                 )
 
             if (
-                not existing_item and
-                component
+                not existing_item
+                and component
             ):
                 existing_item = (
                     PurchaseOrderItem.objects
@@ -394,10 +567,18 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
                         "gst_percentage",
                     ]
                 )
+
             else:
                 PurchaseOrderItem.objects.create(
                     purchase_order=instance,
                     **item_data,
                 )
+
+        # NEW:
+        # If an existing PO gets new components,
+        # add those component names to Vendor Details too.
+        self.sync_vendor_components(
+            instance
+        )
 
         return instance

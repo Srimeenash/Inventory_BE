@@ -89,13 +89,78 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
         return queryset
 
     @staticmethod
-    def get_user_role(user):
-        raw_role = getattr(user, "role", "")
+    def normalize_role_value(value):
+        """
+        Normalize one role value coming from the User model.
 
-        if hasattr(raw_role, "name"):
-            raw_role = raw_role.name
+        The project has used role values through more than one API/model
+        attribute (role, client_type, user_type). Related role objects are
+        also supported through common name/code/slug/value attributes.
+        """
+        if value is None:
+            return ""
 
-        return str(raw_role or "").strip().lower()
+        for attribute in ("name", "code", "slug", "value"):
+            if hasattr(value, attribute):
+                nested = getattr(value, attribute, None)
+                if nested not in (None, ""):
+                    value = nested
+                    break
+
+        return str(value or "").strip().lower()
+
+    @classmethod
+    def get_user_role_candidates(cls, user):
+        """
+        Return every non-empty role representation stored on the user.
+
+        This is intentionally fail-closed. If an account says FINANCE in
+        one field and MANAGER in another, it must not be selected for either
+        Scrap email stage until the user data is corrected.
+        """
+        if not user:
+            return set()
+
+        roles = set()
+
+        for attribute in ("role", "client_type", "user_type"):
+            if not hasattr(user, attribute):
+                continue
+
+            normalized = cls.normalize_role_value(
+                getattr(user, attribute, None)
+            )
+
+            if normalized:
+                roles.add(normalized)
+
+        return roles
+
+    @classmethod
+    def user_has_exact_role(cls, user, expected_role):
+        """
+        True only when every available role field agrees on one role.
+
+        Examples:
+            {"finance"}            -> Finance allowed
+            {"manager"}            -> Manager allowed
+            {"finance", "manager"} -> blocked from both
+        """
+        expected = cls.normalize_role_value(expected_role)
+        roles = cls.get_user_role_candidates(user)
+        return bool(expected) and roles == {expected}
+
+    @classmethod
+    def get_user_role(cls, user):
+        """
+        Return the user's role only when all stored role fields agree.
+        """
+        roles = cls.get_user_role_candidates(user)
+
+        if len(roles) != 1:
+            return ""
+
+        return next(iter(roles))
 
     @classmethod
     def require_manager(cls, request):
@@ -112,6 +177,25 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
         if cls.get_user_role(user) != "manager":
             raise PermissionDenied(
                 "Only Manager can approve or reject Scrap."
+            )
+
+        return user
+
+    @classmethod
+    def require_finance(cls, request):
+        user = getattr(request, "user", None)
+
+        if (
+            not user
+            or not user.is_authenticated
+        ):
+            raise PermissionDenied(
+                "Authentication is required."
+            )
+
+        if cls.get_user_role(user) != "finance":
+            raise PermissionDenied(
+                "Only Finance can approve or reject Scrap at this stage."
             )
 
         return user
@@ -398,6 +482,93 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
         return None
 
     @classmethod
+    def ensure_scrap_finance_notification(
+        cls,
+        instance,
+        requester_name,
+    ):
+        """
+        Create or refresh the Finance notification after Manager approval.
+
+        Every Scrap reaches this stage only after Manager approval has moved
+        the record from PENDING_MANAGER to PENDING_FINANCE.
+        """
+        current = str(
+            getattr(
+                instance,
+                "approval_status",
+                "",
+            )
+            or ""
+        ).strip().upper()
+
+        if current != "PENDING_FINANCE":
+            print(
+                "SCRAP FINANCE NOTIFICATION SKIPPED:",
+                cls.get_scrap_reference(instance),
+                "- current state:",
+                current or "UNKNOWN",
+            )
+            return None
+
+        requester_name = (
+            str(
+                requester_name
+                or "User"
+            ).strip()
+            or "User"
+        )
+
+        remarks = (
+            str(
+                getattr(
+                    instance,
+                    "remarks",
+                    "",
+                )
+                or "Scrap"
+            ).strip()
+            or "Scrap"
+        )
+
+        notification, created = (
+            Notification.objects
+            .get_or_create(
+                category="SCRAP",
+                receiver="FINANCE",
+                reference_id=str(
+                    instance.pk
+                ),
+                defaults={
+                    "title": requester_name,
+                    "requested_by": requester_name,
+                    "message": remarks,
+                    "status": "PENDING_FINANCE",
+                    "is_read": False,
+                },
+            )
+        )
+
+        if not created:
+            notification.title = requester_name
+            notification.requested_by = requester_name
+            notification.message = remarks
+            notification.status = "PENDING_FINANCE"
+            notification.is_read = False
+
+            notification.save(
+                update_fields=[
+                    "title",
+                    "requested_by",
+                    "message",
+                    "status",
+                    "is_read",
+                ]
+            )
+
+        return notification
+
+    @classmethod
     def ensure_scrap_manager_notification(
         cls,
         instance,
@@ -408,6 +579,27 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
         notification. Existing frontends already check whether the
         notification exists, so they will not create duplicates.
         """
+        current = str(
+            getattr(
+                instance,
+                "approval_status",
+                "",
+            )
+            or ""
+        ).strip().upper()
+
+        # HARD WORKFLOW GUARD:
+        # Manager is the FIRST approval stage. Manager notifications are
+        # valid only while the Scrap is PENDING_MANAGER.
+        if current != "PENDING_MANAGER":
+            print(
+                "SCRAP MANAGER NOTIFICATION SKIPPED:",
+                cls.get_scrap_reference(instance),
+                "- current state:",
+                current or "UNKNOWN",
+            )
+            return None
+
         requester_name = (
             str(
                 requester_name
@@ -477,15 +669,158 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
         return notification
 
     @classmethod
-    def send_scrap_manager_approval_email(
+    def ensure_scrap_creator_notification(
+        cls,
+        instance,
+        actor_name,
+        *,
+        actor_role="Manager",
+        outcome="approved",
+        rejection_reason="",
+    ):
+        """
+        Create the FINAL Scrap result notification for only the exact user
+        who originally created the Scrap.
+
+        This helper is called only when the workflow has ended:
+            - Manager rejected, or
+            - Finance approved/rejected.
+
+        No email is sent from this helper.
+        """
+        requester_user = (
+            cls.resolve_scrap_requester_user(
+                instance
+            )
+        )
+
+        if not requester_user:
+            print(
+                "SCRAP CREATOR NOTIFICATION SKIPPED:",
+                cls.get_scrap_reference(instance),
+                "- original requester could not be resolved.",
+            )
+            return None
+
+        normalized_outcome = str(
+            outcome or "approved"
+        ).strip().lower()
+
+        is_rejected = (
+            normalized_outcome == "rejected"
+        )
+
+        normalized_actor_role = (
+            str(actor_role or "User").strip()
+            or "User"
+        )
+
+        scrap_reference = (
+            cls.get_scrap_reference(instance)
+        )
+
+        requester_name = (
+            cls.get_mail_user_name(
+                requester_user,
+                getattr(
+                    instance,
+                    "requested_by",
+                    "",
+                )
+                or "User",
+            )
+        )
+
+        current_status = str(
+            getattr(
+                instance,
+                "approval_status",
+                "",
+            )
+            or ""
+        ).strip().upper()
+
+        if is_rejected:
+            final_status = (
+                current_status
+                if current_status in {
+                    "MANAGER_REJECTED",
+                    "FINANCE_REJECTED",
+                }
+                else "REJECTED"
+            )
+            title = (
+                f"Scrap Rejected - {scrap_reference}"
+            )
+            reason = str(
+                rejection_reason or ""
+            ).strip()
+            message = (
+                f"Your Scrap request {scrap_reference} "
+                f"was rejected by {normalized_actor_role} "
+                f"{actor_name or normalized_actor_role}."
+            )
+            if reason:
+                message += f" Reason: {reason}"
+        else:
+            final_status = (
+                current_status
+                if current_status == "APPROVED"
+                else "APPROVED"
+            )
+            title = (
+                f"Scrap Approved - {scrap_reference}"
+            )
+            message = (
+                f"Your Scrap request {scrap_reference} "
+                f"has been approved by {normalized_actor_role} "
+                f"{actor_name or normalized_actor_role}."
+            )
+
+        notification, created = (
+            Notification.objects.get_or_create(
+                category="SCRAP",
+                recipient_user=requester_user,
+                reference_id=str(instance.pk),
+                status=final_status,
+                defaults={
+                    "title": title,
+                    "requested_by": requester_name,
+                    "message": message,
+                    "receiver": None,
+                    "is_read": False,
+                },
+            )
+        )
+
+        if not created:
+            notification.title = title
+            notification.requested_by = (
+                requester_name
+            )
+            notification.message = message
+            notification.receiver = None
+            notification.is_read = False
+            notification.save(
+                update_fields=[
+                    "title",
+                    "requested_by",
+                    "message",
+                    "receiver",
+                    "is_read",
+                ]
+            )
+
+        return notification
+
+    @classmethod
+    def send_scrap_finance_approval_email(
         cls,
         outward_id,
     ):
         """
-        Approval-request email to every active Manager for:
-        - Inventory-created Scrap
-        - Outward-created Scrap
-        - Engineer-created Scrap
+        Send a Scrap approval-request email to every active Finance user.
+        This email is sent only AFTER Manager approval.
         """
         try:
             instance = (
@@ -499,18 +834,336 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
         except OutwardEntry.DoesNotExist:
             return False
 
-        managers = (
-            User.objects
-            .filter(
-                role__iexact="manager",
-                is_active=True,
+        current = str(
+            getattr(
+                instance,
+                "approval_status",
+                "",
             )
+            or ""
+        ).strip().upper()
+
+        # Finance mail is valid only at the Finance stage.
+        if current != "PENDING_FINANCE":
+            print(
+                "SCRAP FINANCE EMAIL SKIPPED:",
+                cls.get_scrap_reference(instance),
+                "- current state:",
+                current or "UNKNOWN",
+            )
+            return False
+
+        # ---------------------------------------------------------
+        # STRICT FINANCE RECIPIENT SELECTION
+        # ---------------------------------------------------------
+        # Do not trust a single ORM role filter here. In this project some
+        # user payloads can expose role through a related object/name, and
+        # the same email address may also exist on another active account.
+        #
+        # Rules for the Finance-stage Scrap email:
+        #   1. recipient must resolve to role == FINANCE
+        #   2. recipient email must NOT be used by any active MANAGER
+        #   3. send only once per unique Finance email address
+        #
+        # This keeps Finance-stage delivery limited to Finance recipients.
+        active_users_with_email = list(
+            User.objects
+            .filter(is_active=True)
             .exclude(email__isnull=True)
             .exclude(email="")
             .order_by("id")
         )
 
-        if not managers.exists():
+        manager_email_keys = {
+            str(user.email or "").strip().casefold()
+            for user in active_users_with_email
+            if (
+                cls.user_has_exact_role(user, "manager")
+                and str(user.email or "").strip()
+            )
+        }
+
+        finance_users = []
+        seen_finance_email_keys = set()
+
+        for candidate in active_users_with_email:
+            if not cls.user_has_exact_role(candidate, "finance"):
+                roles = cls.get_user_role_candidates(candidate)
+                if "finance" in roles:
+                    print(
+                        "SCRAP FINANCE RECIPIENT BLOCKED DUE TO ROLE CONFLICT:",
+                        candidate.pk,
+                        candidate.email,
+                        sorted(roles),
+                    )
+                continue
+
+            email_key = str(
+                candidate.email or ""
+            ).strip().casefold()
+
+            if not email_key:
+                continue
+
+            # If this mailbox is also attached to an active Manager, never
+            # use it for the Finance-stage Scrap email.
+            if email_key in manager_email_keys:
+                print(
+                    "SCRAP FINANCE RECIPIENT BLOCKED:",
+                    candidate.pk,
+                    candidate.email,
+                    "- same email is used by an active Manager.",
+                )
+                continue
+
+            if email_key in seen_finance_email_keys:
+                continue
+
+            seen_finance_email_keys.add(email_key)
+            finance_users.append(candidate)
+
+        if not finance_users:
+            print(
+                "SCRAP FINANCE EMAIL SKIPPED:",
+                cls.get_scrap_reference(
+                    instance
+                ),
+                "- no eligible Finance-only user with email.",
+            )
+            return False
+
+        requester_user = (
+            cls.resolve_scrap_requester_user(
+                instance
+            )
+        )
+
+        requester_name = (
+            cls.get_mail_user_name(
+                requester_user,
+                getattr(
+                    instance,
+                    "requested_by",
+                    "",
+                )
+                or "User",
+            )
+        )
+
+        material_request = getattr(
+            instance,
+            "material_request",
+            None,
+        )
+
+        mr_number = (
+            getattr(
+                material_request,
+                "material_request_id",
+                "",
+            )
+            or "-"
+        )
+
+        source = str(
+            getattr(
+                instance,
+                "source",
+                "",
+            )
+            or "DIRECT"
+        ).strip().upper()
+
+        scrap_reference = (
+            cls.get_scrap_reference(
+                instance
+            )
+        )
+
+        component_label = (
+            cls.get_scrap_component_label(
+                instance
+            )
+        )
+
+        subject = (
+            f"{scrap_reference} submitted by "
+            f"{requester_name} - Finance Approval Required"
+        )
+
+        sent_any = False
+
+        for finance in finance_users:
+            sent = send_ipms_email(
+                recipient_email=finance.email,
+                subject=subject,
+                context={
+                    "recipient_name":
+                        cls.get_mail_user_name(
+                            finance,
+                            "Finance",
+                        ),
+                    "message": (
+                        f"A Scrap request submitted by "
+                        f"{requester_name} has been "
+                        f"approved by Manager and now "
+                        f"requires Finance approval."
+                    ),
+                    "table_headers": [
+                        "Scrap Reference",
+                        "Requested By",
+                        "Source",
+                        "Material Request",
+                        "Component",
+                        "Quantity",
+                        "Scrap Date",
+                        "Remarks",
+                        "Status",
+                    ],
+                    "table_values": [
+                        scrap_reference,
+                        requester_name,
+                        source,
+                        mr_number,
+                        component_label,
+                        int(
+                            getattr(
+                                instance,
+                                "quantity",
+                                0,
+                            )
+                            or 0
+                        ),
+                        getattr(
+                            instance,
+                            "out_date",
+                            "",
+                        )
+                        or "-",
+                        getattr(
+                            instance,
+                            "remarks",
+                            "",
+                        )
+                        or "-",
+                        "Pending Finance Approval",
+                    ],
+                    "status":
+                        "Pending Finance Approval",
+                    "instruction": (
+                        "Please review this Scrap "
+                        "request from Finance "
+                        "Notifications in IPMS."
+                    ),
+                    "button_text":
+                        "Review Scrap in IPMS",
+                    "action_url": (
+                        f"{cls.get_ipms_base_url()}"
+                        f"/notifications"
+                    ),
+                },
+            )
+
+            if sent:
+                sent_any = True
+
+        print(
+            "SCRAP FINANCE EMAIL SENT =",
+            sent_any,
+            "| SCRAP =",
+            scrap_reference,
+            "| SOURCE =",
+            source,
+        )
+
+        return sent_any
+
+    @classmethod
+    def send_scrap_manager_approval_email(
+        cls,
+        outward_id,
+    ):
+        """
+        Send the FIRST Scrap approval email to Manager.
+        The PENDING_MANAGER guard prevents duplicate/stale stage emails.
+        """
+        try:
+            instance = (
+                OutwardEntry.objects
+                .select_related(
+                    "component",
+                    "material_request",
+                )
+                .get(pk=outward_id)
+            )
+        except OutwardEntry.DoesNotExist:
+            return False
+
+        current = str(
+            getattr(
+                instance,
+                "approval_status",
+                "",
+            )
+            or ""
+        ).strip().upper()
+
+        # HARD WORKFLOW GUARD:
+        # Manager is the first approval stage, so this mail is valid only
+        # while the newly-created Scrap is PENDING_MANAGER.
+        if current != "PENDING_MANAGER":
+            print(
+                "SCRAP MANAGER EMAIL SKIPPED:",
+                cls.get_scrap_reference(instance),
+                "- current state:",
+                current or "UNKNOWN",
+            )
+            return False
+
+        # ---------------------------------------------------------
+        # STRICT MANAGER RECIPIENT SELECTION
+        # ---------------------------------------------------------
+        # This function is protected by PENDING_MANAGER above. Resolve the
+        # Manager role in Python
+        # with the same helper used by permission checks, and de-duplicate by
+        # email so each Manager mailbox receives one approval-request mail.
+        active_users_with_email = list(
+            User.objects
+            .filter(is_active=True)
+            .exclude(email__isnull=True)
+            .exclude(email="")
+            .order_by("id")
+        )
+
+        managers = []
+        seen_manager_email_keys = set()
+
+        for candidate in active_users_with_email:
+            if not cls.user_has_exact_role(candidate, "manager"):
+                roles = cls.get_user_role_candidates(candidate)
+                if "manager" in roles:
+                    print(
+                        "SCRAP MANAGER RECIPIENT BLOCKED DUE TO ROLE CONFLICT:",
+                        candidate.pk,
+                        candidate.email,
+                        sorted(roles),
+                    )
+                continue
+
+            email_key = str(
+                candidate.email or ""
+            ).strip().casefold()
+
+            if (
+                not email_key
+                or email_key in seen_manager_email_keys
+            ):
+                continue
+
+            seen_manager_email_keys.add(email_key)
+            managers.append(candidate)
+
+        if not managers:
             print(
                 "SCRAP MANAGER EMAIL SKIPPED:",
                 cls.get_scrap_reference(
@@ -667,201 +1320,6 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
         return sent_any
 
     @classmethod
-    def send_scrap_requester_result_email(
-        cls,
-        outward_id,
-        *,
-        outcome,
-        manager_name,
-        rejection_reason="",
-    ):
-        """
-        Return Manager Approved / Rejected result to the original
-        authenticated Scrap requester.
-        """
-        try:
-            instance = (
-                OutwardEntry.objects
-                .select_related(
-                    "component",
-                    "material_request",
-                )
-                .get(pk=outward_id)
-            )
-        except OutwardEntry.DoesNotExist:
-            return False
-
-        requester = (
-            cls.resolve_scrap_requester_user(
-                instance
-            )
-        )
-
-        if not requester:
-            print(
-                "SCRAP RESULT EMAIL SKIPPED:",
-                cls.get_scrap_reference(
-                    instance
-                ),
-                "- original requester could not be resolved.",
-            )
-            return False
-
-        recipient_email = str(
-            getattr(
-                requester,
-                "email",
-                "",
-            )
-            or ""
-        ).strip()
-
-        if not recipient_email:
-            print(
-                "SCRAP RESULT EMAIL SKIPPED:",
-                cls.get_scrap_reference(
-                    instance
-                ),
-                "- requester email is empty.",
-            )
-            return False
-
-        requester_name = (
-            cls.get_mail_user_name(
-                requester,
-                "User",
-            )
-        )
-
-        scrap_reference = (
-            cls.get_scrap_reference(
-                instance
-            )
-        )
-
-        component_label = (
-            cls.get_scrap_component_label(
-                instance
-            )
-        )
-
-        normalized_outcome = str(
-            outcome or ""
-        ).strip().lower()
-
-        if normalized_outcome == "rejected":
-            subject = (
-                f"{scrap_reference} - "
-                f"Manager Rejected"
-            )
-            status_label = (
-                "Manager Rejected"
-            )
-            message = (
-                f"Manager has rejected your "
-                f"Scrap request "
-                f"{scrap_reference}."
-            )
-            instruction = (
-                "Please review the Manager "
-                "rejection reason in IPMS."
-            )
-        else:
-            subject = (
-                f"{scrap_reference} - "
-                f"Manager Approved"
-            )
-            status_label = (
-                "Manager Approved"
-            )
-            message = (
-                f"Manager has approved your "
-                f"Scrap request "
-                f"{scrap_reference}."
-            )
-            instruction = (
-                "Your Scrap request has been "
-                "approved by Manager."
-            )
-
-        sent = send_ipms_email(
-            recipient_email=recipient_email,
-            subject=subject,
-            context={
-                "recipient_name":
-                    requester_name,
-                "message":
-                    message,
-                "table_headers": [
-                    "Scrap Reference",
-                    "Component",
-                    "Quantity",
-                    "Scrap Date",
-                    "Decision",
-                    "Decision By",
-                    "Rejection Reason",
-                    "Remarks",
-                ],
-                "table_values": [
-                    scrap_reference,
-                    component_label,
-                    int(
-                        getattr(
-                            instance,
-                            "quantity",
-                            0,
-                        )
-                        or 0
-                    ),
-                    getattr(
-                        instance,
-                        "out_date",
-                        "",
-                    )
-                    or "-",
-                    status_label,
-                    manager_name
-                    or "Manager",
-                    (
-                        rejection_reason
-                        if normalized_outcome
-                        == "rejected"
-                        else "-"
-                    ),
-                    getattr(
-                        instance,
-                        "remarks",
-                        "",
-                    )
-                    or "-",
-                ],
-                "status":
-                    status_label,
-                "instruction":
-                    instruction,
-                "button_text":
-                    "View Scrap in IPMS",
-                "action_url": (
-                    f"{cls.get_ipms_base_url()}"
-                    f"/outward"
-                ),
-            },
-        )
-
-        print(
-            "SCRAP RESULT EMAIL SENT =",
-            sent,
-            "| SCRAP =",
-            scrap_reference,
-            "| TO =",
-            recipient_email,
-            "| OUTCOME =",
-            status_label,
-        )
-
-        return sent
-
-    @classmethod
     def register_new_scrap_workflow(
         cls,
         instance,
@@ -870,8 +1328,11 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
         """
         Called only after a new Scrap OutwardEntry exists.
 
-        Stores requester identity, creates/refreshes Manager notification,
-        and queues Manager approval-request mail after transaction commit.
+        Required approval order:
+            PENDING_MANAGER -> PENDING_FINANCE -> APPROVED
+
+        A newly-created Scrap is sent to Manager first. Finance receives a
+        notification/email only after manager_approve() succeeds.
         """
         if (
             str(
@@ -919,9 +1380,7 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
 
         update_fields = []
 
-        instance.requested_by = (
-            requester_name
-        )
+        instance.requested_by = requester_name
         update_fields.append(
             "requested_by"
         )
@@ -947,6 +1406,23 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                 "source"
             )
 
+        # All newly-created Scrap enters Manager approval first.
+        instance.approval_status = (
+            "PENDING_MANAGER"
+        )
+        instance.status = "PENDING_MANAGER"
+        instance.rejection_reason = None
+        instance.rejected_by = None
+
+        update_fields.extend(
+            [
+                "approval_status",
+                "status",
+                "rejection_reason",
+                "rejected_by",
+            ]
+        )
+
         instance.save(
             update_fields=list(
                 dict.fromkeys(
@@ -956,6 +1432,7 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
             )
         )
 
+        # Manager is the first approval stage.
         cls.ensure_scrap_manager_notification(
             instance,
             requester_name,
@@ -1755,7 +2232,7 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
 
         save_values = {
             "approval_status": (
-                "REQUESTED"
+                "PENDING_MANAGER"
                 if outward_type == "SCRAP"
                 else "NOT_REQUESTED"
             ),
@@ -1992,7 +2469,7 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                             "detail": (
                                 "Scrap approval fields cannot be "
                                 "changed with normal PATCH. Use "
-                                "manager-approve or manager-reject."
+                                "finance-approve, finance-reject, manager-approve or manager-reject."
                             )
                         }
                     )
@@ -2393,14 +2870,14 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
             instance.requested_by_user_id = user.pk
             instance.moved_to_inventory = False
             instance.moved_at = None
-            instance.approval_status = "REQUESTED"
+            instance.approval_status = "PENDING_MANAGER"
             instance.status = "PENDING_MANAGER"
             instance.save(update_fields=[
                 "product_name", "serial_numbers", "source", "scrap_origin",
                 "material_request", "requested_by", "requested_by_user_id",
                 "moved_to_inventory", "moved_at", "approval_status", "status", "updated_at",
             ])
-            # Backend-owned Manager notification + approval email.
+            # Backend-owned Manager-first notification + approval email.
             # requested_by/requested_by_user_id were already set above,
             # so the later Approved/Rejected return mail goes to this
             # exact Engineer.
@@ -2574,13 +3051,13 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
             # -------------------------------------------------
             # 1. NOT YET MOVED:
             #    delete the Engineer Scrap staging record.
-            #    Its Manager notification would otherwise point
+            #    Its Finance/Manager notification would otherwise point
             #    to a deleted Scrap request, so remove it too.
             # -------------------------------------------------
             if staging_ids:
                 Notification.objects.filter(
                     category="SCRAP",
-                    receiver="MANAGER",
+                    receiver__in=["FINANCE", "MANAGER"],
                     reference_id__in=[
                         str(value)
                         for value
@@ -2661,7 +3138,7 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
         - DIRECT Inventory/Outward Scrap cannot use this action.
         - Once moved_to_inventory=True, deletion is blocked because
           the row is now the official Inventory/Outward Scrap record.
-        - Any matching Manager Scrap notification is removed too.
+        - Any matching Finance/Manager Scrap notification is removed too.
         """
         user = self.require_engineer_or_admin(
             request
@@ -2728,7 +3205,7 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
             Notification.objects.filter(
                 category="SCRAP",
                 reference_id=reference_id,
-                receiver="MANAGER",
+                receiver__in=["FINANCE", "MANAGER"],
             ).delete()
 
             # Delete only this staged Engineer Scrap row.
@@ -2750,7 +3227,7 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
         pk=None,
     ):
         """
-        Engineer/Admin may perform this only AFTER Manager approval.
+        Engineer/Admin may perform this only AFTER final Finance approval.
 
         We do not create a duplicate OutwardEntry.
 
@@ -2816,12 +3293,12 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
 
             if (
                 current
-                != "MANAGER_APPROVED"
+                != "APPROVED"
             ):
                 raise ValidationError(
                     {
                         "detail": (
-                            "Manager approval is required before "
+                            "Manager and Finance approval are required before "
                             "moving Scrap to Inventory. "
                             f"Current state: {current or 'UNKNOWN'}."
                         )
@@ -2835,7 +3312,7 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                 timezone.now()
             )
 
-            # Once moved, this becomes the final Scrap Outward record.
+            # Keep the final Finance-approved audit state after movement.
             instance.approval_status = (
                 "APPROVED"
             )
@@ -2864,6 +3341,236 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
     @action(
         detail=True,
         methods=["post"],
+        url_path="finance-approve",
+    )
+    def finance_approve(
+        self,
+        request,
+        pk=None,
+    ):
+        """
+        Finance is the FINAL Scrap approval stage.
+
+        PENDING_FINANCE -> APPROVED
+        """
+        user = self.require_finance(request)
+
+        with transaction.atomic():
+            instance = (
+                self.get_queryset()
+                .select_for_update()
+                .get(pk=pk)
+            )
+
+            if (
+                str(
+                    instance.outward_type
+                    or ""
+                ).strip().upper()
+                != "SCRAP"
+            ):
+                raise ValidationError(
+                    {
+                        "detail":
+                            "Only Scrap records require Finance approval."
+                    }
+                )
+
+            current = str(
+                instance.approval_status
+                or ""
+            ).strip().upper()
+
+            if current != "PENDING_FINANCE":
+                raise ValidationError(
+                    {
+                        "detail": (
+                            "This Scrap is no longer pending "
+                            "Finance approval. Current state: "
+                            f"{current or 'UNKNOWN'}."
+                        )
+                    }
+                )
+
+            finance_name = (
+                self.get_actor_name(user)
+            )
+
+            instance.approval_status = "APPROVED"
+            instance.status = "APPROVED"
+            instance.rejection_reason = None
+            instance.rejected_by = None
+
+            instance.save(
+                update_fields=[
+                    "approval_status",
+                    "status",
+                    "rejection_reason",
+                    "rejected_by",
+                    "updated_at",
+                ]
+            )
+
+            # Mark the Finance notification as processed.
+            Notification.objects.filter(
+                category="SCRAP",
+                receiver="FINANCE",
+                reference_id=str(
+                    instance.pk
+                ),
+            ).update(
+                status="APPROVED",
+                is_read=True,
+                message=(
+                    f"Scrap approved by Finance "
+                    f"{finance_name}."
+                ),
+            )
+
+            # Final result goes only to the exact creator.
+            self.ensure_scrap_creator_notification(
+                instance,
+                finance_name,
+                actor_role="Finance",
+                outcome="approved",
+            )
+
+        return Response(
+            self.get_serializer(
+                instance
+            ).data,
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="finance-reject",
+    )
+    def finance_reject(
+        self,
+        request,
+        pk=None,
+    ):
+        """
+        Finance rejection is final and occurs only after Manager approval.
+        """
+        user = self.require_finance(request)
+
+        reason = str(
+            request.data.get(
+                "rejection_reason",
+                request.data.get(
+                    "reason",
+                    "",
+                ),
+            )
+            or ""
+        ).strip()
+
+        if not reason:
+            raise ValidationError(
+                {
+                    "rejection_reason":
+                        "Enter a rejection reason."
+                }
+            )
+
+        with transaction.atomic():
+            instance = (
+                self.get_queryset()
+                .select_for_update()
+                .get(pk=pk)
+            )
+
+            if (
+                str(
+                    instance.outward_type
+                    or ""
+                ).strip().upper()
+                != "SCRAP"
+            ):
+                raise ValidationError(
+                    {
+                        "detail":
+                            "Only Scrap records use this Finance workflow."
+                    }
+                )
+
+            current = str(
+                instance.approval_status
+                or ""
+            ).strip().upper()
+
+            if current != "PENDING_FINANCE":
+                raise ValidationError(
+                    {
+                        "detail": (
+                            "This Scrap is no longer pending "
+                            "Finance approval. Current state: "
+                            f"{current or 'UNKNOWN'}."
+                        )
+                    }
+                )
+
+            finance_name = (
+                self.get_actor_name(user)
+            )
+
+            instance.approval_status = (
+                "FINANCE_REJECTED"
+            )
+            instance.status = "FINANCE_REJECTED"
+            instance.rejection_reason = reason
+            instance.rejected_by = finance_name
+
+            instance.save(
+                update_fields=[
+                    "approval_status",
+                    "status",
+                    "rejection_reason",
+                    "rejected_by",
+                    "updated_at",
+                ]
+            )
+
+            Notification.objects.filter(
+                category="SCRAP",
+                receiver="FINANCE",
+                reference_id=str(
+                    instance.pk
+                ),
+            ).update(
+                status="FINANCE_REJECTED",
+                is_read=True,
+                message=(
+                    f"Scrap rejected by Finance "
+                    f"{finance_name}. "
+                    f"Reason: {reason}"
+                ),
+            )
+
+            # Manager has already approved at this point, so keep the
+            # Manager notification as audit history and notify only the creator
+            # of the final Finance rejection.
+            self.ensure_scrap_creator_notification(
+                instance,
+                finance_name,
+                actor_role="Finance",
+                outcome="rejected",
+                rejection_reason=reason,
+            )
+
+        return Response(
+            self.get_serializer(
+                instance
+            ).data,
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
         url_path="manager-approve",
     )
     def manager_approve(
@@ -2871,6 +3578,12 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
         request,
         pk=None,
     ):
+        """
+        Manager is the FIRST Scrap approval stage.
+
+        PENDING_MANAGER -> PENDING_FINANCE
+        Then create the Finance notification and Finance approval email.
+        """
         user = self.require_manager(request)
 
         with transaction.atomic():
@@ -2899,7 +3612,7 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                 or ""
             ).strip().upper()
 
-            if current != "REQUESTED":
+            if current != "PENDING_MANAGER":
                 raise ValidationError(
                     {
                         "detail": (
@@ -2910,34 +3623,15 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                     }
                 )
 
-            is_engineer_staged = (
-                str(
-                    instance.source
-                    or ""
-                ).strip().upper()
-                == "ENGINEER"
-                and not instance.moved_to_inventory
+            manager_name = (
+                self.get_actor_name(user)
             )
 
-            if is_engineer_staged:
-                # Engineer sees Manager Approved and then gets
-                # the "Move to Inventory" action.
-                instance.approval_status = (
-                    "MANAGER_APPROVED"
-                )
-                instance.status = (
-                    "MANAGER_APPROVED"
-                )
-            else:
-                # Existing Inventory/Outward-created Scrap keeps
-                # the original direct final-approval behavior.
-                instance.approval_status = (
-                    "APPROVED"
-                )
-                instance.status = (
-                    "APPROVED"
-                )
-
+            # Manager approval advances the request to Finance.
+            instance.approval_status = (
+                "PENDING_FINANCE"
+            )
+            instance.status = "PENDING_FINANCE"
             instance.rejection_reason = None
             instance.rejected_by = None
 
@@ -2951,12 +3645,7 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                 ]
             )
 
-            manager_name = (
-                self.get_actor_name(
-                    user
-                )
-            )
-
+            # Manager's own notification is now completed.
             Notification.objects.filter(
                 category="SCRAP",
                 receiver="MANAGER",
@@ -2964,25 +3653,25 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                     instance.pk
                 ),
             ).update(
-                status=(
-                    "MANAGER_APPROVED"
-                    if is_engineer_staged
-                    else "APPROVED"
-                ),
+                status="MANAGER_APPROVED",
                 is_read=True,
                 message=(
                     f"Scrap approved by "
-                    f"{manager_name}."
+                    f"{manager_name}; pending Finance approval."
                 ),
             )
 
+            # Finance notification exists only after Manager approval.
+            self.ensure_scrap_finance_notification(
+                instance,
+                instance.requested_by
+                or "User",
+            )
+
             transaction.on_commit(
-                lambda outward_id=instance.pk,
-                actor=manager_name: (
-                    self.send_scrap_requester_result_email(
-                        outward_id,
-                        outcome="approved",
-                        manager_name=actor,
+                lambda outward_id=instance.pk: (
+                    self.send_scrap_finance_approval_email(
+                        outward_id
                     )
                 )
             )
@@ -3051,7 +3740,7 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                 or ""
             ).strip().upper()
 
-            if current != "REQUESTED":
+            if current != "PENDING_MANAGER":
                 raise ValidationError(
                     {
                         "detail": (
@@ -3062,10 +3751,8 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                     }
                 )
 
-            instance.approval_status = (
-                "REJECTED"
-            )
-            instance.status = "REJECTED"
+            instance.approval_status = "MANAGER_REJECTED"
+            instance.status = "MANAGER_REJECTED"
             instance.rejection_reason = reason
             instance.rejected_by = (
                 self.get_actor_name(user)
@@ -3094,7 +3781,7 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                     instance.pk
                 ),
             ).update(
-                status="REJECTED",
+                status="MANAGER_REJECTED",
                 is_read=True,
                 message=(
                     f"Scrap rejected by "
@@ -3103,19 +3790,22 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                 ),
             )
 
-            transaction.on_commit(
-                lambda outward_id=instance.pk,
-                actor=manager_name,
-                reject_reason=reason: (
-                    self.send_scrap_requester_result_email(
-                        outward_id,
-                        outcome="rejected",
-                        manager_name=actor,
-                        rejection_reason=(
-                            reject_reason
-                        ),
-                    )
-                )
+            # Manager rejection is final. Remove any impossible stale
+            # Finance-stage notification and notify only the exact creator.
+            Notification.objects.filter(
+                category="SCRAP",
+                receiver="FINANCE",
+                reference_id=str(
+                    instance.pk
+                ),
+            ).delete()
+
+            self.ensure_scrap_creator_notification(
+                instance,
+                manager_name,
+                actor_role="Manager",
+                outcome="rejected",
+                rejection_reason=reason,
             )
 
         return Response(

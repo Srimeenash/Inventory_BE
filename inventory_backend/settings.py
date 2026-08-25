@@ -287,13 +287,11 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # EMAIL / ZOHO SMTP
 # ---------------------------------------------------------------------
 
-EMAIL_BACKEND = (
-    "django.core.mail.backends.smtp.EmailBackend"
-)
+EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
 
 EMAIL_HOST = os.environ.get(
     "EMAIL_HOST",
-    "",
+    "smtp.zoho.com",
 )
 
 EMAIL_PORT = int(
@@ -301,6 +299,14 @@ EMAIL_PORT = int(
         "EMAIL_PORT",
         "587",
     )
+)
+
+EMAIL_USE_TLS = (
+    os.environ.get(
+        "EMAIL_USE_TLS",
+        "True",
+    ).lower()
+    in ("true", "1", "yes")
 )
 
 EMAIL_USE_SSL = (
@@ -330,7 +336,6 @@ IPMS_BASE_URL = os.environ.get(
     "IPMS_BASE_URL",
     "http://localhost:5173",
 )
-
 
 # ---------------------------------------------------------------------
 # LOGIN OTP POLICY

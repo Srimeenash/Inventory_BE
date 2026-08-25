@@ -15,6 +15,7 @@ class ComponentSerializer(serializers.ModelSerializer):
             'specifications',
             'unit_of_measurements',
             'hsn_numbers',
+            'version',
             'sku_numbers',
             'part_numbers',
             'product_link', 

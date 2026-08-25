@@ -136,27 +136,181 @@ def seconds_until_expiry(otp):
     )
 
 
+def get_user_roles(user):
+    """
+    Return every role currently assigned to the user.
+
+    The existing `role` field remains the primary role.
+    `additional_roles` contains optional extra access.
+
+    Example:
+        role = "manager"
+        additional_roles = ["inventory", "procurement"]
+
+    Result:
+        ["manager", "inventory", "procurement"]
+    """
+    if hasattr(user, "get_all_roles"):
+        return user.get_all_roles()
+
+    roles = []
+
+    primary_role = str(
+        getattr(user, "role", "") or ""
+    ).strip().lower()
+
+    if primary_role:
+        roles.append(primary_role)
+
+    additional_roles = getattr(
+        user,
+        "additional_roles",
+        [],
+    )
+
+    if not isinstance(additional_roles, list):
+        additional_roles = []
+
+    for role in additional_roles:
+        normalized_role = str(
+            role or ""
+        ).strip().lower()
+
+        if (
+            normalized_role
+            and normalized_role not in roles
+        ):
+            roles.append(normalized_role)
+
+    return roles
+
+
+def get_request_active_role(request):
+    """
+    Return the role represented by the current JWT.
+
+    Security rule:
+    The role from the token is accepted only if the role is
+    still assigned to the user in the database. This prevents
+    an old token from retaining access after Admin removes a role.
+    """
+    user = getattr(request, "user", None)
+
+    if not (
+        user
+        and getattr(user, "is_authenticated", False)
+    ):
+        return ""
+
+    allowed_roles = get_user_roles(user)
+
+    token = getattr(request, "auth", None)
+    token_role = ""
+
+    if token is not None:
+        try:
+            token_role = str(
+                token.get("active_role", "")
+                or ""
+            ).strip().lower()
+        except (AttributeError, TypeError, ValueError):
+            token_role = ""
+
+    if token_role and token_role in allowed_roles:
+        return token_role
+
+    primary_role = str(
+        getattr(user, "role", "") or ""
+    ).strip().lower()
+
+    if primary_role in allowed_roles:
+        return primary_role
+
+    return (
+        allowed_roles[0]
+        if allowed_roles
+        else ""
+    )
+
+
 def serialize_user(
     user,
     request,
 ):
-    return UserSerializer(
+    data = UserSerializer(
         user,
         context={
             "request": request
         },
     ).data
 
+    # Include active_role only when serializing the logged-in
+    # account itself. Active role belongs to a session/JWT, not
+    # permanently to another employee record.
+    request_user = getattr(request, "user", None)
+
+    if (
+        request_user
+        and getattr(
+            request_user,
+            "is_authenticated",
+            False,
+        )
+        and getattr(request_user, "pk", None)
+        == getattr(user, "pk", None)
+    ):
+        data["active_role"] = (
+            get_request_active_role(request)
+        )
+
+    return data
+
 
 def token_response_for_user(
     user,
     request,
+    active_role=None,
 ):
+    """
+    Create a fresh JWT pair for the user.
+
+    Login uses the primary role by default.
+    Role switching passes the selected role explicitly.
+    """
     if not user.is_active:
         return None
 
-    refresh = RefreshToken.for_user(
-        user
+    allowed_roles = get_user_roles(user)
+
+    requested_active_role = str(
+        active_role
+        or user.role
+        or ""
+    ).strip().lower()
+
+    if requested_active_role not in allowed_roles:
+        requested_active_role = (
+            allowed_roles[0]
+            if allowed_roles
+            else ""
+        )
+
+    refresh = RefreshToken.for_user(user)
+
+    # Custom claims are copied into the generated access token.
+    refresh["active_role"] = requested_active_role
+    refresh["roles"] = allowed_roles
+
+    user_data = UserSerializer(
+        user,
+        context={
+            "request": request
+        },
+    ).data
+
+    user_data["roles"] = allowed_roles
+    user_data["active_role"] = (
+        requested_active_role
     )
 
     return {
@@ -164,10 +318,7 @@ def token_response_for_user(
             refresh.access_token
         ),
         "refresh": str(refresh),
-        "user": serialize_user(
-            user,
-            request,
-        ),
+        "user": user_data,
     }
 
 
@@ -186,17 +337,19 @@ class IsAdminRole(
     ):
         user = request.user
 
-        return bool(
+        if not (
             user
             and user.is_authenticated
             and user.is_active
-            and (
-                user.is_superuser
-                or str(
-                    user.role or ""
-                ).lower()
-                == "admin"
-            )
+        ):
+            return False
+
+        if user.is_superuser:
+            return True
+
+        return (
+            get_request_active_role(request)
+            == "admin"
         )
 
 
@@ -752,6 +905,170 @@ class LoginResendView(APIView):
         )
 
 
+class SwitchRoleView(APIView):
+    """
+    Re-authenticate the currently logged-in user before entering
+    another role assigned by Admin.
+
+    IMPORTANT:
+    - This does NOT log the user out.
+    - The existing session remains active until verification succeeds.
+    - A fresh JWT pair is issued only after the same user's email,
+      password and requested role are verified.
+
+    POST body:
+        {
+            "role": "procurement",
+            "email": "user@company.com",
+            "password": "current-password"
+        }
+    """
+
+    authentication_classes = [
+        JWTAuthentication
+    ]
+
+    permission_classes = [
+        permissions.IsAuthenticated
+    ]
+
+    parser_classes = [
+        JSONParser
+    ]
+
+    def post(self, request):
+        requested_role = str(
+            request.data.get(
+                "role",
+                "",
+            )
+            or ""
+        ).strip().lower()
+
+        email = str(
+            request.data.get(
+                "email",
+                "",
+            )
+            or ""
+        ).strip().lower()
+
+        password = request.data.get(
+            "password"
+        )
+
+        if not requested_role:
+            return Response(
+                {
+                    "detail":
+                        "Role is required."
+                },
+                status=(
+                    status.HTTP_400_BAD_REQUEST
+                ),
+            )
+
+        if not email:
+            return Response(
+                {
+                    "detail":
+                        "Email is required."
+                },
+                status=(
+                    status.HTTP_400_BAD_REQUEST
+                ),
+            )
+
+        if not password:
+            return Response(
+                {
+                    "detail":
+                        "Password is required."
+                },
+                status=(
+                    status.HTTP_400_BAD_REQUEST
+                ),
+            )
+
+        current_user = request.user
+
+        if not current_user.is_active:
+            return Response(
+                {
+                    "detail":
+                        "User is inactive."
+                },
+                status=(
+                    status.HTTP_403_FORBIDDEN
+                ),
+            )
+
+        current_email = str(
+            current_user.email
+            or ""
+        ).strip().lower()
+
+        if email != current_email:
+            return Response(
+                {
+                    "detail":
+                        "Incorrect email or password."
+                },
+                status=(
+                    status.HTTP_400_BAD_REQUEST
+                ),
+            )
+
+        if not current_user.check_password(
+            password
+        ):
+            return Response(
+                {
+                    "detail":
+                        "Incorrect email or password."
+                },
+                status=(
+                    status.HTTP_400_BAD_REQUEST
+                ),
+            )
+
+        allowed_roles = get_user_roles(
+            current_user
+        )
+
+        if requested_role not in allowed_roles:
+            return Response(
+                {
+                    "detail": (
+                        "You do not have access "
+                        "to this role."
+                    )
+                },
+                status=(
+                    status.HTTP_403_FORBIDDEN
+                ),
+            )
+
+        payload = token_response_for_user(
+            current_user,
+            request,
+            active_role=requested_role,
+        )
+
+        payload[
+            "verification_required"
+        ] = False
+
+        payload[
+            "role_reauthenticated"
+        ] = True
+
+        return Response(
+            payload,
+            status=status.HTTP_200_OK,
+        )
+
+
 class UserListCreateView(APIView):
     authentication_classes = [
         JWTAuthentication
@@ -941,7 +1258,6 @@ class UserDetailView(APIView):
             )
         )
 
-
 class ProfileView(APIView):
     authentication_classes = [
         JWTAuthentication
@@ -967,24 +1283,39 @@ class ProfileView(APIView):
         )
 
     def patch(self, request):
-        mutable_data = request.data.copy()
+        """
+        Update the currently logged-in user's profile.
 
-        # A normal user must not change
-        # authorization fields from Topbar.
-        for protected_field in [
+        Do not use request.data.copy() for multipart uploads.
+        Large uploads can be TemporaryUploadedFile objects,
+        and QueryDict.copy() may attempt to deepcopy them.
+        """
+
+        protected_fields = {
             "email",
             "role",
+            "additional_roles",
+            "roles",
+            "active_role",
             "is_active",
             "is_staff",
-        ]:
-            mutable_data.pop(
-                protected_field,
-                None,
-            )
+            "is_superuser",
+            "email_verified",
+        }
+
+        # Build a plain dictionary without copying/deepcopying
+        # uploaded file objects.
+        profile_data = {}
+
+        for key in request.data.keys():
+            if key in protected_fields:
+                continue
+
+            profile_data[key] = request.data.get(key)
 
         serializer = UserSerializer(
             request.user,
-            data=mutable_data,
+            data=profile_data,
             partial=True,
             context={
                 "request": request

@@ -17,10 +17,18 @@ class OutwardEntry(models.Model):
 
     APPROVAL_STATUS_CHOICES = [
         ("NOT_REQUESTED", "Not Requested"),
+
+        # Keep for old records
         ("REQUESTED", "Requested"),
-        ("MANAGER_APPROVED", "Manager Approved"),
-        ("APPROVED", "Approved"),
         ("REJECTED", "Rejected"),
+        ("APPROVED", "Approved"),
+
+        # New Scrap workflow
+        ("PENDING_FINANCE", "Pending Finance"),
+        ("PENDING_MANAGER", "Pending Manager"),
+        ("FINANCE_REJECTED", "Finance Rejected"),
+        ("MANAGER_REJECTED", "Manager Rejected"),
+        ("MANAGER_APPROVED", "Manager Approved"),
     ]
 
     SOURCE_CHOICES = [

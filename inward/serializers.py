@@ -407,6 +407,34 @@ class InwardEntrySerializer(
         read_only=True,
     )
 
+    component_code = serializers.CharField(
+        source="component.component_id",
+        read_only=True,
+        default="",
+    )
+
+    component_name = serializers.CharField(
+        source="component.name",
+        read_only=True,
+        default="",
+    )
+
+    purchase_order_number = (
+        serializers.SerializerMethodField()
+    )
+
+    purchase_order_status = (
+        serializers.SerializerMethodField()
+    )
+
+    replacement_purchase_order_number = (
+        serializers.SerializerMethodField()
+    )
+
+    replacement_purchase_order_status = (
+        serializers.SerializerMethodField()
+    )
+
     qc_passed_count = (
         serializers.SerializerMethodField()
     )
@@ -435,6 +463,14 @@ class InwardEntrySerializer(
             "qc_passed_count",
             "qc_failed_count",
             "source_mr_number",
+            "component_code",
+            "component_name",
+            "purchase_order_number",
+            "purchase_order_status",
+            "qc_failed_action",
+            "replacement_purchase_order",
+            "replacement_purchase_order_number",
+            "replacement_purchase_order_status",
         ]
 
     def get_qc_passed_count(self, obj):
@@ -454,6 +490,60 @@ class InwardEntrySerializer(
         return str(
             obj.purchase_order
             .source_mr_number
+            or ""
+        ).strip()
+
+    def get_purchase_order_number(self, obj):
+        if not obj.purchase_order:
+            return ""
+
+        return str(
+            obj.purchase_order.po_number
+            or ""
+        ).strip()
+
+    def get_purchase_order_status(self, obj):
+        if not obj.purchase_order:
+            return ""
+
+        return str(
+            obj.purchase_order.status
+            or ""
+        ).strip()
+
+    def get_replacement_purchase_order_number(
+        self,
+        obj,
+    ):
+        replacement_po = getattr(
+            obj,
+            "replacement_purchase_order",
+            None,
+        )
+
+        if not replacement_po:
+            return ""
+
+        return str(
+            replacement_po.po_number
+            or ""
+        ).strip()
+
+    def get_replacement_purchase_order_status(
+        self,
+        obj,
+    ):
+        replacement_po = getattr(
+            obj,
+            "replacement_purchase_order",
+            None,
+        )
+
+        if not replacement_po:
+            return ""
+
+        return str(
+            replacement_po.status
             or ""
         ).strip()
 

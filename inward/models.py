@@ -1,7 +1,8 @@
 from django.db import models
-from vendors.models import Vendor
+
 from components.models import Component
 from procurement.models import PurchaseOrder
+from vendors.models import Vendor
 
 
 class InwardEntry(models.Model):
@@ -11,6 +12,13 @@ class InwardEntry(models.Model):
         ("PASS", "Pass"),
         ("FAIL", "Fail"),
         ("COMPLETED", "Completed"),
+    ]
+
+    QC_FAILED_ACTION_CHOICES = [
+        ("NONE", "Action Required"),
+        ("REPLACEMENT_REQUESTED", "Replacement Requested"),
+        # Reserved for the next phase requested by the user.
+        ("RETURN_REQUESTED", "Return / Refund Requested"),
     ]
 
     code = models.CharField(max_length=100, unique=True)
@@ -47,6 +55,24 @@ class InwardEntry(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
     issued = models.BooleanField(default=False)
     removed_from_inventory = models.BooleanField(default=False)
+
+    # ---------------------------------------------------------
+    # Failed-QC disposition / replacement traceability.
+    # ---------------------------------------------------------
+    qc_failed_action = models.CharField(
+        max_length=40,
+        choices=QC_FAILED_ACTION_CHOICES,
+        default="NONE",
+        db_index=True,
+    )
+    replacement_purchase_order = models.ForeignKey(
+        PurchaseOrder,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="replacement_source_inwards",
+        help_text="Replacement PO created from this failed-QC inward entry.",
+    )
 
     def __str__(self):
         return self.code

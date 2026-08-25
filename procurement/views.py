@@ -1,9 +1,10 @@
 from django.db import transaction
 from django.db.models import F, Q, Sum
+from django.utils import timezone
 
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework_simplejwt.authentication import JWTAuthentication
@@ -26,6 +27,7 @@ from xhtml2pdf import pisa
 from vendors.models import Vendor
 from .models import (
     PurchaseOrder,
+    PurchaseOrderApproval,
     PurchaseOrderItem,
     PurchaseRequest,
 )
@@ -86,6 +88,306 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
     # existing AllowAny behavior for routes that still rely on it.
     authentication_classes = [JWTAuthentication]
     permission_classes = [AllowAny]
+
+    # ==========================================================
+    # QC REPLACEMENT APPROVAL HELPERS
+    # ==========================================================
+
+    @staticmethod
+    def normalize_role(value):
+        return str(value or "").strip().lower()
+
+    def get_user_roles(self, user):
+        """
+        Return every role currently assigned to the user.
+
+        The primary role remains in `role`. Extra allowed roles are read
+        from `additional_roles`, or from get_all_roles() when provided by
+        the User model.
+        """
+        if not user or not getattr(user, "is_authenticated", False):
+            return []
+
+        if hasattr(user, "get_all_roles"):
+            try:
+                roles = user.get_all_roles()
+            except Exception:
+                roles = []
+        else:
+            roles = []
+
+            primary_role = self.normalize_role(
+                getattr(user, "role", "")
+            )
+            if primary_role:
+                roles.append(primary_role)
+
+            additional_roles = getattr(
+                user,
+                "additional_roles",
+                [],
+            )
+
+            if not isinstance(additional_roles, list):
+                additional_roles = []
+
+            for value in additional_roles:
+                normalized = self.normalize_role(value)
+                if normalized and normalized not in roles:
+                    roles.append(normalized)
+
+        normalized_roles = []
+
+        for value in roles or []:
+            normalized = self.normalize_role(value)
+            if normalized and normalized not in normalized_roles:
+                normalized_roles.append(normalized)
+
+        return normalized_roles
+
+    def get_request_active_role(self, request):
+        """
+        Return the active JWT role only when it is still assigned in DB.
+
+        A stale token must not keep removed access. If Admin changed the
+        user's primary role and the old JWT role is no longer assigned,
+        fall back to the current primary role.
+        """
+        user = getattr(request, "user", None)
+
+        if not user or not getattr(user, "is_authenticated", False):
+            return ""
+
+        allowed_roles = self.get_user_roles(user)
+
+        token = getattr(request, "auth", None)
+        token_role = ""
+
+        if token is not None:
+            try:
+                token_role = self.normalize_role(
+                    token.get("active_role", "")
+                )
+            except (AttributeError, TypeError, ValueError):
+                token_role = ""
+
+        if token_role and token_role in allowed_roles:
+            return token_role
+
+        primary_role = self.normalize_role(
+            getattr(user, "role", "")
+        )
+
+        if primary_role and primary_role in allowed_roles:
+            return primary_role
+
+        return allowed_roles[0] if allowed_roles else ""
+
+    def require_active_role(self, request, *allowed_roles):
+        role = self.get_request_active_role(request)
+
+        allowed = {
+            self.normalize_role(value)
+            for value in allowed_roles
+            if value
+        }
+
+        if not role:
+            raise PermissionDenied("Authentication is required.")
+
+        if role not in allowed:
+            raise PermissionDenied(
+                "This action is not available for the current active role "
+                f"'{role}'. Switch to one of: "
+                + ", ".join(sorted(allowed))
+                + "."
+            )
+
+        return role
+
+    def get_request_actor_name(self, request):
+        user = getattr(request, "user", None)
+
+        if not user or not getattr(user, "is_authenticated", False):
+            return "User"
+
+        return str(
+            getattr(user, "email", "")
+            or getattr(user, "employee_name", "")
+            or getattr(user, "name", "")
+            or getattr(user, "username", "")
+            or "User"
+        ).strip()[:100]
+
+    def save_replacement_notification(
+        self,
+        purchase_order,
+        *,
+        receiver,
+        notification_status,
+        title,
+        message,
+        requested_by="",
+    ):
+        """Keep one current replacement notification per PO + receiver."""
+        queryset = Notification.objects.filter(
+            category="PO",
+            receiver=str(receiver).upper(),
+            reference_id=str(purchase_order.id),
+        ).order_by("-created_at", "-id")
+
+        notification = queryset.first()
+        requested_by = str(requested_by or "").strip()[:150]
+
+        if notification:
+            notification.title = title
+            notification.message = message
+            notification.status = notification_status
+            notification.is_read = False
+            if requested_by:
+                notification.requested_by = requested_by
+
+            update_fields = [
+                "title",
+                "message",
+                "status",
+                "is_read",
+            ]
+            if requested_by:
+                update_fields.append("requested_by")
+
+            notification.save(update_fields=update_fields)
+            queryset.exclude(pk=notification.pk).delete()
+            return notification
+
+        create_kwargs = {
+            "category": "PO",
+            "receiver": str(receiver).upper(),
+            "reference_id": str(purchase_order.id),
+            "title": title,
+            "message": message,
+            "status": notification_status,
+            "is_read": False,
+        }
+        if requested_by:
+            create_kwargs["requested_by"] = requested_by
+
+        return Notification.objects.create(**create_kwargs)
+
+    @staticmethod
+    def get_replacement_mr_status(replacement_orders):
+        """
+        Return the most important current replacement state for an MR.
+
+        When several components have replacement orders at the same time,
+        an unresolved approval/delivery stage takes precedence over a
+        replacement that has already been received.
+        """
+        statuses = {
+            str(order.status or "").strip().upper()
+            for order in replacement_orders
+        }
+
+        if not statuses:
+            return ""
+
+        if statuses & {
+            "REPLACEMENT_MANAGER_REJECTED",
+            "REPLACEMENT_FINANCE_REJECTED",
+        }:
+            return "REPLACEMENT_APPROVAL_REJECTED"
+
+        if statuses & {
+            "REPLACEMENT_PENDING_MANAGER",
+            "REPLACEMENT_PENDING_FINANCE",
+        }:
+            return "AWAITING_REPLACEMENT_APPROVAL"
+
+        if "REPLACEMENT_APPROVED" in statuses:
+            return "REPLACEMENT_APPROVED"
+
+        if "REPLACEMENT_ORDERED" in statuses:
+            return "AWAITING_REPLACEMENT_DELIVERY"
+
+        if "REPLACEMENT_PARTIALLY_RECEIVED" in statuses:
+            return "REPLACEMENT_PARTIALLY_RECEIVED"
+
+        if statuses == {"REPLACEMENT_RECEIVED"}:
+            return "REPLACEMENT_RECEIVED"
+
+        return ""
+
+    def sync_replacement_mr_status(self, purchase_order):
+        source_mr_number = str(
+            purchase_order.source_mr_number or ""
+        ).strip()
+
+        if not source_mr_number:
+            return None
+
+        material_request = self.get_source_material_request(
+            source_mr_number,
+            lock=True,
+        )
+        if not material_request:
+            return None
+
+        current_status = str(material_request.status or "").upper()
+        if current_status in {"INVENTORY_ISSUED", "MR_COMPLETED"}:
+            return material_request
+
+        replacement_orders = list(
+            PurchaseOrder.objects
+            .select_for_update()
+            .filter(
+                source_mr_number=str(
+                    material_request.material_request_id
+                ).strip(),
+                order_type="REPLACEMENT",
+            )
+            .exclude(
+                status__in=[
+                    "REJECTED",
+                    "FINANCE_REJECTED",
+                ]
+            )
+        )
+
+        desired_status = self.get_replacement_mr_status(
+            replacement_orders
+        )
+
+        if desired_status and desired_status != current_status:
+            material_request.status = desired_status
+            material_request.po_raised = True
+            material_request.save(
+                update_fields=["status", "po_raised"]
+            )
+
+        return material_request
+
+    def get_replacement_po_or_error(self, pk):
+        try:
+            purchase_order = (
+                PurchaseOrder.objects
+                .select_for_update()
+                .prefetch_related("items", "items__component")
+                .get(pk=pk)
+            )
+        except PurchaseOrder.DoesNotExist:
+            return None, Response(
+                {"detail": "Purchase Order not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if str(purchase_order.order_type or "").upper() != "REPLACEMENT":
+            return None, Response(
+                {"detail": "This action is only for QC replacement orders."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return purchase_order, None
+
 
     # ==========================================================
     # ORIGINAL PO SENDER / FINANCE NOTIFICATION HELPERS
@@ -272,6 +574,318 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             **create_kwargs
         )
 
+
+    # ==========================================================
+    # DIRECT PO - MANAGER APPROVAL
+    # Finance -> Manager -> Procurement can order
+    # ==========================================================
+
+    def is_direct_standard_po(self, purchase_order):
+        return (
+            str(
+                getattr(
+                    purchase_order,
+                    "order_type",
+                    "STANDARD",
+                )
+                or "STANDARD"
+            ).strip().upper()
+            != "REPLACEMENT"
+            and not str(
+                getattr(
+                    purchase_order,
+                    "source_mr_number",
+                    "",
+                )
+                or ""
+            ).strip()
+        )
+
+    def save_direct_po_manager_notification(
+        self,
+        purchase_order,
+    ):
+        """
+        After Finance approves a Direct PO, create exactly one
+        Manager notification asking for final Manager approval.
+        """
+        finance_notification = (
+            Notification.objects
+            .filter(
+                category="PO",
+                receiver="FINANCE",
+                reference_id=str(
+                    purchase_order.id
+                ),
+            )
+            .order_by("-created_at", "-id")
+            .first()
+        )
+
+        requested_by = str(
+            getattr(
+                finance_notification,
+                "requested_by",
+                "",
+            )
+            or self.get_authenticated_po_sender_name()
+            or ""
+        ).strip()[:150]
+
+        queryset = (
+            Notification.objects
+            .filter(
+                category="PO",
+                receiver="MANAGER",
+                reference_id=str(
+                    purchase_order.id
+                ),
+            )
+            .order_by("-created_at", "-id")
+        )
+
+        notification = queryset.first()
+
+        title = (
+            "Direct PO Manager Approval - "
+            f"{purchase_order.po_number}"
+        )
+
+        message = (
+            f"Finance approved Direct PO "
+            f"{purchase_order.po_number}. "
+            "Manager approval is required before "
+            "Procurement can mark this PO as Ordered."
+        )
+
+        if notification:
+            notification.title = title
+            notification.message = message
+            notification.status = "PENDING_MANAGER"
+            notification.receiver = "MANAGER"
+            notification.is_read = False
+
+            if requested_by:
+                notification.requested_by = (
+                    requested_by
+                )
+
+            fields = [
+                "title",
+                "message",
+                "status",
+                "receiver",
+                "is_read",
+            ]
+
+            if requested_by:
+                fields.append("requested_by")
+
+            notification.save(
+                update_fields=fields
+            )
+
+            queryset.exclude(
+                pk=notification.pk
+            ).delete()
+
+            return notification
+
+        create_kwargs = {
+            "category": "PO",
+            "receiver": "MANAGER",
+            "reference_id": str(
+                purchase_order.id
+            ),
+            "title": title,
+            "message": message,
+            "status": "PENDING_MANAGER",
+            "is_read": False,
+        }
+
+        if requested_by:
+            create_kwargs[
+                "requested_by"
+            ] = requested_by
+
+        return Notification.objects.create(
+            **create_kwargs
+        )
+
+    def send_direct_po_manager_approval_email(
+        self,
+        purchase_order_id,
+    ):
+        """
+        Email all active Manager users after Finance approves
+        a Direct PO. This email is only for Direct STANDARD POs.
+        """
+        try:
+            purchase_order = (
+                PurchaseOrder.objects
+                .prefetch_related(
+                    "items",
+                    "items__component",
+                )
+                .get(pk=purchase_order_id)
+            )
+        except PurchaseOrder.DoesNotExist:
+            return False
+
+        if not self.is_direct_standard_po(
+            purchase_order
+        ):
+            return False
+
+        manager_users = [
+            user
+            for user in (
+                User.objects
+                .filter(is_active=True)
+                .exclude(email__isnull=True)
+                .exclude(email="")
+                .order_by("id")
+            )
+            if "manager" in self.get_user_roles(
+                user
+            )
+        ]
+
+        if not manager_users:
+            print(
+                "DIRECT PO MANAGER EMAIL SKIPPED:",
+                purchase_order.po_number,
+                "- no active Manager user with email.",
+            )
+            return False
+
+        items = list(
+            purchase_order.items.all()
+        )
+
+        total_quantity = sum(
+            max(
+                int(item.quantity or 0),
+                0,
+            )
+            for item in items
+        )
+
+        component_lines = []
+
+        for item in items:
+            component = getattr(
+                item,
+                "component",
+                None,
+            )
+
+            component_code = str(
+                getattr(
+                    component,
+                    "component_id",
+                    "",
+                )
+                or getattr(
+                    component,
+                    "id",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            component_name = str(
+                getattr(
+                    component,
+                    "name",
+                    "",
+                )
+                or "Component"
+            ).strip()
+
+            component_lines.append(
+                (
+                    f"{component_code} - "
+                    f"{component_name} "
+                    f"(Qty: {int(item.quantity or 0)})"
+                ).strip(" -")
+            )
+
+        components_display = (
+            "; ".join(component_lines)
+            if component_lines
+            else "-"
+        )
+
+        subject = (
+            f"{purchase_order.po_number} "
+            "- Manager Approval Required"
+        )
+
+        message = (
+            f"Finance has approved Direct Purchase Order "
+            f"{purchase_order.po_number}. "
+            "Manager approval is required before Procurement "
+            "can place the order."
+        )
+
+        action_url = (
+            f"{self.get_ipms_base_url()}"
+            "/purchase-orders"
+        )
+
+        sent_any = False
+
+        for manager_user in manager_users:
+            sent = send_ipms_email(
+                recipient_email=
+                    manager_user.email,
+                subject=subject,
+                context={
+                    "recipient_name":
+                        self.get_user_display_name(
+                            manager_user,
+                            "Manager",
+                        ),
+                    "message": message,
+                    "table_headers": [
+                        "PO Number",
+                        "PO Type",
+                        "Vendor",
+                        "Quantity",
+                        "Components",
+                        "Finance Status",
+                        "Manager Status",
+                    ],
+                    "table_values": [
+                        purchase_order.po_number,
+                        "Direct PO",
+                        purchase_order.vendor_name
+                        or "-",
+                        total_quantity,
+                        components_display,
+                        "Finance Approved",
+                        "Pending Manager Approval",
+                    ],
+                    "status":
+                        "Pending Manager Approval",
+                    "instruction": (
+                        "Please open the Purchase Order "
+                        "table in IPMS and approve this "
+                        "Direct PO. Procurement can mark "
+                        "it Ordered only after your approval."
+                    ),
+                    "button_text":
+                        "Review Direct PO",
+                    "action_url":
+                        action_url,
+                },
+            )
+
+            if sent:
+                sent_any = True
+
+        return sent_any
 
     # ==========================================================
     # FINANCE APPROVAL EMAIL
@@ -1856,7 +2470,8 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             .filter(
                 source_mr_number=(
                     material_request.material_request_id
-                )
+                ),
+                order_type="STANDARD",
             )
             .exclude(
                 status__in=[
@@ -1932,18 +2547,15 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             )
 
     @transaction.atomic
+    @transaction.atomic
     def sync_material_request_po_progress(
         self,
         source_mr_number,
     ):
         """
-        Synchronize one Material Request using every active PO linked to
-        that MR.
-
-        The required PO quantity comes from
-        InventoryReservation.procurement_shortage_quantity. Therefore,
-        stock reserved for an earlier MR cannot be reused by a later MR,
-        and Procurement orders only the true remaining shortage.
+        Synchronize the NORMAL procurement shortage without counting QC
+        replacement POs as additional demand. Replacement orders have their
+        own MR workflow statuses and are evaluated separately.
         """
         material_request = self.get_source_material_request(
             source_mr_number,
@@ -1959,12 +2571,10 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             or ""
         ).strip()
 
-        related_purchase_orders = list(
+        all_related_purchase_orders = list(
             PurchaseOrder.objects
             .select_for_update()
-            .filter(
-                source_mr_number=canonical_mr_number
-            )
+            .filter(source_mr_number=canonical_mr_number)
             .exclude(
                 status__in=[
                     "REJECTED",
@@ -1973,35 +2583,40 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             )
         )
 
-        related_purchase_order_ids = [
-            purchase_order.id
-            for purchase_order in related_purchase_orders
+        standard_purchase_orders = [
+            po
+            for po in all_related_purchase_orders
+            if str(getattr(po, "order_type", "STANDARD") or "STANDARD")
+            .strip()
+            .upper()
+            != "REPLACEMENT"
         ]
+
+        replacement_purchase_orders = [
+            po
+            for po in all_related_purchase_orders
+            if str(getattr(po, "order_type", "STANDARD") or "STANDARD")
+            .strip()
+            .upper()
+            == "REPLACEMENT"
+        ]
+
+        standard_po_ids = [po.id for po in standard_purchase_orders]
 
         quantity_rows = (
             PurchaseOrderItem.objects
-            .filter(
-                purchase_order_id__in=(
-                    related_purchase_order_ids
-                )
-            )
+            .filter(purchase_order_id__in=standard_po_ids)
             .values("component_id")
             .annotate(
                 ordered_quantity=Sum("quantity"),
-                delivered_quantity=Sum(
-                    "received_quantity"
-                ),
+                delivered_quantity=Sum("received_quantity"),
             )
         )
 
         component_progress = {
             int(row["component_id"]): {
-                "ordered_quantity": int(
-                    row["ordered_quantity"] or 0
-                ),
-                "delivered_quantity": int(
-                    row["delivered_quantity"] or 0
-                ),
+                "ordered_quantity": int(row["ordered_quantity"] or 0),
+                "delivered_quantity": int(row["delivered_quantity"] or 0),
             }
             for row in quantity_rows
             if row["component_id"] is not None
@@ -2011,7 +2626,6 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             material_request,
             lock=True,
         )
-
         shortage_groups = self.get_reservation_shortages(
             material_request,
             request_items,
@@ -2023,169 +2637,106 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         for component_id, group in shortage_groups.items():
             progress = component_progress.get(
                 component_id,
-                {
-                    "ordered_quantity": 0,
-                    "delivered_quantity": 0,
-                },
+                {"ordered_quantity": 0, "delivered_quantity": 0},
             )
-
-            ordered_quantity = int(
-                progress["ordered_quantity"]
-            )
-            delivered_quantity = int(
-                progress["delivered_quantity"]
-            )
-            shortage_quantity = int(
-                group["shortage_quantity"] or 0
-            )
+            ordered_quantity = int(progress["ordered_quantity"])
+            delivered_quantity = int(progress["delivered_quantity"])
+            shortage_quantity = int(group["shortage_quantity"] or 0)
 
             ordered_distribution = self.distribute_quantity(
                 group["items"],
                 ordered_quantity,
             )
-            delivered_distribution = (
-                self.distribute_quantity(
-                    group["items"],
-                    delivered_quantity,
-                )
+            delivered_distribution = self.distribute_quantity(
+                group["items"],
+                delivered_quantity,
             )
 
             for request_item in group["items"]:
                 changed_fields = []
+                item_ordered = ordered_distribution.get(request_item.pk, 0)
+                item_delivered = delivered_distribution.get(request_item.pk, 0)
 
-                item_ordered = ordered_distribution.get(
-                    request_item.pk,
-                    0,
-                )
-                item_delivered = (
-                    delivered_distribution.get(
-                        request_item.pk,
-                        0,
-                    )
-                )
+                if int(request_item.po_raised_quantity or 0) != item_ordered:
+                    request_item.po_raised_quantity = item_ordered
+                    changed_fields.append("po_raised_quantity")
 
-                if (
-                    int(
-                        request_item.po_raised_quantity
-                        or 0
-                    )
-                    != item_ordered
-                ):
-                    request_item.po_raised_quantity = (
-                        item_ordered
-                    )
-                    changed_fields.append(
-                        "po_raised_quantity"
-                    )
-
-                if (
-                    int(
-                        request_item.delivered_quantity
-                        or 0
-                    )
-                    != item_delivered
-                ):
-                    request_item.delivered_quantity = (
-                        item_delivered
-                    )
-                    changed_fields.append(
-                        "delivered_quantity"
-                    )
+                if int(request_item.delivered_quantity or 0) != item_delivered:
+                    request_item.delivered_quantity = item_delivered
+                    changed_fields.append("delivered_quantity")
 
                 if changed_fields:
-                    request_item.save(
-                        update_fields=changed_fields
-                    )
+                    request_item.save(update_fields=changed_fields)
 
             if shortage_quantity > 0:
                 shortage_components.append(
                     {
                         "component_id": component_id,
-                        "shortage_quantity": (
-                            shortage_quantity
-                        ),
-                        "ordered_quantity": (
-                            ordered_quantity
-                        ),
-                        "delivered_quantity": (
-                            delivered_quantity
-                        ),
+                        "shortage_quantity": shortage_quantity,
+                        "ordered_quantity": ordered_quantity,
+                        "delivered_quantity": delivered_quantity,
                     }
                 )
+
+        current_status = str(material_request.status or "").strip().upper()
+        if current_status in {
+            "QC_CHECKED",
+            "PROJECT_INVENTORY_READY",
+            "INVENTORY_ISSUED",
+            "MR_COMPLETED",
+        }:
+            return material_request
+
+        # Replacement stage takes precedence over the original PO delivery
+        # stage. This is what keeps an MR open while replacement material is
+        # awaiting approval, ordering, delivery or QC.
+        replacement_status = self.get_replacement_mr_status(
+            replacement_purchase_orders
+        )
+        if replacement_status:
+            if replacement_status != current_status:
+                material_request.status = replacement_status
+                material_request.po_raised = True
+                material_request.save(
+                    update_fields=["status", "po_raised"]
+                )
+            return material_request
 
         # An MR with no Procurement shortage belongs only to Inventory.
         if not shortage_components:
             return material_request
 
         all_shortages_have_po = all(
-            row["ordered_quantity"]
-            >= row["shortage_quantity"]
+            row["ordered_quantity"] >= row["shortage_quantity"]
             for row in shortage_components
         )
-
-        active_po_exists = bool(
-            related_purchase_orders
-        )
-
-        all_active_pos_delivered = (
-            active_po_exists
+        standard_po_exists = bool(standard_purchase_orders)
+        all_standard_pos_delivered = (
+            standard_po_exists
             and all(
-                str(
-                    purchase_order.status or ""
-                ).strip().upper()
-                == "DELIVERED"
-                for purchase_order
-                in related_purchase_orders
+                str(po.status or "").strip().upper() == "DELIVERED"
+                for po in standard_purchase_orders
             )
         )
-
         all_shortages_delivered = (
             all_shortages_have_po
             and all(
-                row["delivered_quantity"]
-                >= row["shortage_quantity"]
+                row["delivered_quantity"] >= row["shortage_quantity"]
                 for row in shortage_components
             )
         )
-
-        all_delivered = (
-            all_active_pos_delivered
-            and all_shortages_delivered
-        )
-
-        # Professional partial-delivery workflow:
-        # the MR must reflect real receipt progress immediately.
+        all_delivered = all_standard_pos_delivered and all_shortages_delivered
         any_shortage_delivered = any(
             int(row["delivered_quantity"] or 0) > 0
             for row in shortage_components
         )
-
-        current_status = str(
-            material_request.status or ""
-        ).strip().upper()
-
-        later_workflow_statuses = {
-            "QC_CHECKED",
-            "PROJECT_INVENTORY_READY",
-            "INVENTORY_ISSUED",
-            "MR_COMPLETED",
-        }
-
-        if current_status in later_workflow_statuses:
-            return material_request
 
         reference_id = str(material_request.id)
 
         if all_delivered:
             material_request.status = "PO_DELIVERED"
             material_request.po_raised = True
-            material_request.save(
-                update_fields=[
-                    "status",
-                    "po_raised",
-                ]
-            )
-
+            material_request.save(update_fields=["status", "po_raised"])
             Notification.objects.filter(
                 category="MR",
                 receiver="PROCUREMENT",
@@ -2194,24 +2745,14 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 status="PO_DELIVERED",
                 is_read=True,
                 message=(
-                    "All reserved Procurement shortages "
-                    "were delivered for "
+                    "All reserved Procurement shortages were delivered for "
                     f"{material_request.material_request_id}."
                 ),
             )
-
         elif any_shortage_delivered:
-            material_request.status = (
-                "PARTIALLY_DELIVERED"
-            )
+            material_request.status = "PARTIALLY_DELIVERED"
             material_request.po_raised = True
-            material_request.save(
-                update_fields=[
-                    "status",
-                    "po_raised",
-                ]
-            )
-
+            material_request.save(update_fields=["status", "po_raised"])
             Notification.objects.filter(
                 category="MR",
                 receiver="PROCUREMENT",
@@ -2220,24 +2761,15 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 status="PARTIALLY_DELIVERED",
                 is_read=False,
                 message=(
-                    "Part of the Procurement shortage has "
-                    "been delivered for "
-                    f"{material_request.material_request_id}. "
-                    "Remaining components or quantities are "
-                    "still awaiting delivery."
+                    "Part of the Procurement shortage has been delivered for "
+                    f"{material_request.material_request_id}. Remaining "
+                    "components or quantities are still awaiting delivery."
                 ),
             )
-
         elif all_shortages_have_po:
             material_request.status = "PO_RAISED"
             material_request.po_raised = True
-            material_request.save(
-                update_fields=[
-                    "status",
-                    "po_raised",
-                ]
-            )
-
+            material_request.save(update_fields=["status", "po_raised"])
             Notification.objects.filter(
                 category="MR",
                 receiver="PROCUREMENT",
@@ -2246,24 +2778,14 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 status="PO_RAISED",
                 is_read=True,
                 message=(
-                    "Purchase Orders cover every reserved "
-                    "shortage for "
+                    "Purchase Orders cover every reserved shortage for "
                     f"{material_request.material_request_id}."
                 ),
             )
-
         else:
-            material_request.status = (
-                "PROCUREMENT_PENDING"
-            )
+            material_request.status = "PROCUREMENT_PENDING"
             material_request.po_raised = False
-            material_request.save(
-                update_fields=[
-                    "status",
-                    "po_raised",
-                ]
-            )
-
+            material_request.save(update_fields=["status", "po_raised"])
             Notification.objects.filter(
                 category="MR",
                 receiver="PROCUREMENT",
@@ -2272,8 +2794,8 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 status="PROCUREMENT_PENDING",
                 is_read=False,
                 message=(
-                    "Additional Purchase Orders are still "
-                    "required for the reserved shortage of "
+                    "Additional Purchase Orders are still required for the "
+                    "reserved shortage of "
                     f"{material_request.material_request_id}."
                 ),
             )
@@ -2362,7 +2884,34 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             or ""
         ).upper()
 
+        old_status = str(
+            serializer.instance.status
+            or ""
+        ).upper()
+
         purchase_order = serializer.save()
+
+        new_status = str(
+            purchase_order.status
+            or ""
+        ).upper()
+
+        if (
+            self.is_direct_standard_po(
+                purchase_order
+            )
+            and new_status == "ORDERED"
+            and old_status != "APPROVED"
+        ):
+            raise ValidationError(
+                {
+                    "status": (
+                        "Manager approval is required "
+                        "before a Direct PO can be "
+                        "marked Ordered."
+                    )
+                }
+            )
 
         new_approval_status = str(
             purchase_order.approval_status
@@ -2449,16 +2998,33 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                     update_fields=update_fields
                 )
 
-            # Return Finance approval result to the Procurement
-            # user who originally sent this PO for approval.
-            transaction.on_commit(
-                lambda po_id=purchase_order.id: (
-                    self.send_po_requester_result_email(
-                        po_id,
-                        outcome="approved",
+            # Finance approval is NOT the final approval for a Direct PO.
+            # Direct PO: notify/email Manager for final approval.
+            # MR-linked standard PO: preserve the existing Finance-only flow.
+            if self.is_direct_standard_po(
+                purchase_order
+            ):
+                self.save_direct_po_manager_notification(
+                    purchase_order
+                )
+
+                transaction.on_commit(
+                    lambda po_id=purchase_order.id: (
+                        self.send_direct_po_manager_approval_email(
+                            po_id
+                        )
                     )
                 )
-            )
+            else:
+                # Existing MR-linked PO behavior remains unchanged.
+                transaction.on_commit(
+                    lambda po_id=purchase_order.id: (
+                        self.send_po_requester_result_email(
+                            po_id,
+                            outcome="approved",
+                        )
+                    )
+                )
 
         # ---------------------------------------------------------
         # Finance rejected
@@ -2540,6 +3106,629 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 source_mr_number
             )
 
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="direct-manager-approve",
+    )
+    @transaction.atomic
+    def direct_manager_approve(
+        self,
+        request,
+        pk=None,
+    ):
+        """
+        Final Manager approval for a Direct STANDARD PO.
+
+        Finance must approve first. No Manager approval is required
+        for MR-linked standard POs or QC Replacement POs.
+        """
+        self.require_active_role(
+            request,
+            "manager",
+            "admin",
+        )
+
+        try:
+            purchase_order = (
+                PurchaseOrder.objects
+                .select_for_update()
+                .prefetch_related(
+                    "items",
+                    "items__component",
+                )
+                .get(pk=pk)
+            )
+        except PurchaseOrder.DoesNotExist:
+            return Response(
+                {
+                    "detail":
+                        "Purchase Order not found."
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if not self.is_direct_standard_po(
+            purchase_order
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "Manager approval through this "
+                        "action is only for Direct POs."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if (
+            str(
+                purchase_order.status
+                or ""
+            ).upper()
+            != "FINANCE_APPROVED"
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "Finance must approve this Direct "
+                        "PO before Manager approval."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        actor = self.get_request_actor_name(
+            request
+        )
+
+        purchase_order.status = "APPROVED"
+        purchase_order.approved_by = actor
+        purchase_order.approved_at = timezone.now()
+        purchase_order.rejection_reason = None
+        purchase_order.rejected_by = None
+
+        purchase_order.save(
+            update_fields=[
+                "status",
+                "approved_by",
+                "approved_at",
+                "rejection_reason",
+                "rejected_by",
+            ]
+        )
+
+        Notification.objects.filter(
+            category="PO",
+            receiver="MANAGER",
+            reference_id=str(
+                purchase_order.id
+            ),
+        ).update(
+            status="APPROVED",
+            is_read=True,
+        )
+
+        return Response(
+            self.get_serializer(
+                purchase_order
+            ).data
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="direct-manager-reject",
+    )
+    @transaction.atomic
+    def direct_manager_reject(
+        self,
+        request,
+        pk=None,
+    ):
+        """
+        Manager rejects a Direct STANDARD PO after Finance approval.
+
+        This action is ONLY for Direct POs.
+        QC Replacement POs remain Procurement-approved in the PO table.
+        """
+        self.require_active_role(
+            request,
+            "manager",
+            "admin",
+        )
+
+        reason = str(
+            request.data.get("reason")
+            or request.data.get("remarks")
+            or request.data.get("rejection_reason")
+            or ""
+        ).strip()
+
+        if not reason:
+            return Response(
+                {
+                    "detail":
+                        "Manager rejection reason is required."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            purchase_order = (
+                PurchaseOrder.objects
+                .select_for_update()
+                .prefetch_related(
+                    "items",
+                    "items__component",
+                )
+                .get(pk=pk)
+            )
+        except PurchaseOrder.DoesNotExist:
+            return Response(
+                {
+                    "detail":
+                        "Purchase Order not found."
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if not self.is_direct_standard_po(
+            purchase_order
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "Manager rejection through this "
+                        "action is only for Direct POs."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if (
+            str(
+                purchase_order.status
+                or ""
+            ).upper()
+            != "FINANCE_APPROVED"
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "This Direct PO is not pending "
+                        "Manager approval."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        actor = self.get_request_actor_name(
+            request
+        )
+
+        purchase_order.status = "REJECTED"
+        purchase_order.approval_status = "REJECTED"
+        purchase_order.rejection_reason = reason
+        purchase_order.rejected_by = actor
+
+        purchase_order.save(
+            update_fields=[
+                "status",
+                "approval_status",
+                "rejection_reason",
+                "rejected_by",
+            ]
+        )
+
+        Notification.objects.filter(
+            category="PO",
+            receiver="MANAGER",
+            reference_id=str(
+                purchase_order.id
+            ),
+        ).update(
+            status="REJECTED",
+            is_read=True,
+        )
+
+        return Response(
+            self.get_serializer(
+                purchase_order
+            ).data
+        )
+
+
+    # ==========================================================
+    # QC REPLACEMENT APPROVAL ACTIONS
+    #
+    # Replacement flow:
+    # Procurement approval only -> Replacement Approved -> Ordered.
+    #
+    # Historical Manager/Finance replacement endpoints below remain
+    # available only for old database rows.
+    # ==========================================================
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="replacement-procurement-approve",
+    )
+    @transaction.atomic
+    def replacement_procurement_approve(self, request, pk=None):
+        """
+        Procurement approves a newly raised QC Replacement PO.
+
+        No Manager/Finance email or notification is created here.
+        """
+        self.require_active_role(
+            request,
+            "procurement",
+            "admin",
+        )
+
+        purchase_order, error_response = (
+            self.get_replacement_po_or_error(pk)
+        )
+
+        if error_response:
+            return error_response
+
+        if (
+            str(purchase_order.status or "").upper()
+            != "REPLACEMENT_PENDING_MANAGER"
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "This Replacement PO is not "
+                        "pending Procurement approval."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        actor = self.get_request_actor_name(request)
+
+        purchase_order.status = "REPLACEMENT_APPROVED"
+        purchase_order.approval_status = "NOT_REQUESTED"
+        purchase_order.approved_by = actor
+        purchase_order.approved_at = timezone.now()
+        purchase_order.rejection_reason = None
+        purchase_order.rejected_by = None
+
+        purchase_order.save(
+            update_fields=[
+                "status",
+                "approval_status",
+                "approved_by",
+                "approved_at",
+                "rejection_reason",
+                "rejected_by",
+            ]
+        )
+
+        # Defensive cleanup. The new replacement flow must not leave
+        # Manager/Finance approval notifications behind.
+        Notification.objects.filter(
+            category="PO",
+            receiver__in=["MANAGER", "FINANCE"],
+            reference_id=str(purchase_order.id),
+        ).delete()
+
+        self.sync_replacement_mr_status(
+            purchase_order
+        )
+
+        return Response(
+            self.get_serializer(
+                purchase_order
+            ).data
+        )
+
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="replacement-manager-approve",
+    )
+    @transaction.atomic
+    def replacement_manager_approve(self, request, pk=None):
+        self.require_active_role(request, "manager", "admin")
+        purchase_order, error_response = self.get_replacement_po_or_error(pk)
+        if error_response:
+            return error_response
+
+        if str(purchase_order.status or "").upper() != "REPLACEMENT_PENDING_MANAGER":
+            return Response(
+                {"detail": "This replacement is not pending Manager approval."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        actor = self.get_request_actor_name(request)
+        original_sender = (
+            Notification.objects
+            .filter(
+                category="PO",
+                receiver="MANAGER",
+                reference_id=str(purchase_order.id),
+            )
+            .exclude(requested_by__isnull=True)
+            .exclude(requested_by="")
+            .values_list("requested_by", flat=True)
+            .first()
+            or ""
+        )
+
+        purchase_order.status = "REPLACEMENT_PENDING_FINANCE"
+        purchase_order.approval_status = "REPLACEMENT_PENDING_FINANCE"
+        purchase_order.rejection_reason = None
+        purchase_order.rejected_by = None
+        purchase_order.save(
+            update_fields=[
+                "status",
+                "approval_status",
+                "rejection_reason",
+                "rejected_by",
+            ]
+        )
+
+        PurchaseOrderApproval.objects.create(
+            purchase_order=purchase_order,
+            action="REPLACEMENT_MANAGER_APPROVED",
+            requested_by=str(original_sender or actor)[:100],
+            approved_by=actor,
+        )
+
+        Notification.objects.filter(
+            category="PO",
+            receiver="MANAGER",
+            reference_id=str(purchase_order.id),
+        ).update(
+            status="REPLACEMENT_MANAGER_APPROVED",
+            is_read=True,
+        )
+
+        self.save_replacement_notification(
+            purchase_order,
+            receiver="FINANCE",
+            notification_status="REPLACEMENT_PENDING_FINANCE",
+            title=f"Replacement PO Finance Approval - {purchase_order.po_number}",
+            message=(
+                f"Manager approved QC replacement PO {purchase_order.po_number}. "
+                "Finance approval is now required."
+            ),
+            requested_by=original_sender or actor,
+        )
+
+        self.sync_replacement_mr_status(purchase_order)
+        return Response(self.get_serializer(purchase_order).data)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="replacement-manager-reject",
+    )
+    @transaction.atomic
+    def replacement_manager_reject(self, request, pk=None):
+        self.require_active_role(request, "manager", "admin")
+        purchase_order, error_response = self.get_replacement_po_or_error(pk)
+        if error_response:
+            return error_response
+
+        if str(purchase_order.status or "").upper() != "REPLACEMENT_PENDING_MANAGER":
+            return Response(
+                {"detail": "This replacement is not pending Manager approval."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        reason = str(
+            request.data.get("reason")
+            or request.data.get("remarks")
+            or ""
+        ).strip()
+        if not reason:
+            return Response(
+                {"detail": "Rejection reason is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        actor = self.get_request_actor_name(request)
+        purchase_order.status = "REPLACEMENT_MANAGER_REJECTED"
+        purchase_order.approval_status = "REPLACEMENT_MANAGER_REJECTED"
+        purchase_order.rejection_reason = reason
+        purchase_order.rejected_by = actor
+        purchase_order.save(
+            update_fields=[
+                "status",
+                "approval_status",
+                "rejection_reason",
+                "rejected_by",
+            ]
+        )
+
+        PurchaseOrderApproval.objects.create(
+            purchase_order=purchase_order,
+            action="REPLACEMENT_MANAGER_REJECTED",
+            requested_by=actor,
+            approved_by=actor,
+            finance_remarks=reason,
+        )
+
+        Notification.objects.filter(
+            category="PO",
+            receiver="MANAGER",
+            reference_id=str(purchase_order.id),
+        ).update(
+            status="REPLACEMENT_MANAGER_REJECTED",
+            is_read=True,
+        )
+
+        self.sync_replacement_mr_status(purchase_order)
+        return Response(self.get_serializer(purchase_order).data)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="replacement-finance-approve",
+    )
+    @transaction.atomic
+    def replacement_finance_approve(self, request, pk=None):
+        self.require_active_role(request, "finance", "admin")
+        purchase_order, error_response = self.get_replacement_po_or_error(pk)
+        if error_response:
+            return error_response
+
+        if str(purchase_order.status or "").upper() != "REPLACEMENT_PENDING_FINANCE":
+            return Response(
+                {"detail": "This replacement is not pending Finance approval."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        actor = self.get_request_actor_name(request)
+        remarks = str(
+            request.data.get("remarks")
+            or request.data.get("finance_remarks")
+            or ""
+        ).strip()
+
+        purchase_order.status = "REPLACEMENT_APPROVED"
+        purchase_order.approval_status = "REPLACEMENT_FINANCE_APPROVED"
+        purchase_order.finance_remarks = remarks or purchase_order.finance_remarks
+        purchase_order.approved_by = actor
+        purchase_order.approved_at = timezone.now()
+        purchase_order.rejection_reason = None
+        purchase_order.rejected_by = None
+        purchase_order.save(
+            update_fields=[
+                "status",
+                "approval_status",
+                "finance_remarks",
+                "approved_by",
+                "approved_at",
+                "rejection_reason",
+                "rejected_by",
+            ]
+        )
+
+        PurchaseOrderApproval.objects.create(
+            purchase_order=purchase_order,
+            action="REPLACEMENT_FINANCE_APPROVED",
+            requested_by=actor,
+            approved_by=actor,
+            finance_remarks=remarks or None,
+        )
+
+        Notification.objects.filter(
+            category="PO",
+            receiver="FINANCE",
+            reference_id=str(purchase_order.id),
+        ).update(
+            status="REPLACEMENT_FINANCE_APPROVED",
+            is_read=True,
+        )
+
+        self.sync_replacement_mr_status(purchase_order)
+        return Response(self.get_serializer(purchase_order).data)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="replacement-finance-reject",
+    )
+    @transaction.atomic
+    def replacement_finance_reject(self, request, pk=None):
+        self.require_active_role(request, "finance", "admin")
+        purchase_order, error_response = self.get_replacement_po_or_error(pk)
+        if error_response:
+            return error_response
+
+        if str(purchase_order.status or "").upper() != "REPLACEMENT_PENDING_FINANCE":
+            return Response(
+                {"detail": "This replacement is not pending Finance approval."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        reason = str(
+            request.data.get("reason")
+            or request.data.get("remarks")
+            or ""
+        ).strip()
+        if not reason:
+            return Response(
+                {"detail": "Rejection reason is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        actor = self.get_request_actor_name(request)
+        purchase_order.status = "REPLACEMENT_FINANCE_REJECTED"
+        purchase_order.approval_status = "REPLACEMENT_FINANCE_REJECTED"
+        purchase_order.finance_remarks = reason
+        purchase_order.rejection_reason = reason
+        purchase_order.rejected_by = actor
+        purchase_order.save(
+            update_fields=[
+                "status",
+                "approval_status",
+                "finance_remarks",
+                "rejection_reason",
+                "rejected_by",
+            ]
+        )
+
+        PurchaseOrderApproval.objects.create(
+            purchase_order=purchase_order,
+            action="REPLACEMENT_FINANCE_REJECTED",
+            requested_by=actor,
+            approved_by=actor,
+            finance_remarks=reason,
+        )
+
+        Notification.objects.filter(
+            category="PO",
+            receiver="FINANCE",
+            reference_id=str(purchase_order.id),
+        ).update(
+            status="REPLACEMENT_FINANCE_REJECTED",
+            is_read=True,
+        )
+
+        self.sync_replacement_mr_status(purchase_order)
+        return Response(self.get_serializer(purchase_order).data)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="replacement-mark-ordered",
+    )
+    @transaction.atomic
+    def replacement_mark_ordered(self, request, pk=None):
+        self.require_active_role(request, "procurement", "admin")
+        purchase_order, error_response = self.get_replacement_po_or_error(pk)
+        if error_response:
+            return error_response
+
+        if str(purchase_order.status or "").upper() != "REPLACEMENT_APPROVED":
+            return Response(
+                {"detail": "The Replacement PO must be approved before it can be ordered."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        actor = self.get_request_actor_name(request)
+        purchase_order.status = "REPLACEMENT_ORDERED"
+        purchase_order.save(update_fields=["status"])
+
+        PurchaseOrderApproval.objects.create(
+            purchase_order=purchase_order,
+            action="REPLACEMENT_ORDERED",
+            requested_by=actor,
+            approved_by=actor,
+        )
+
+        self.sync_replacement_mr_status(purchase_order)
+        return Response(self.get_serializer(purchase_order).data)
+
+
     # ==========================================================
     # PURCHASE ORDER RECEIPT
     # ==========================================================
@@ -2597,15 +3786,19 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         allowed_statuses = {
             "ORDERED",
             "PARTIALLY_DELIVERED",
+            "REPLACEMENT_ORDERED",
+            "REPLACEMENT_PARTIALLY_RECEIVED",
         }
 
         if current_status not in allowed_statuses:
             return Response(
                 {
                     "detail": (
-                        "Only ORDERED or "
-                        "PARTIALLY_DELIVERED Purchase "
-                        "Orders can receive material."
+                        "Only an ordered Purchase Order can receive "
+                        "material. Standard POs must be ORDERED or "
+                        "PARTIALLY_DELIVERED; replacement POs must be "
+                        "REPLACEMENT_ORDERED or "
+                        "REPLACEMENT_PARTIALLY_RECEIVED."
                     )
                 },
                 status=
@@ -2798,12 +3991,30 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             ).exists()
         )
 
-        if has_remaining_quantity:
+        is_replacement = (
+            str(
+                getattr(
+                    purchase_order,
+                    "order_type",
+                    "STANDARD",
+                )
+                or "STANDARD"
+            ).strip().upper()
+            == "REPLACEMENT"
+        )
+
+        if is_replacement:
             purchase_order.status = (
-                "PARTIALLY_DELIVERED"
+                "REPLACEMENT_PARTIALLY_RECEIVED"
+                if has_remaining_quantity
+                else "REPLACEMENT_RECEIVED"
             )
         else:
-            purchase_order.status = "DELIVERED"
+            purchase_order.status = (
+                "PARTIALLY_DELIVERED"
+                if has_remaining_quantity
+                else "DELIVERED"
+            )
 
         purchase_order.save(
             update_fields=["status"]
