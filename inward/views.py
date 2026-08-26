@@ -1,4 +1,5 @@
 from collections import defaultdict
+from decimal import Decimal, ROUND_HALF_UP
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
@@ -314,18 +315,18 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
         inward_entry_id,
         replacement_po_id,
         source_po_id,
-        material_request_id,
         replacement_quantity,
+        material_request_id=None,
     ):
         """
         Send an email ONLY to Procurement when a QC replacement PO is raised.
 
-        This helper does not create any in-app notification and does not send
-        anything to Manager or Finance.
+        Works for:
+        - MR-linked Purchase Orders
+        - Direct Purchase Orders
+
+        No Manager/Finance notification or email is created here.
         """
-        # Replacement approval belongs to Procurement only.
-        # Delete any Manager/Finance PO notification that may have been
-        # created by older code or a stale deployment for this replacement.
         Notification.objects.filter(
             category="PO",
             reference_id=str(replacement_po_id),
@@ -350,14 +351,9 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             source_po = PurchaseOrder.objects.get(
                 pk=source_po_id
             )
-
-            material_request = MaterialRequest.objects.get(
-                pk=material_request_id
-            )
         except (
             InwardEntry.DoesNotExist,
             PurchaseOrder.DoesNotExist,
-            MaterialRequest.DoesNotExist,
         ) as error:
             print(
                 "QC REPLACEMENT PROCUREMENT EMAIL SKIPPED:",
@@ -365,13 +361,15 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             )
             return False
 
-        # IMPORTANT:
-        # Replacement email must go ONLY to employees whose PRIMARY
-        # login role is Procurement.
-        #
-        # Do NOT use get_user_roles() here because that also includes
-        # additional_roles. A Manager who has Procurement as an
-        # additional role would otherwise receive this email.
+        material_request = None
+
+        if material_request_id:
+            material_request = (
+                MaterialRequest.objects
+                .filter(pk=material_request_id)
+                .first()
+            )
+
         procurement_users = (
             User.objects
             .filter(
@@ -387,7 +385,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             print(
                 "QC REPLACEMENT PROCUREMENT EMAIL SKIPPED:",
                 replacement_po.po_number,
-                "- no active Procurement user with email.",
+                "- no active Procurement primary-role user with email.",
             )
             return False
 
@@ -414,23 +412,42 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             else component_name
         )
 
-        mr_number = str(
-            material_request.material_request_id
-            or replacement_po.source_mr_number
-            or "-"
-        ).strip()
+        mr_number = ""
+
+        if material_request:
+            mr_number = str(
+                material_request.material_request_id
+                or replacement_po.source_mr_number
+                or ""
+            ).strip()
+
+        is_mr_replacement = bool(mr_number)
+
+        source_label = (
+            mr_number
+            if is_mr_replacement
+            else f"Direct PO {source_po.po_number}"
+        )
 
         subject = (
             f"Replacement PO Approval Required - "
             f"{replacement_po.po_number}"
         )
 
-        message = (
-            f"Replacement PO {replacement_po.po_number} has been "
-            f"raised for the same Material Request {mr_number} because "
-            f"the previously received component failed QC. "
-            f"Please approve this Replacement PO in the Purchase Order table."
-        )
+        if is_mr_replacement:
+            message = (
+                f"Replacement PO {replacement_po.po_number} has been "
+                f"raised for Material Request {mr_number} because the "
+                f"previously received component failed QC. "
+                f"Please approve this Replacement PO in the Purchase Order table."
+            )
+        else:
+            message = (
+                f"Replacement PO {replacement_po.po_number} has been "
+                f"raised against Direct PO {source_po.po_number} because the "
+                f"previously received component failed QC. "
+                f"Please approve this Replacement PO in the Purchase Order table."
+            )
 
         sent_any = False
 
@@ -448,7 +465,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                     "message": message,
                     "table_headers": [
                         "Replacement PO",
-                        "MR ID",
+                        "Source",
                         "Original PO",
                         "Component",
                         "Replacement Qty",
@@ -457,7 +474,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                     ],
                     "table_values": [
                         replacement_po.po_number,
-                        mr_number,
+                        source_label,
                         source_po.po_number,
                         component_display,
                         int(replacement_quantity or 0),
@@ -487,8 +504,8 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             [user.email for user in procurement_users],
             "| PO =",
             replacement_po.po_number,
-            "| MR =",
-            mr_number,
+            "| SOURCE =",
+            source_label,
         )
 
         return sent_any
@@ -2083,17 +2100,23 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        source_mr_number = str(source_po.source_mr_number or "").strip()
-        if not source_mr_number:
-            return Response(
-                {
-                    "detail": (
-                        "Replacement is available only for MR-linked Purchase "
-                        "Orders. Direct PO QC failures must use Return / Refund."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        source_mr_number = str(
+            source_po.source_mr_number
+            or ""
+        ).strip()
+
+        is_direct_po = (
+            str(
+                getattr(
+                    source_po,
+                    "order_type",
+                    "STANDARD",
+                )
+                or "STANDARD"
+            ).strip().upper()
+            != "REPLACEMENT"
+            and not source_mr_number
+        )
 
         # Idempotency: one failed Inward row cannot create duplicate POs.
         if inward_entry.replacement_purchase_order_id:
@@ -2112,15 +2135,35 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_200_OK,
             )
 
-        material_request = (
-            MaterialRequest.objects
-            .select_for_update()
-            .filter(material_request_id=source_mr_number)
-            .first()
-        )
-        if not material_request:
+        material_request = None
+
+        if source_mr_number:
+            material_request = (
+                MaterialRequest.objects
+                .select_for_update()
+                .filter(
+                    material_request_id=
+                        source_mr_number
+                )
+                .first()
+            )
+
+            if not material_request:
+                return Response(
+                    {
+                        "detail":
+                            "The linked Material Request could not be found."
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        elif not is_direct_po:
             return Response(
-                {"detail": "The linked Material Request could not be found."},
+                {
+                    "detail": (
+                        "Replacement can be raised only from an "
+                        "MR-linked PO or a Direct standard PO."
+                    )
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -2160,82 +2203,127 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             else source_po
         )
 
-        # Keep the replacement quantity inside the still-unfulfilled
-        # procurement requirement for this MR component.
-        request_items = self.get_material_request_items(
-            material_request,
-            lock=True,
-        )
-        component_items = [
-            item
-            for item in request_items
-            if str(getattr(item, "component_id", "")) == str(component.id)
-        ]
-        required_quantity = sum(
-            max(int(item.quantity or 0), 0)
-            for item in component_items
-        )
-        reservation = (
-            InventoryReservation.objects
-            .select_for_update()
-            .filter(
-                material_request=material_request,
-                component_id=component.id,
+        if material_request:
+            # MR-linked PO:
+            # replacement quantity must stay within the still-unfulfilled
+            # procurement requirement for this MR component.
+            request_items = self.get_material_request_items(
+                material_request,
+                lock=True,
             )
-            .first()
-        )
-        reserved_store_quantity = min(
-            required_quantity,
-            int(
-                reservation.reserved_store_quantity
-                if reservation
-                else 0
-            ),
-        )
-        procurement_requirement = max(
-            required_quantity - reserved_store_quantity,
-            0,
-        )
-
-        mr_po_ids = list(
-            PurchaseOrder.objects
-            .filter(source_mr_number=source_mr_number)
-            .values_list("id", flat=True)
-        )
-        component_inwards = (
-            InwardEntry.objects
-            .select_for_update()
-            .filter(
-                purchase_order_id__in=mr_po_ids,
-                component_id=component.id,
-            )
-            .filter(
-                Q(removed_from_inventory=False)
-                | Q(removed_from_inventory__isnull=True)
-            )
-        )
-        passed_quantity = sum(
-            self.get_qc_rows_quantity(row.qc_passed_rows)
-            for row in component_inwards
-        )
-        outstanding_requirement = max(
-            procurement_requirement - passed_quantity,
-            0,
-        )
-        replacement_quantity = min(
-            failed_quantity,
-            outstanding_requirement,
-        )
-
-        if replacement_quantity <= 0:
-            return Response(
-                {
-                    "detail": (
-                        "The MR procurement requirement is already satisfied by "
-                        "QC-passed quantity; no replacement is required."
+            component_items = [
+                item
+                for item in request_items
+                if str(
+                    getattr(
+                        item,
+                        "component_id",
+                        "",
                     )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
+                )
+                == str(component.id)
+            ]
+
+            required_quantity = sum(
+                max(int(item.quantity or 0), 0)
+                for item in component_items
+            )
+
+            reservation = (
+                InventoryReservation.objects
+                .select_for_update()
+                .filter(
+                    material_request=
+                        material_request,
+                    component_id=
+                        component.id,
+                )
+                .first()
+            )
+
+            reserved_store_quantity = min(
+                required_quantity,
+                int(
+                    reservation.reserved_store_quantity
+                    if reservation
+                    else 0
+                ),
+            )
+
+            procurement_requirement = max(
+                required_quantity
+                - reserved_store_quantity,
+                0,
+            )
+
+            mr_po_ids = list(
+                PurchaseOrder.objects
+                .filter(
+                    source_mr_number=
+                        source_mr_number
+                )
+                .values_list(
+                    "id",
+                    flat=True,
+                )
+            )
+
+            component_inwards = (
+                InwardEntry.objects
+                .select_for_update()
+                .filter(
+                    purchase_order_id__in=
+                        mr_po_ids,
+                    component_id=
+                        component.id,
+                )
+                .filter(
+                    Q(
+                        removed_from_inventory=
+                            False
+                    )
+                    | Q(
+                        removed_from_inventory__isnull=
+                            True
+                    )
+                )
+            )
+
+            passed_quantity = sum(
+                self.get_qc_rows_quantity(
+                    row.qc_passed_rows
+                )
+                for row in component_inwards
+            )
+
+            outstanding_requirement = max(
+                procurement_requirement
+                - passed_quantity,
+                0,
+            )
+
+            replacement_quantity = min(
+                failed_quantity,
+                outstanding_requirement,
+            )
+
+            if replacement_quantity <= 0:
+                return Response(
+                    {
+                        "detail": (
+                            "The MR procurement requirement is already "
+                            "satisfied by QC-passed quantity; "
+                            "no replacement is required."
+                        )
+                    },
+                    status=
+                        status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            # Direct PO:
+            # every failed QC unit can be replaced.
+            replacement_quantity = (
+                failed_quantity
             )
 
         last_round = (
@@ -2276,7 +2364,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             finance_remarks=None,
             status="REPLACEMENT_PENDING_MANAGER",
             approval_status="REPLACEMENT_PENDING_MANAGER",
-            source_mr_number=source_mr_number,
+            source_mr_number=(source_mr_number or None),
             order_type="REPLACEMENT",
             replacement_for=root_po,
             replacement_round=replacement_round,
@@ -2317,14 +2405,26 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             ]
         )
 
-        if str(material_request.status or "").upper() not in {
-            "INVENTORY_ISSUED",
-            "MR_COMPLETED",
-        }:
-            material_request.status = "AWAITING_REPLACEMENT_APPROVAL"
+        if (
+            material_request
+            and str(
+                material_request.status
+                or ""
+            ).upper()
+            not in {
+                "INVENTORY_ISSUED",
+                "MR_COMPLETED",
+            }
+        ):
+            material_request.status = (
+                "AWAITING_REPLACEMENT_APPROVAL"
+            )
             material_request.po_raised = True
             material_request.save(
-                update_fields=["status", "po_raised"]
+                update_fields=[
+                    "status",
+                    "po_raised",
+                ]
             )
 
         # No Manager/Finance notification is created for this step.
@@ -2334,7 +2434,11 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                 inward_entry_id=inward_entry.id,
                 replacement_po_id=replacement_po.id,
                 source_po_id=source_po.id,
-                material_request_id=material_request.id,
+                material_request_id=(
+                    material_request.id
+                    if material_request
+                    else None
+                ),
                 replacement_quantity=replacement_quantity,
             )
         )
@@ -2359,6 +2463,630 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                 },
             },
             status=status.HTTP_201_CREATED,
+        )
+
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="request-refund",
+    )
+    @transaction.atomic
+    def request_refund(self, request, pk=None):
+        """
+        Refund all QC-failed units for one Direct-PO Inward component.
+
+        The refund is completed immediately:
+        - failed quantity is deducted from the original Direct PO item
+        - received quantity is reduced by the same amount
+        - PO subtotal/GST/total automatically recalculate from the new quantity
+        - failed serial numbers and refund calculation are stored in
+          qc_failed_rows for traceability
+
+        No Manager/Finance/Procurement approval is added for Refund.
+        """
+        self.require_replacement_request_role(
+            request
+        )
+
+        try:
+            inward_entry = (
+                InwardEntry.objects
+                .select_for_update()
+                .select_related(
+                    "component",
+                    "purchase_order",
+                )
+                .prefetch_related(
+                    "line_items"
+                )
+                .get(pk=pk)
+            )
+        except InwardEntry.DoesNotExist:
+            return Response(
+                {
+                    "detail":
+                        "Inward entry not found."
+                },
+                status=
+                    status.HTTP_404_NOT_FOUND,
+            )
+
+        current_action = str(
+            inward_entry.qc_failed_action
+            or "NONE"
+        ).strip().upper()
+
+        if current_action == "RETURN_REQUESTED":
+            return Response(
+                {
+                    "detail":
+                        "Refund has already been completed for this failed QC entry.",
+                    "inward":
+                        self.get_serializer(
+                            inward_entry
+                        ).data,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        if (
+            current_action
+            == "REPLACEMENT_REQUESTED"
+            or inward_entry.replacement_purchase_order_id
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "Replacement has already been selected for "
+                        "this failed QC entry. Refund cannot also be applied."
+                    )
+                },
+                status=
+                    status.HTTP_400_BAD_REQUEST,
+            )
+
+        failed_rows = [
+            dict(row)
+            for row in (
+                inward_entry.qc_failed_rows
+                or []
+            )
+            if isinstance(row, dict)
+        ]
+
+        failed_quantity = (
+            self.get_qc_rows_quantity(
+                failed_rows
+            )
+        )
+
+        if failed_quantity <= 0:
+            return Response(
+                {
+                    "detail":
+                        "This Inward entry has no QC-failed quantity."
+                },
+                status=
+                    status.HTTP_400_BAD_REQUEST,
+            )
+
+        source_po = (
+            inward_entry.purchase_order
+        )
+
+        if not source_po:
+            return Response(
+                {
+                    "detail": (
+                        "The failed QC entry is not linked "
+                        "to a Purchase Order."
+                    )
+                },
+                status=
+                    status.HTTP_400_BAD_REQUEST,
+            )
+
+        source_mr_number = str(
+            source_po.source_mr_number
+            or ""
+        ).strip()
+
+        source_order_type = str(
+            getattr(
+                source_po,
+                "order_type",
+                "STANDARD",
+            )
+            or "STANDARD"
+        ).strip().upper()
+
+        if (
+            source_mr_number
+            or source_order_type
+            == "REPLACEMENT"
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "Refund is available only for a Direct standard PO."
+                    )
+                },
+                status=
+                    status.HTTP_400_BAD_REQUEST,
+            )
+
+        component = (
+            inward_entry.component
+        )
+
+        if not component:
+            return Response(
+                {
+                    "detail":
+                        "The failed component could not be resolved."
+                },
+                status=
+                    status.HTTP_400_BAD_REQUEST,
+            )
+
+        source_item = (
+            PurchaseOrderItem.objects
+            .select_for_update()
+            .filter(
+                purchase_order=source_po,
+                component=component,
+            )
+            .order_by("id")
+            .first()
+        )
+
+        if not source_item:
+            return Response(
+                {
+                    "detail": (
+                        "The failed component is not present "
+                        "on the Direct PO."
+                    )
+                },
+                status=
+                    status.HTTP_400_BAD_REQUEST,
+            )
+
+        ordered_quantity_before = max(
+            int(source_item.quantity or 0),
+            0,
+        )
+
+        received_quantity_before = max(
+            int(
+                source_item.received_quantity
+                or 0
+            ),
+            0,
+        )
+
+        if (
+            failed_quantity
+            > ordered_quantity_before
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "Failed QC quantity is greater than "
+                        "the remaining Direct PO item quantity."
+                    )
+                },
+                status=
+                    status.HTTP_400_BAD_REQUEST,
+            )
+
+        unit_price = Decimal(
+            str(
+                source_item.unit_price
+                or "0"
+            )
+        )
+
+        gst_percentage = Decimal(
+            str(
+                source_item.gst_percentage
+                or "0"
+            )
+        )
+
+        refund_subtotal = (
+            unit_price
+            * Decimal(failed_quantity)
+        )
+
+        refund_gst_amount = (
+            refund_subtotal
+            * gst_percentage
+            / Decimal("100")
+        )
+
+        refund_total = (
+            refund_subtotal
+            + refund_gst_amount
+        )
+
+        money_quantum = Decimal("0.01")
+
+        refund_subtotal = (
+            refund_subtotal.quantize(
+                money_quantum,
+                rounding=
+                    ROUND_HALF_UP,
+            )
+        )
+
+        refund_gst_amount = (
+            refund_gst_amount.quantize(
+                money_quantum,
+                rounding=
+                    ROUND_HALF_UP,
+            )
+        )
+
+        refund_total = (
+            refund_total.quantize(
+                money_quantum,
+                rounding=
+                    ROUND_HALF_UP,
+            )
+        )
+
+        new_ordered_quantity = max(
+            ordered_quantity_before
+            - failed_quantity,
+            0,
+        )
+
+        new_received_quantity = max(
+            received_quantity_before
+            - failed_quantity,
+            0,
+        )
+
+        # Keep received_quantity within the reduced ordered quantity.
+        new_received_quantity = min(
+            new_received_quantity,
+            new_ordered_quantity,
+        )
+
+        source_item.quantity = (
+            new_ordered_quantity
+        )
+
+        source_item.received_quantity = (
+            new_received_quantity
+        )
+
+        source_item.save(
+            update_fields=[
+                "quantity",
+                "received_quantity",
+            ]
+        )
+
+        # Refresh the source PO item and calculate the NEW authoritative
+        # Direct-PO totals after deducting the QC-failed quantity.
+        source_item.refresh_from_db()
+
+        updated_item_subtotal = (
+            Decimal(source_item.quantity)
+            * (
+                source_item.unit_price
+                or Decimal("0")
+            )
+        )
+
+        updated_item_gst_amount = (
+            updated_item_subtotal
+            * Decimal(
+                str(
+                    source_item.gst_percentage
+                    or "0"
+                )
+            )
+            / Decimal("100")
+        )
+
+        updated_item_total = (
+            updated_item_subtotal
+            + updated_item_gst_amount
+        )
+
+        source_po_items = list(
+            PurchaseOrderItem.objects
+            .select_for_update()
+            .filter(
+                purchase_order=source_po
+            )
+            .order_by("id")
+        )
+
+        updated_po_subtotal = sum(
+            (
+                Decimal(item.quantity)
+                * (
+                    item.unit_price
+                    or Decimal("0")
+                )
+                for item in source_po_items
+            ),
+            Decimal("0"),
+        )
+
+        updated_po_gst_amount = sum(
+            (
+                (
+                    Decimal(item.quantity)
+                    * (
+                        item.unit_price
+                        or Decimal("0")
+                    )
+                )
+                * Decimal(
+                    str(
+                        item.gst_percentage
+                        or "0"
+                    )
+                )
+                / Decimal("100")
+                for item in source_po_items
+            ),
+            Decimal("0"),
+        )
+
+        updated_po_total = (
+            updated_po_subtotal
+            + updated_po_gst_amount
+        )
+
+        refunded_at = (
+            timezone.now().isoformat()
+        )
+
+        serial_numbers = []
+
+        for row in failed_rows:
+            serial_number = str(
+                row.get("serialNumber")
+                or row.get("serial_number")
+                or row.get("serial")
+                or ""
+            ).strip()
+
+            if serial_number:
+                serial_numbers.append(
+                    serial_number
+                )
+
+            row_quantity = max(
+                self.get_qc_row_quantity(
+                    row
+                ),
+                0,
+            )
+
+            row_subtotal = (
+                unit_price
+                * Decimal(
+                    row_quantity
+                )
+            )
+
+            row_gst_amount = (
+                row_subtotal
+                * gst_percentage
+                / Decimal("100")
+            )
+
+            row_total = (
+                row_subtotal
+                + row_gst_amount
+            )
+
+            row[
+                "refund_status"
+            ] = "REFUNDED"
+
+            row[
+                "refunded_at"
+            ] = refunded_at
+
+            row[
+                "refund_unit_price"
+            ] = str(
+                unit_price.quantize(
+                    money_quantum,
+                    rounding=
+                        ROUND_HALF_UP,
+                )
+            )
+
+            row[
+                "refund_gst_percentage"
+            ] = str(
+                gst_percentage
+            )
+
+            row[
+                "refund_subtotal"
+            ] = str(
+                row_subtotal.quantize(
+                    money_quantum,
+                    rounding=
+                        ROUND_HALF_UP,
+                )
+            )
+
+            row[
+                "refund_gst_amount"
+            ] = str(
+                row_gst_amount.quantize(
+                    money_quantum,
+                    rounding=
+                        ROUND_HALF_UP,
+                )
+            )
+
+            row[
+                "refund_total"
+            ] = str(
+                row_total.quantize(
+                    money_quantum,
+                    rounding=
+                        ROUND_HALF_UP,
+                )
+            )
+
+        inward_entry.qc_failed_rows = (
+            failed_rows
+        )
+
+        # Existing model value is reused for compatibility.
+        # In the frontend it is displayed as "Refund Completed".
+        inward_entry.qc_failed_action = (
+            "RETURN_REQUESTED"
+        )
+
+        inward_entry.save(
+            update_fields=[
+                "qc_failed_rows",
+                "qc_failed_action",
+                "updated_at",
+            ]
+        )
+
+        return Response(
+            {
+                "detail":
+                    "Refund completed successfully.",
+                "inward":
+                    self.get_serializer(
+                        inward_entry
+                    ).data,
+                "refund": {
+                    "source_po_id":
+                        source_po.id,
+                    "source_po_number":
+                        source_po.po_number,
+                    "component_id":
+                        component.id,
+                    "component_code":
+                        str(
+                            getattr(
+                                component,
+                                "component_id",
+                                "",
+                            )
+                            or ""
+                        ),
+                    "component_name":
+                        str(
+                            getattr(
+                                component,
+                                "name",
+                                "",
+                            )
+                            or ""
+                        ),
+                    "serial_numbers":
+                        serial_numbers,
+                    "failed_quantity":
+                        failed_quantity,
+                    "unit_price":
+                        str(
+                            unit_price.quantize(
+                                money_quantum,
+                                rounding=
+                                    ROUND_HALF_UP,
+                            )
+                        ),
+                    "gst_percentage":
+                        str(
+                            gst_percentage
+                        ),
+                    "refund_subtotal":
+                        str(
+                            refund_subtotal
+                        ),
+                    "refund_gst_amount":
+                        str(
+                            refund_gst_amount
+                        ),
+                    "refund_total":
+                        str(
+                            refund_total
+                        ),
+                    "po_quantity_before":
+                        ordered_quantity_before,
+                    "po_quantity_after":
+                        new_ordered_quantity,
+                    "po_received_quantity_before":
+                        received_quantity_before,
+                    "po_received_quantity_after":
+                        new_received_quantity,
+
+                    # Updated ORIGINAL Direct PO component values.
+                    "updated_item_quantity":
+                        int(source_item.quantity),
+                    "updated_item_subtotal":
+                        str(
+                            updated_item_subtotal.quantize(
+                                money_quantum,
+                                rounding=
+                                    ROUND_HALF_UP,
+                            )
+                        ),
+                    "updated_item_gst_amount":
+                        str(
+                            updated_item_gst_amount.quantize(
+                                money_quantum,
+                                rounding=
+                                    ROUND_HALF_UP,
+                            )
+                        ),
+                    "updated_item_total":
+                        str(
+                            updated_item_total.quantize(
+                                money_quantum,
+                                rounding=
+                                    ROUND_HALF_UP,
+                            )
+                        ),
+
+                    # Updated ORIGINAL Direct PO totals.
+                    "updated_po_subtotal":
+                        str(
+                            updated_po_subtotal.quantize(
+                                money_quantum,
+                                rounding=
+                                    ROUND_HALF_UP,
+                            )
+                        ),
+                    "updated_po_gst_amount":
+                        str(
+                            updated_po_gst_amount.quantize(
+                                money_quantum,
+                                rounding=
+                                    ROUND_HALF_UP,
+                            )
+                        ),
+                    "updated_po_total":
+                        str(
+                            updated_po_total.quantize(
+                                money_quantum,
+                                rounding=
+                                    ROUND_HALF_UP,
+                            )
+                        ),
+                },
+            },
+            status=status.HTTP_200_OK,
         )
 
 

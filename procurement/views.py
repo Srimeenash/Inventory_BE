@@ -10,6 +10,7 @@ from rest_framework.response import Response
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from django.contrib.staticfiles import finders
 from inventory.models import InventoryReservation
+from components.models import Component
 from materialrequest.models import MaterialRequest
 from notifications.models import Notification
 from notifications.email_service import send_ipms_email
@@ -442,6 +443,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
     def save_finance_notification_with_sender(
         self,
         purchase_order,
+        requested_by_override="",
     ):
         """
         Create/update the Finance notification WITHOUT losing the
@@ -484,13 +486,19 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             or ""
         )
 
-        # Prefer the currently authenticated PO-raising user.
+        # Direct PO Manager approval happens under the Manager JWT.
+        # For that transition, requested_by_override carries the ORIGINAL
+        # Procurement/Admin user who created the Direct PO.
         actor_name = (
             self.get_authenticated_po_sender_name()
         )
 
         requested_by = (
-            actor_name
+            str(
+                requested_by_override
+                or ""
+            ).strip()
+            or actor_name
             or str(
                 preserved_sender or ""
             ).strip()
@@ -577,7 +585,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
 
     # ==========================================================
     # DIRECT PO - MANAGER APPROVAL
-    # Finance -> Manager -> Procurement can order
+    # Manager -> Finance -> Procurement can order
     # ==========================================================
 
     def is_direct_standard_po(self, purchase_order):
@@ -606,32 +614,12 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         purchase_order,
     ):
         """
-        After Finance approves a Direct PO, create exactly one
-        Manager notification asking for final Manager approval.
+        Create exactly one Manager notification immediately after a
+        Direct STANDARD PO is created.
+
+        Direct PO approval order:
+            Create -> Manager -> Finance -> Ordered -> Delivery
         """
-        finance_notification = (
-            Notification.objects
-            .filter(
-                category="PO",
-                receiver="FINANCE",
-                reference_id=str(
-                    purchase_order.id
-                ),
-            )
-            .order_by("-created_at", "-id")
-            .first()
-        )
-
-        requested_by = str(
-            getattr(
-                finance_notification,
-                "requested_by",
-                "",
-            )
-            or self.get_authenticated_po_sender_name()
-            or ""
-        ).strip()[:150]
-
         queryset = (
             Notification.objects
             .filter(
@@ -644,6 +632,30 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             .order_by("-created_at", "-id")
         )
 
+        # Preserve the original PO creator if this notification already
+        # exists; otherwise use the authenticated creator of the Direct PO.
+        preserved_sender = (
+            queryset
+            .exclude(
+                requested_by__isnull=True
+            )
+            .exclude(
+                requested_by=""
+            )
+            .values_list(
+                "requested_by",
+                flat=True,
+            )
+            .first()
+            or ""
+        )
+
+        requested_by = str(
+            preserved_sender
+            or self.get_authenticated_po_sender_name()
+            or ""
+        ).strip()[:150]
+
         notification = queryset.first()
 
         title = (
@@ -652,10 +664,9 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         )
 
         message = (
-            f"Finance approved Direct PO "
-            f"{purchase_order.po_number}. "
-            "Manager approval is required before "
-            "Procurement can mark this PO as Ordered."
+            f"Direct PO {purchase_order.po_number} "
+            "has been created. Manager approval is required "
+            "before this PO is sent to Finance."
         )
 
         if notification:
@@ -666,9 +677,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             notification.is_read = False
 
             if requested_by:
-                notification.requested_by = (
-                    requested_by
-                )
+                notification.requested_by = requested_by
 
             fields = [
                 "title",
@@ -717,8 +726,8 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         purchase_order_id,
     ):
         """
-        Email all active Manager users after Finance approves
-        a Direct PO. This email is only for Direct STANDARD POs.
+        Email all active Manager users immediately after a Direct
+        STANDARD PO is created. Manager approval is the first stage.
         """
         try:
             purchase_order = (
@@ -823,15 +832,14 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         )
 
         message = (
-            f"Finance has approved Direct Purchase Order "
-            f"{purchase_order.po_number}. "
-            "Manager approval is required before Procurement "
-            "can place the order."
+            f"Direct Purchase Order {purchase_order.po_number} "
+            "has been created and is waiting for Manager approval. "
+            "Finance will receive this PO only after Manager approval."
         )
 
         action_url = (
             f"{self.get_ipms_base_url()}"
-            "/purchase-orders"
+            "/notifications"
         )
 
         sent_any = False
@@ -854,8 +862,8 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                         "Vendor",
                         "Quantity",
                         "Components",
-                        "Finance Status",
                         "Manager Status",
+                        "Finance Status",
                     ],
                     "table_values": [
                         purchase_order.po_number,
@@ -864,16 +872,16 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                         or "-",
                         total_quantity,
                         components_display,
-                        "Finance Approved",
                         "Pending Manager Approval",
+                        "Waiting for Manager Approval",
                     ],
                     "status":
                         "Pending Manager Approval",
                     "instruction": (
-                        "Please open the Purchase Order "
-                        "table in IPMS and approve this "
-                        "Direct PO. Procurement can mark "
-                        "it Ordered only after your approval."
+                        "Please open Notifications -> PO "
+                        "and approve or reject this Direct PO. "
+                        "Finance approval will start only after "
+                        "Manager approval."
                     ),
                     "button_text":
                         "Review Direct PO",
@@ -1909,7 +1917,120 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
 
         # ------------------------------------------------------
         # Items / totals
+        #
+        # Optional line-item selection from the PO detail page:
+        #
+        #   /pdf/?item_ids=12,15
+        #
+        # If item_ids is omitted, keep the old behaviour and include
+        # every PO line item.
         # ------------------------------------------------------
+
+        requested_item_ids_raw = str(
+            request.query_params.get(
+                "item_ids",
+                "",
+            )
+            or ""
+        ).strip()
+
+        selected_items_queryset = (
+            purchase_order.items
+            .select_related("component")
+            .all()
+        )
+
+        if requested_item_ids_raw:
+            requested_item_ids = []
+
+            for value in (
+                requested_item_ids_raw
+                .split(",")
+            ):
+                value = str(value or "").strip()
+
+                if not value:
+                    continue
+
+                if not value.isdigit():
+                    return Response(
+                        {
+                            "detail": (
+                                "Invalid Purchase Order "
+                                "line-item selection."
+                            )
+                        },
+                        status=
+                            status.HTTP_400_BAD_REQUEST,
+                    )
+
+                requested_item_ids.append(
+                    int(value)
+                )
+
+            requested_item_ids = list(
+                dict.fromkeys(
+                    requested_item_ids
+                )
+            )
+
+            if not requested_item_ids:
+                return Response(
+                    {
+                        "detail": (
+                            "Select at least one Purchase "
+                            "Order line item."
+                        )
+                    },
+                    status=
+                        status.HTTP_400_BAD_REQUEST,
+                )
+
+            selected_items_queryset = (
+                selected_items_queryset
+                .filter(
+                    id__in=
+                        requested_item_ids
+                )
+            )
+
+            selected_ids_found = set(
+                selected_items_queryset
+                .values_list(
+                    "id",
+                    flat=True,
+                )
+            )
+
+            if selected_ids_found != set(
+                requested_item_ids
+            ):
+                return Response(
+                    {
+                        "detail": (
+                            "One or more selected line "
+                            "items do not belong to this "
+                            "Purchase Order."
+                        )
+                    },
+                    status=
+                        status.HTTP_400_BAD_REQUEST,
+                )
+
+        selected_items = list(
+            selected_items_queryset
+            .order_by("id")
+        )
+
+        if not selected_items:
+            return Response(
+                {
+                    "detail":
+                        "No Purchase Order line items found."
+                },
+                status=
+                    status.HTTP_400_BAD_REQUEST,
+            )
 
         pdf_items = []
 
@@ -1918,7 +2039,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         total_quantity = 0
 
         for index, item in enumerate(
-            purchase_order.items.all(),
+            selected_items,
             start=1,
         ):
             component = item.component
@@ -1983,7 +2104,10 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
 "uom": "Nos",
 
                 "due_date":
-                    purchase_order.expected_delivery_date,
+                    (
+                        item.expected_delivery_date
+                        or purchase_order.expected_delivery_date
+                    ),
 
                 "quantity":
                     quantity,
@@ -2021,7 +2145,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
 
         gst_rates = []
 
-        for po_item in purchase_order.items.all():
+        for po_item in selected_items:
             rate = Decimal(
                 str(po_item.gst_percentage or 0)
             )
@@ -2454,18 +2578,70 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
 
         return result
 
-    def validate_po_against_reserved_shortage(
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="mr-shortage-summary",
+    )
+    def mr_shortage_summary(
         self,
-        material_request,
+        request,
     ):
         """
-        Prevent active linked POs from ordering more than the shortage
-        reserved for Procurement.
+        Return the authoritative Procurement shortage for one Material
+        Request, including quantities already covered by existing active
+        STANDARD Purchase Orders.
 
-        This is called after PO creation while the transaction is still
-        open, so a ValidationError rolls the new PO back.
+        This endpoint intentionally uses the SAME rules as PO creation
+        validation so the Procurement UI cannot show stale "PO Remaining"
+        values that later fail during POST.
         """
-        active_purchase_orders = (
+        source_mr_number = str(
+            request.query_params.get("mr")
+            or request.query_params.get(
+                "source_mr_number"
+            )
+            or ""
+        ).strip()
+
+        if not source_mr_number:
+            return Response(
+                {
+                    "detail":
+                        "Material Request number is required."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        material_request = (
+            self.get_source_material_request(
+                source_mr_number
+            )
+        )
+
+        if not material_request:
+            return Response(
+                {
+                    "detail":
+                        "Material Request not found."
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        request_items = (
+            self.get_material_request_items(
+                material_request
+            )
+        )
+
+        shortage_groups = (
+            self.get_reservation_shortages(
+                material_request,
+                request_items,
+            )
+        )
+
+        active_standard_pos = (
             PurchaseOrder.objects
             .filter(
                 source_mr_number=(
@@ -2484,7 +2660,8 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         ordered_rows = (
             PurchaseOrderItem.objects
             .filter(
-                purchase_order__in=active_purchase_orders
+                purchase_order__in=
+                    active_standard_pos
             )
             .values("component_id")
             .annotate(
@@ -2500,6 +2677,144 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             if row["component_id"] is not None
         }
 
+        components = []
+
+        for (
+            component_id,
+            group,
+        ) in shortage_groups.items():
+            component = (
+                Component.objects
+                .filter(pk=component_id)
+                .first()
+            )
+
+            requested_quantity = int(
+                group.get(
+                    "required_quantity",
+                    0,
+                )
+                or 0
+            )
+
+            reserved_store_quantity = int(
+                group.get(
+                    "reserved_store_quantity",
+                    0,
+                )
+                or 0
+            )
+
+            procurement_shortage_quantity = int(
+                group.get(
+                    "shortage_quantity",
+                    0,
+                )
+                or 0
+            )
+
+            already_ordered_quantity = int(
+                ordered_by_component.get(
+                    component_id,
+                    0,
+                )
+                or 0
+            )
+
+            remaining_quantity = max(
+                procurement_shortage_quantity
+                - already_ordered_quantity,
+                0,
+            )
+
+            first_item = (
+                group.get("items") or [None]
+            )[0]
+
+            category = str(
+                getattr(
+                    first_item,
+                    "category",
+                    "",
+                )
+                or getattr(
+                    component,
+                    "category",
+                    "",
+                )
+                or ""
+            )
+
+            components.append(
+                {
+                    "component_id":
+                        component_id,
+                    "component_code": str(
+                        getattr(
+                            component,
+                            "component_id",
+                            "",
+                        )
+                        or component_id
+                    ),
+                    "component_name": str(
+                        getattr(
+                            component,
+                            "name",
+                            "",
+                        )
+                        or "Component"
+                    ),
+                    "category": category,
+                    "requested_quantity":
+                        requested_quantity,
+                    "reserved_store_quantity":
+                        reserved_store_quantity,
+                    "procurement_shortage_quantity":
+                        procurement_shortage_quantity,
+                    "already_ordered_quantity":
+                        already_ordered_quantity,
+                    "remaining_quantity":
+                        remaining_quantity,
+                }
+            )
+
+        return Response(
+            {
+                "material_request_id":
+                    material_request
+                    .material_request_id,
+                "components": components,
+            }
+        )
+
+
+    def validate_po_against_reserved_shortage(
+        self,
+        material_request,
+        purchase_order,
+    ):
+        """
+        Validate ONLY the components being created in the current PO.
+
+        Why this is important:
+        The old implementation re-validated every historical active PO
+        attached to the MR. If an older PO row was already inconsistent,
+        a completely valid new combined PO could be rejected even when
+        its own component quantities were within the remaining shortage.
+
+        For every component in the CURRENT PO:
+
+            existing active ordered quantity
+          + current PO quantity
+          <= reserved Procurement shortage
+
+        This works for:
+        - one component in one PO,
+        - multiple components in one combined PO,
+        - separate POs,
+        - partial quantities raised over multiple POs.
+        """
         request_items = self.get_material_request_items(
             material_request,
             lock=True,
@@ -2511,26 +2826,154 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             lock=True,
         )
 
+        # ------------------------------------------------------
+        # Quantity being created in THIS PO, grouped by component.
+        # Multiple rows for the same component are safely summed.
+        # ------------------------------------------------------
+        current_rows = (
+            PurchaseOrderItem.objects
+            .filter(
+                purchase_order=purchase_order
+            )
+            .values("component_id")
+            .annotate(
+                ordered_quantity=Sum("quantity")
+            )
+        )
+
+        current_by_component = {
+            int(row["component_id"]): int(
+                row["ordered_quantity"] or 0
+            )
+            for row in current_rows
+            if row["component_id"] is not None
+        }
+
+        if not current_by_component:
+            return
+
+        # ------------------------------------------------------
+        # Quantities already ordered BEFORE this new PO.
+        #
+        # Important: exclude the current PO itself; otherwise its quantity
+        # would be counted twice when we add current_by_component below.
+        # ------------------------------------------------------
+        previous_active_pos = (
+            PurchaseOrder.objects
+            .filter(
+                source_mr_number=(
+                    material_request.material_request_id
+                ),
+                order_type="STANDARD",
+            )
+            .exclude(pk=purchase_order.pk)
+            .exclude(
+                status__in=[
+                    "REJECTED",
+                    "FINANCE_REJECTED",
+                ]
+            )
+        )
+
+        previous_rows = (
+            PurchaseOrderItem.objects
+            .filter(
+                purchase_order__in=
+                    previous_active_pos,
+                component_id__in=
+                    list(
+                        current_by_component.keys()
+                    ),
+            )
+            .values("component_id")
+            .annotate(
+                ordered_quantity=Sum("quantity")
+            )
+        )
+
+        previous_by_component = {
+            int(row["component_id"]): int(
+                row["ordered_quantity"] or 0
+            )
+            for row in previous_rows
+            if row["component_id"] is not None
+        }
+
         errors = []
 
-        for component_id, ordered_quantity in (
-            ordered_by_component.items()
-        ):
+        for (
+            component_id,
+            current_quantity,
+        ) in current_by_component.items():
             allowed_shortage = int(
                 shortage_groups
                 .get(component_id, {})
-                .get("shortage_quantity", 0)
+                .get(
+                    "shortage_quantity",
+                    0,
+                )
+                or 0
             )
 
-            if ordered_quantity > allowed_shortage:
+            previous_quantity = int(
+                previous_by_component.get(
+                    component_id,
+                    0,
+                )
+                or 0
+            )
+
+            remaining_before_current = max(
+                allowed_shortage
+                - previous_quantity,
+                0,
+            )
+
+            resulting_quantity = (
+                previous_quantity
+                + current_quantity
+            )
+
+            if (
+                resulting_quantity
+                > allowed_shortage
+            ):
+                component = (
+                    Component.objects
+                    .filter(pk=component_id)
+                    .first()
+                )
+
+                component_code = str(
+                    getattr(
+                        component,
+                        "component_id",
+                        "",
+                    )
+                    or component_id
+                )
+
+                component_name = str(
+                    getattr(
+                        component,
+                        "name",
+                        "",
+                    )
+                    or "Component"
+                )
+
                 errors.append(
-                    {
-                        "component_id": component_id,
-                        "ordered_quantity": ordered_quantity,
-                        "allowed_shortage_quantity": (
-                            allowed_shortage
-                        ),
-                    }
+                    (
+                        f"{component_code} - "
+                        f"{component_name}: "
+                        f"PO Qty {current_quantity}, "
+                        f"Remaining Procurement shortage "
+                        f"{remaining_before_current} "
+                        f"(Reserved shortage "
+                        f"{allowed_shortage}, "
+                        f"already ordered "
+                        f"{previous_quantity})."
+                    )
                 )
 
         if errors:
@@ -2538,10 +2981,14 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 {
                     "items": [
                         (
-                            "PO quantity exceeds the reserved "
-                            "Procurement shortage."
+                            "PO quantity exceeds the "
+                            "remaining reserved Procurement "
+                            "shortage for one or more "
+                            "selected components."
                         )
                     ],
+                    # Keep these as strings so the frontend/API helper
+                    # shows useful text instead of [object Object].
                     "components": errors,
                 }
             )
@@ -2809,8 +3256,16 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
     @transaction.atomic
     def perform_create(self, serializer):
         """
-        Create a PO, reject over-ordering, and synchronize component-wise
-        PO progress for the linked Material Request.
+        Create a PO and start the correct approval workflow.
+
+        Direct STANDARD PO:
+            Create -> Manager -> Finance -> Ordered -> Delivery
+
+        MR-linked STANDARD PO:
+            Existing Finance workflow remains unchanged.
+
+        QC Replacement PO:
+            Existing Procurement replacement workflow remains unchanged.
         """
         purchase_order = serializer.save()
 
@@ -2824,15 +3279,14 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
 
             if material_request:
                 self.validate_po_against_reserved_shortage(
-                    material_request
+                    material_request,
+                    purchase_order,
                 )
 
             self.sync_material_request_po_progress(
                 purchase_order.source_mr_number
             )
 
-            # Return a Procurement progress email to the original
-            # MR requester/Engineer after this linked PO commits.
             transaction.on_commit(
                 lambda po_id=purchase_order.id: (
                     self.send_mr_requester_po_raised_email(
@@ -2841,7 +3295,61 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 )
             )
 
-        # Finance email for BOTH Direct PO and MR-linked PO.
+        # ------------------------------------------------------
+        # DIRECT STANDARD PO -> MANAGER FIRST
+        # ------------------------------------------------------
+        if self.is_direct_standard_po(
+            purchase_order
+        ):
+            update_fields = []
+
+            if str(
+                purchase_order.status
+                or ""
+            ).upper() != "PENDING":
+                purchase_order.status = "PENDING"
+                update_fields.append("status")
+
+            if str(
+                purchase_order.approval_status
+                or ""
+            ).upper() != "PENDING":
+                purchase_order.approval_status = "PENDING"
+                update_fields.append(
+                    "approval_status"
+                )
+
+            if update_fields:
+                purchase_order.save(
+                    update_fields=update_fields
+                )
+
+            # Direct PO must NOT be visible to Finance before Manager approval.
+            Notification.objects.filter(
+                category="PO",
+                receiver="FINANCE",
+                reference_id=str(
+                    purchase_order.id
+                ),
+            ).delete()
+
+            self.save_direct_po_manager_notification(
+                purchase_order
+            )
+
+            transaction.on_commit(
+                lambda po_id=purchase_order.id: (
+                    self.send_direct_po_manager_approval_email(
+                        po_id
+                    )
+                )
+            )
+
+            return
+
+        # ------------------------------------------------------
+        # NON-DIRECT PO: preserve existing Finance behaviour.
+        # ------------------------------------------------------
         create_approval_status = str(
             purchase_order.approval_status
             or ""
@@ -2858,8 +3366,6 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             or create_status
             == "PENDING_FINANCE"
         ):
-            # Store exactly who raised/created this PO before
-            # Finance receives it. Works for Direct PO and MR PO.
             self.save_finance_notification_with_sender(
                 purchase_order
             )
@@ -2901,12 +3407,12 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 purchase_order
             )
             and new_status == "ORDERED"
-            and old_status != "APPROVED"
+            and old_status != "FINANCE_APPROVED"
         ):
             raise ValidationError(
                 {
                     "status": (
-                        "Manager approval is required "
+                        "Finance approval is required "
                         "before a Direct PO can be "
                         "marked Ordered."
                     )
@@ -2917,6 +3423,55 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             purchase_order.approval_status
             or ""
         ).upper()
+
+        # A generic PATCH must never bypass the Manager-first Direct PO flow.
+        # Only direct_manager_approve() is allowed to move a Direct PO from
+        # PENDING to PENDING_FINANCE.
+        if (
+            self.is_direct_standard_po(
+                purchase_order
+            )
+            and new_approval_status
+            == "PENDING_FINANCE"
+            and old_status
+            != "PENDING_FINANCE"
+        ):
+            raise ValidationError(
+                {
+                    "approval_status": (
+                        "Manager approval is required "
+                        "before a Direct PO can be sent "
+                        "to Finance."
+                    )
+                }
+            )
+
+        # Finance can act on a Direct PO only after Manager approval has
+        # already moved it to PENDING_FINANCE.
+        if (
+            self.is_direct_standard_po(
+                purchase_order
+            )
+            and new_approval_status in {
+                "FINANCE_APPROVED",
+                "FINANCE_REJECTED",
+            }
+            # Only validate when Finance approval_status is actually
+            # CHANGING. A later ORDERED / delivery update keeps the
+            # already-approved FINANCE_APPROVED value and must pass.
+            and old_approval_status
+            != new_approval_status
+            and old_status
+            != "PENDING_FINANCE"
+        ):
+            raise ValidationError(
+                {
+                    "approval_status": (
+                        "This Direct PO is not pending "
+                        "Finance approval."
+                    )
+                }
+            )
 
         # ---------------------------------------------------------
         # Finance approval requested
@@ -2998,33 +3553,18 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                     update_fields=update_fields
                 )
 
-            # Finance approval is NOT the final approval for a Direct PO.
-            # Direct PO: notify/email Manager for final approval.
-            # MR-linked standard PO: preserve the existing Finance-only flow.
-            if self.is_direct_standard_po(
-                purchase_order
-            ):
-                self.save_direct_po_manager_notification(
-                    purchase_order
-                )
-
-                transaction.on_commit(
-                    lambda po_id=purchase_order.id: (
-                        self.send_direct_po_manager_approval_email(
-                            po_id
-                        )
+            # Finance approval is the FINAL approval stage for a Direct PO.
+            # After this, Procurement can Mark as Ordered.
+            #
+            # MR-linked standard PO keeps its existing Finance result email.
+            transaction.on_commit(
+                lambda po_id=purchase_order.id: (
+                    self.send_po_requester_result_email(
+                        po_id,
+                        outcome="approved",
                     )
                 )
-            else:
-                # Existing MR-linked PO behavior remains unchanged.
-                transaction.on_commit(
-                    lambda po_id=purchase_order.id: (
-                        self.send_po_requester_result_email(
-                            po_id,
-                            outcome="approved",
-                        )
-                    )
-                )
+            )
 
         # ---------------------------------------------------------
         # Finance rejected
@@ -3118,10 +3658,16 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         pk=None,
     ):
         """
-        Final Manager approval for a Direct STANDARD PO.
+        FIRST approval stage for a Direct STANDARD PO.
 
-        Finance must approve first. No Manager approval is required
-        for MR-linked standard POs or QC Replacement POs.
+        Direct PO:
+            PENDING (Manager)
+                -> PENDING_FINANCE
+                -> FINANCE_APPROVED
+                -> ORDERED
+                -> Delivery
+
+        MR-linked standard POs and QC Replacement POs are unchanged.
         """
         self.require_active_role(
             request,
@@ -3166,23 +3712,50 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 purchase_order.status
                 or ""
             ).upper()
-            != "FINANCE_APPROVED"
+            != "PENDING"
         ):
             return Response(
                 {
                     "detail": (
-                        "Finance must approve this Direct "
-                        "PO before Manager approval."
+                        "This Direct PO is not pending "
+                        "Manager approval."
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        manager_notification = (
+            Notification.objects
+            .filter(
+                category="PO",
+                receiver="MANAGER",
+                reference_id=str(
+                    purchase_order.id
+                ),
+            )
+            .order_by("-created_at", "-id")
+            .first()
+        )
+
+        original_sender = str(
+            getattr(
+                manager_notification,
+                "requested_by",
+                "",
+            )
+            or ""
+        ).strip()[:150]
+
         actor = self.get_request_actor_name(
             request
         )
 
-        purchase_order.status = "APPROVED"
+        purchase_order.status = (
+            "PENDING_FINANCE"
+        )
+        purchase_order.approval_status = (
+            "PENDING_FINANCE"
+        )
         purchase_order.approved_by = actor
         purchase_order.approved_at = timezone.now()
         purchase_order.rejection_reason = None
@@ -3191,6 +3764,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         purchase_order.save(
             update_fields=[
                 "status",
+                "approval_status",
                 "approved_by",
                 "approved_at",
                 "rejection_reason",
@@ -3207,6 +3781,22 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         ).update(
             status="APPROVED",
             is_read=True,
+        )
+
+        # Finance notification is created ONLY AFTER Manager approval.
+        self.save_finance_notification_with_sender(
+            purchase_order,
+            requested_by_override=(
+                original_sender
+            ),
+        )
+
+        transaction.on_commit(
+            lambda po_id=purchase_order.id: (
+                self.send_finance_approval_email(
+                    po_id
+                )
+            )
         )
 
         return Response(
@@ -3227,10 +3817,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         pk=None,
     ):
         """
-        Manager rejects a Direct STANDARD PO after Finance approval.
-
-        This action is ONLY for Direct POs.
-        QC Replacement POs remain Procurement-approved in the PO table.
+        Manager rejects a Direct STANDARD PO before it reaches Finance.
         """
         self.require_active_role(
             request,
@@ -3291,7 +3878,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 purchase_order.status
                 or ""
             ).upper()
-            != "FINANCE_APPROVED"
+            != "PENDING"
         ):
             return Response(
                 {
@@ -3308,7 +3895,10 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         )
 
         purchase_order.status = "REJECTED"
-        purchase_order.approval_status = "REJECTED"
+
+        # Keep approval_status inside the existing model choices.
+        # The authoritative rejected state is PurchaseOrder.status.
+        purchase_order.approval_status = "PENDING"
         purchase_order.rejection_reason = reason
         purchase_order.rejected_by = actor
 
@@ -3331,6 +3921,16 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             status="REJECTED",
             is_read=True,
         )
+
+        # Defensive cleanup: a Manager-rejected Direct PO must never
+        # remain visible to Finance.
+        Notification.objects.filter(
+            category="PO",
+            receiver="FINANCE",
+            reference_id=str(
+                purchase_order.id
+            ),
+        ).delete()
 
         return Response(
             self.get_serializer(

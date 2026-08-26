@@ -67,6 +67,51 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
     serializer_class = MaterialRequestSerializer
     pagination_class = None
 
+    @staticmethod
+    def is_from_scrap_request(
+        material_request,
+    ):
+        """
+        Detect both NEW and already-created legacy derived Scrap MRs.
+
+        New records:
+            request_type = SCRAP
+
+        Legacy records from the previous implementation can still have
+        request_type = BOM/R&D but their remarks identify that they were
+        automatically recreated from Scrap.
+        """
+        request_type = str(
+            getattr(
+                material_request,
+                "request_type",
+                "",
+            )
+            or ""
+        ).strip().upper()
+
+        if request_type == "SCRAP":
+            return True
+
+        remarks = str(
+            getattr(
+                material_request,
+                "remarks",
+                "",
+            )
+            or ""
+        ).strip().lower()
+
+        return (
+            "automatically recreated from scrap"
+            in remarks
+            or "automatically created from scrap"
+            in remarks
+            or "from scrap "
+            in remarks
+        )
+
+
     def get_request_items(self, material_request, *, lock=False):
         request_type = str(
             material_request.request_type or ""
@@ -1098,6 +1143,72 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
             INVENTORY notification -> issue 2 Wings
             PROCUREMENT notification -> raise PO for 8 Wings
         """
+        # ------------------------------------------------------
+        # FROM-SCRAP MR
+        # ------------------------------------------------------
+        # These components already physically come from the scrapped drone.
+        # They must NOT be reserved from central In Store, must NOT enter
+        # Project Inventory, and must NOT create Procurement work.
+        #
+        # Manager approval therefore completes this derived MR directly.
+        # ------------------------------------------------------
+        if self.is_from_scrap_request(
+            material_request
+        ):
+            reference_id = str(
+                material_request.id
+            )
+
+            Notification.objects.filter(
+                category="MR",
+                reference_id=reference_id,
+                receiver="MANAGER",
+            ).update(
+                status="MANAGER_APPROVED",
+                is_read=True,
+            )
+
+            # Defensive cleanup in case an old deployment created work.
+            Notification.objects.filter(
+                category="MR",
+                reference_id=reference_id,
+                receiver__in=[
+                    "INVENTORY",
+                    "PROCUREMENT",
+                ],
+            ).delete()
+
+            # There should be no active Inventory reservation for a
+            # From-Scrap MR. Release/delete any stale rows defensively.
+            InventoryReservation.objects.filter(
+                material_request=
+                    material_request
+            ).delete()
+
+            # No ProjectInventory row should be needed for this MR.
+            ProjectInventory.objects.filter(
+                material_request=
+                    material_request
+            ).delete()
+
+            material_request.approval_status = (
+                "MANAGER_APPROVED"
+            )
+            material_request.status = (
+                "MR_COMPLETED"
+            )
+            material_request.po_raised = False
+
+            material_request.save(
+                update_fields=[
+                    "status",
+                    "approval_status",
+                    "po_raised",
+                ]
+            )
+
+            return
+
         allocations, shortages = (
             self.reserve_request_components(
                 material_request

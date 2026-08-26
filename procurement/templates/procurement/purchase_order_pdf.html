@@ -159,12 +159,11 @@
         }
 
         .continued-box {
-            height: 210px;
             text-align: right;
             vertical-align: top;
-            padding-top: 45px;
-            padding-right: 35px;
+            padding: 8px 16px;
             font-style: italic;
+            line-height: 1.2;
         }
 
         .words-box {
@@ -535,20 +534,27 @@
 
         {% endif %}
 
+        <tr>
+            <td
+                colspan="7"
+                class="continued-box"
+                {% if items|length <= 1 %}
+                    style="height:72px;"
+                {% elif items|length == 2 %}
+                    style="height:48px;"
+                {% elif items|length == 3 %}
+                    style="height:32px;"
+                {% elif items|length == 4 %}
+                    style="height:22px;"
+                {% else %}
+                    style="height:14px;"
+                {% endif %}
+            >
+                continued ...
+            </td>
+        </tr>
+
     </tbody>
-
-</table>
-
-
-<table>
-
-    <tr>
-
-        <td class="continued-box">
-            continued ...
-        </td>
-
-    </tr>
 
 </table>
 

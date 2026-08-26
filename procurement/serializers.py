@@ -88,6 +88,7 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
             "remaining_quantity",
             "unit_price",
             "gst_percentage",
+            "expected_delivery_date",
             "subtotal",
             "gst_amount",
             "total_cost",
@@ -560,11 +561,19 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
                     )
                 )
 
+                existing_item.expected_delivery_date = (
+                    item_data.get(
+                        "expected_delivery_date",
+                        existing_item.expected_delivery_date,
+                    )
+                )
+
                 existing_item.save(
                     update_fields=[
                         "quantity",
                         "unit_price",
                         "gst_percentage",
+                        "expected_delivery_date",
                     ]
                 )
 

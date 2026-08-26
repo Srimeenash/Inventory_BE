@@ -1,4 +1,5 @@
 from uuid import uuid4
+from decimal import Decimal
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
@@ -17,7 +18,7 @@ from inventory.models import (
     InventoryReservation,
     ProjectInventory,
 )
-from materialrequest.models import MaterialRequest
+from materialrequest.models import MaterialRequest, BOMItem, RDItem
 from notifications.email_service import send_ipms_email
 from notifications.models import Notification
 
@@ -1560,7 +1561,22 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
         return list(queryset)
 
     @classmethod
-    def get_used_mr_scrap_serials(cls, material_request, *, lock=False):
+    def get_used_mr_scrap_serials(
+        cls,
+        material_request,
+        *,
+        lock=False,
+    ):
+        """
+        Serials unavailable to a NEW Engineer Scrap request.
+
+        Active Scrap rows reserve:
+        - exact serials selected for Scrap
+        - for Partial Scrap + Reordering NO, the remaining good serials
+          that will return to central Inventory after final approval
+
+        Rejected Scrap rows release their serials again.
+        """
         queryset = (
             OutwardEntry.objects
             .filter(
@@ -1568,14 +1584,188 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                 scrap_origin="MR",
                 material_request=material_request,
             )
-            .exclude(approval_status="REJECTED")
+            .order_by("id")
         )
+
         if lock:
             queryset = queryset.select_for_update()
-        used = set()
+
+        unavailable = set()
+
+        rejected_states = {
+            "REJECTED",
+            "MANAGER_REJECTED",
+            "FINANCE_REJECTED",
+        }
+
         for row in queryset:
-            used.update(cls.normalize_serials(row.serial_numbers))
-        return used
+            approval_state = str(
+                row.approval_status or ""
+            ).strip().upper()
+
+            status_state = str(
+                row.status or ""
+            ).strip().upper()
+
+            if (
+                approval_state in rejected_states
+                or status_state in rejected_states
+            ):
+                continue
+
+            unavailable.update(
+                cls.normalize_serials(
+                    row.serial_numbers
+                )
+            )
+
+            metadata = (
+                row.inventory_allocations
+                if isinstance(
+                    row.inventory_allocations,
+                    dict,
+                )
+                else {}
+            )
+
+            if (
+                metadata.get("workflow")
+                == "ENGINEER_MR_SCRAP_DISPOSITION_V1"
+            ):
+                for item in (
+                    metadata.get(
+                        "return_items",
+                        [],
+                    )
+                    or []
+                ):
+                    if not isinstance(item, dict):
+                        continue
+
+                    unavailable.update(
+                        cls.normalize_serials(
+                            item.get(
+                                "serial_numbers"
+                            )
+                            or []
+                        )
+                    )
+
+        return unavailable
+
+    @classmethod
+    def get_engineer_scrap_component_snapshot(
+        cls,
+        material_request,
+        *,
+        lock=False,
+    ):
+        """
+        Return exact issued serials available for the Scrap disposition.
+
+        ProjectInventory is the source of truth for what was issued to
+        the INVENTORY_ISSUED MR.
+        """
+        project_rows = cls.get_project_rows_for_mr(
+            material_request,
+            lock=lock,
+        )
+
+        unavailable = cls.get_used_mr_scrap_serials(
+            material_request,
+            lock=lock,
+        )
+
+        result = []
+
+        for project_row in project_rows:
+            issued_serials = cls.normalize_serials(
+                cls.normalize_serials(
+                    project_row.issued_store_serials
+                )
+                + cls.normalize_serials(
+                    project_row.issued_purchased_serials
+                )
+            )
+
+            if not issued_serials:
+                continue
+
+            available_serials = [
+                serial
+                for serial in issued_serials
+                if serial not in unavailable
+            ]
+
+            if not available_serials:
+                continue
+
+            component = project_row.component
+
+            component_code = str(
+                getattr(
+                    component,
+                    "component_id",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            component_name = str(
+                getattr(
+                    component,
+                    "name",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            label = (
+                " - ".join(
+                    value
+                    for value in [
+                        component_code,
+                        component_name,
+                    ]
+                    if value
+                )
+                or component_name
+                or component_code
+                or f"Component {project_row.component_id}"
+            )
+
+            result.append(
+                {
+                    "component":
+                        project_row.component_id,
+                    "component_code":
+                        component_code,
+                    "component_name":
+                        component_name,
+                    "label":
+                        label,
+                    "issued_serials":
+                        issued_serials,
+                    "available_serials":
+                        available_serials,
+                    "issued_quantity":
+                        int(
+                            project_row
+                            .calculated_issued_quantity
+                            or 0
+                        ),
+                    "requested_quantity":
+                        int(
+                            project_row
+                            .requested_quantity
+                            or 0
+                        ),
+                    "issue_status":
+                        "ISSUED",
+                }
+            )
+
+        return result
 
     @classmethod
     def build_engineer_scrap_mr_options(
@@ -1583,221 +1773,891 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
         user,
     ):
         """
-        Engineer Scrap MR dropdown rule:
+        Engineer Scrap dropdown rule:
 
-        Show an MR when AT LEAST ONE ProjectInventory component has
-        actually been issued and has issued serial number(s).
+        ONLY Material Requests whose current status is exactly
+        INVENTORY_ISSUED are displayed.
 
-        This intentionally includes:
-        - partially issued MRs/components
-        - fully issued MRs/components
-
-        It does NOT require:
-        - the whole MR to be completed
-        - every component in the MR to be fulfilled
-        - a final MaterialRequest status
-
-        ProjectInventory issued serials are the authority because those
-        are the exact physical components currently shown by In Drone.
+        Each option exposes the exact issued serials that are still
+        available for a new Scrap disposition.
         """
+        # An INVENTORY_ISSUED MR can be selected for Engineer Scrap
+        # only once at a time.
+        #
+        # As soon as a non-rejected Engineer Scrap request exists for the MR,
+        # hide that MR from the dropdown. This prevents the same issued MR
+        # from being selected again while it is Pending Manager / Pending
+        # Finance / Approved / Moved to Store.
+        #
+        # If the Scrap request is rejected, the MR becomes selectable again.
+        blocked_mr_ids = (
+            OutwardEntry.objects
+            .filter(
+                source="ENGINEER",
+                outward_type="SCRAP",
+                scrap_origin="MR",
+                material_request_id__isnull=False,
+            )
+            .exclude(
+                approval_status__in=[
+                    "REJECTED",
+                    "MANAGER_REJECTED",
+                    "FINANCE_REJECTED",
+                ]
+            )
+            .exclude(
+                status__in=[
+                    "REJECTED",
+                    "MANAGER_REJECTED",
+                    "FINANCE_REJECTED",
+                ]
+            )
+            .values_list(
+                "material_request_id",
+                flat=True,
+            )
+            .distinct()
+        )
+
         mr_queryset = (
             MaterialRequest.objects
-            .all()
+            .filter(
+                status="INVENTORY_ISSUED"
+            )
+            .exclude(
+                id__in=blocked_mr_ids
+            )
             .order_by(
                 "-date",
                 "-id",
             )
         )
 
-        # MaterialRequest currently stores requester_name as free text,
-        # not as a User FK. Do not hide valid issued MRs here based only
-        # on a fragile display-name comparison.
-        #
-        # The Engineer Scrap page is already role-protected, and the
-        # selected serial is validated against issued serials again on POST.
-
         options = []
 
         for material_request in mr_queryset:
-            project_rows = (
-                cls.get_project_rows_for_mr(
+            components = (
+                cls.get_engineer_scrap_component_snapshot(
                     material_request
                 )
             )
 
-            if not project_rows:
+            if not components:
                 continue
 
-            used_serials = (
-                cls.get_used_mr_scrap_serials(
-                    material_request
+            total_available_quantity = sum(
+                len(
+                    item.get(
+                        "available_serials",
+                        [],
+                    )
+                    or []
                 )
+                for item in components
             )
 
-            components = []
-
-            for project_row in project_rows:
-                issued_serials = (
-                    cls.normalize_serials(
-                        project_row
-                        .issued_store_serials
-                    )
-                    + cls.normalize_serials(
-                        project_row
-                        .issued_purchased_serials
-                    )
-                )
-
-                issued_serials = (
-                    cls.normalize_serials(
-                        issued_serials
-                    )
-                )
-
-                # A component is eligible as soon as any exact serial
-                # has actually been provided/issued to this MR.
-                if not issued_serials:
-                    continue
-
-                available_serials = [
-                    serial
-                    for serial
-                    in issued_serials
-                    if serial
-                    not in used_serials
-                ]
-
-                # If every issued serial is already in an active Scrap
-                # request, there is nothing selectable for this component.
-                if not available_serials:
-                    continue
-
-                component = (
-                    project_row.component
-                )
-
-                component_code = str(
-                    getattr(
-                        component,
-                        "component_id",
-                        "",
-                    )
-                    or ""
-                ).strip()
-
-                component_name = str(
-                    getattr(
-                        component,
-                        "name",
-                        "",
-                    )
-                    or ""
-                ).strip()
-
-                label = (
-                    " - ".join(
-                        value
-                        for value
-                        in [
-                            component_code,
-                            component_name,
-                        ]
-                        if value
-                    )
-                    or component_name
-                    or component_code
-                    or f"Component {project_row.component_id}"
-                )
-
-                issued_quantity = int(
-                    project_row
-                    .calculated_issued_quantity
-                    or 0
-                )
-
-                requested_quantity = int(
-                    project_row
-                    .requested_quantity
-                    or 0
-                )
-
-                component_issue_status = (
-                    "ISSUED"
-                    if (
-                        requested_quantity > 0
-                        and issued_quantity
-                        >= requested_quantity
-                    )
-                    else "PARTIAL"
-                )
-
-                components.append(
-                    {
-                        "component":
-                            project_row.component_id,
-
-                        "component_code":
-                            component_code,
-
-                        "component_name":
-                            component_name,
-
-                        "label":
-                            label,
-
-                        "issued_serials":
-                            issued_serials,
-
-                        "available_serials":
-                            available_serials,
-
-                        "issued_quantity":
-                            issued_quantity,
-
-                        "requested_quantity":
-                            requested_quantity,
-
-                        "issue_status":
-                            component_issue_status,
-                    }
-                )
-
-            # MR appears if at least one component is issued/partially issued
-            # and still has an available issued serial.
-            if not components:
+            if total_available_quantity <= 0:
                 continue
 
             options.append(
                 {
                     "id":
                         material_request.id,
-
                     "material_request_id":
                         material_request
                         .material_request_id,
-
                     "requester_name":
                         material_request
                         .requester_name,
-
                     "project":
                         material_request
                         .project,
-
                     "date":
                         material_request
                         .date,
-
                     "status":
                         material_request
                         .status,
-
+                    "total_available_quantity":
+                        total_available_quantity,
                     "components":
                         components,
                 }
             )
 
         return options
+
+    @classmethod
+    def normalize_scrap_items(
+        cls,
+        raw_items,
+    ):
+        """
+        Normalize frontend scrap_items into:
+        [{component, serial_numbers, quantity}, ...]
+        """
+        if not isinstance(raw_items, list):
+            return []
+
+        normalized = []
+
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+
+            component_id = (
+                raw.get("component")
+                or raw.get("component_id")
+            )
+
+            serials = cls.normalize_serials(
+                raw.get("serial_numbers")
+                or raw.get("selected_serials")
+                or raw.get("serials")
+                or []
+            )
+
+            if not component_id or not serials:
+                continue
+
+            normalized.append(
+                {
+                    "component":
+                        component_id,
+                    "serial_numbers":
+                        serials,
+                    "quantity":
+                        len(serials),
+                }
+            )
+
+        return normalized
+
+    @staticmethod
+    def get_source_mr_item(
+        material_request,
+        component_id,
+    ):
+        request_type = str(
+            material_request.request_type
+            or ""
+        ).strip().upper()
+
+        manager = (
+            material_request.rd_items
+            if request_type in {"R&D", "RD"}
+            else material_request.bom_items
+        )
+
+        return (
+            manager
+            .filter(
+                component_id=component_id
+            )
+            .order_by("id")
+            .first()
+        )
+
+    @staticmethod
+    def generate_scrap_return_inventory_code():
+        """
+        Unique, audit-friendly Inventory code for usable components
+        returned from an issued MR after Scrap disposition.
+        """
+        while True:
+            code = (
+                "INVRET-"
+                + timezone.now().strftime(
+                    "%Y%m%d%H%M%S%f"
+                )
+                + "-"
+                + uuid4().hex[:6].upper()
+            )
+
+            if not Inventory.objects.filter(
+                inventory_code=code
+            ).exists():
+                return code
+
+    @classmethod
+    def create_scrap_return_inventory(
+        cls,
+        *,
+        source_mr,
+        item,
+    ):
+        serials = cls.normalize_serials(
+            item.get("serial_numbers")
+            or []
+        )
+
+        if not serials:
+            return None
+
+        component_id = item.get(
+            "component"
+        )
+
+        project_row = (
+            ProjectInventory.objects
+            .select_related("component")
+            .filter(
+                material_request=source_mr,
+                component_id=component_id,
+            )
+            .first()
+        )
+
+        if not project_row:
+            return None
+
+        component = project_row.component
+
+        source_item = cls.get_source_mr_item(
+            source_mr,
+            component_id,
+        )
+
+        unit_price = Decimal(
+            str(
+                getattr(
+                    source_item,
+                    "unit_price",
+                    0,
+                )
+                or 0
+            )
+        )
+
+        total_price = (
+            unit_price
+            * Decimal(
+                len(serials)
+            )
+        )
+
+        return Inventory.objects.create(
+            inventory_code=(
+                cls.generate_scrap_return_inventory_code()
+            ),
+            component=component,
+            category=(
+                getattr(
+                    component,
+                    "category",
+                    "",
+                )
+                or getattr(
+                    source_item,
+                    "category",
+                    "",
+                )
+                or ""
+            ),
+            vendor=(
+                "Returned from issued MR"
+            ),
+            purchase_order=(
+                f"SCRAP-RETURN:"
+                f"{source_mr.material_request_id}"
+            ),
+            quantity=len(serials),
+            received_date=timezone.localdate(),
+            total_price=total_price,
+            issued=False,
+            serial_numbers=serials,
+            issued_serial_numbers=[],
+        )
+
+    @classmethod
+    def generate_next_material_request_id(
+        cls,
+    ):
+        """
+        Generate the SAME MR ID format used by the New Material Request page:
+
+            MR-YYMMDD-00001
+
+        Example:
+            MR-260825-00001
+
+        The sequence is shared across normal MRs and From-Scrap MRs for the
+        same date, so a Scrap-created MR continues the normal MR numbering.
+        """
+        date_part = (
+            timezone.localdate()
+            .strftime("%y%m%d")
+        )
+
+        prefix = f"MR-{date_part}-"
+
+        existing_ids = (
+            MaterialRequest.objects
+            .filter(
+                material_request_id__startswith=
+                    prefix
+            )
+            .values_list(
+                "material_request_id",
+                flat=True,
+            )
+        )
+
+        highest_sequence = 0
+
+        for request_id in existing_ids:
+            value = str(
+                request_id or ""
+            ).strip()
+
+            if not value.startswith(
+                prefix
+            ):
+                continue
+
+            sequence_text = value[
+                len(prefix):
+            ]
+
+            if (
+                len(sequence_text) != 5
+                or not sequence_text.isdigit()
+            ):
+                continue
+
+            highest_sequence = max(
+                highest_sequence,
+                int(sequence_text),
+            )
+
+        return (
+            f"{prefix}"
+            f"{highest_sequence + 1:05d}"
+        )
+
+
+    @classmethod
+    def create_scrap_reorder_mr(
+        cls,
+        *,
+        scrap_entry,
+        source_mr,
+        scrap_items,
+    ):
+        """
+        Create a dedicated FROM-SCRAP Material Request.
+
+        IMPORTANT:
+        - This is NOT a BOM / Custom BOM / R&D procurement request.
+        - The physical components already come from the scrapped drone.
+        - The selected serial numbers are carried directly into this MR.
+        - Manager approval must NOT reserve In-Store stock and must NOT
+          create Project Inventory / Procurement work for this request.
+
+        No schema migration is required. The existing CharField stores the
+        internal request_type value "SCRAP".
+        """
+        requester = None
+
+        if scrap_entry.requested_by_user_id:
+            requester = (
+                User.objects
+                .filter(
+                    pk=
+                        scrap_entry
+                        .requested_by_user_id
+                )
+                .first()
+            )
+
+        requester_name = (
+            scrap_entry.requested_by
+            or getattr(
+                requester,
+                "employee_name",
+                "",
+            )
+            or getattr(
+                requester,
+                "email",
+                "",
+            )
+            or "Engineer"
+        )
+
+        total_quantity = sum(
+            max(
+                int(
+                    item.get(
+                        "quantity",
+                        0,
+                    )
+                    or 0
+                ),
+                0,
+            )
+            for item in scrap_items
+        )
+
+        reorder_mr = MaterialRequest.objects.create(
+            # Use the exact same ID format and daily sequence as the
+            # normal New Material Request page.
+            material_request_id=(
+                cls.generate_next_material_request_id()
+            ),
+
+            requester_name=requester_name,
+            requester=requester,
+            date=timezone.localdate(),
+            project=source_mr.project,
+
+            # FROM-SCRAP is intentionally independent of BOM.
+            bom=None,
+            customized_bom=False,
+            request_type="SCRAP",
+
+            required_quantity=max(
+                total_quantity,
+                1,
+            ),
+            required_date=(
+                source_mr.required_date
+            ),
+            remarks=(
+                f"Automatically created From Scrap for "
+                f"{source_mr.material_request_id}. "
+                f"Selected quantity: "
+                f"{total_quantity}."
+            ),
+            status="PENDING_MANAGER",
+            approval_status="PENDING_MANAGER",
+            po_raised=False,
+        )
+
+        for item in scrap_items:
+            component_id = item.get(
+                "component"
+            )
+
+            serial_numbers = (
+                cls.normalize_serials(
+                    item.get(
+                        "serial_numbers"
+                    )
+                    or []
+                )
+            )
+
+            # Selected quantity must match exact selected serials.
+            quantity = len(serial_numbers)
+
+            if (
+                not component_id
+                or quantity <= 0
+            ):
+                continue
+
+            source_item = (
+                cls.get_source_mr_item(
+                    source_mr,
+                    component_id,
+                )
+            )
+
+            if source_item is None:
+                continue
+
+            component = getattr(
+                source_item,
+                "component",
+                None,
+            )
+
+            if component is None:
+                continue
+
+            unit_price = getattr(
+                source_item,
+                "unit_price",
+                0,
+            ) or 0
+
+            price = (
+                Decimal(
+                    str(unit_price)
+                )
+                * Decimal(quantity)
+            )
+
+            # Always store FROM-SCRAP rows in BOMItem.
+            # This is only a detail container; it is NOT a BOM workflow.
+            BOMItem.objects.create(
+                material_request=reorder_mr,
+                component=component,
+                category=(
+                    getattr(
+                        source_item,
+                        "category",
+                        "",
+                    )
+                    or getattr(
+                        component,
+                        "category",
+                        "",
+                    )
+                    or ""
+                ),
+                specification=(
+                    getattr(
+                        source_item,
+                        "specification",
+                        "",
+                    )
+                    or getattr(
+                        source_item,
+                        "specifications",
+                        "",
+                    )
+                    or getattr(
+                        component,
+                        "specifications",
+                        "",
+                    )
+                    or ""
+                ),
+                quantity=quantity,
+                unit=(
+                    getattr(
+                        source_item,
+                        "unit",
+                        "pc",
+                    )
+                    or "pc"
+                ),
+                unit_price=unit_price,
+                price=price,
+                tax=(
+                    getattr(
+                        source_item,
+                        "tax",
+                        0,
+                    )
+                    or 0
+                ),
+
+                # Do NOT treat these items as coming from In Store.
+                inventory_quantity=0,
+                po_raised_quantity=0,
+                delivered_quantity=0,
+                qc_passed_quantity=0,
+                qc_failed_quantity=0,
+                project_inventory_quantity=0,
+
+                vendor=None,
+
+                # Persist exact selected serials without a new DB field.
+                # MaterialRequestsPage parses this marker for the
+                # dedicated "From Scrap Details" popup.
+                remarks=(
+                    f"FROM_SCRAP_SERIALS:"
+                    f"{'|'.join(serial_numbers)}"
+                    f"\nSOURCE_SCRAP:{scrap_entry.code}"
+                    f"\nSOURCE_MR:"
+                    f"{source_mr.material_request_id}"
+                ),
+            )
+
+        # Keep the existing Manager notification stage.
+        Notification.objects.update_or_create(
+            category="MR",
+            receiver="MANAGER",
+            reference_id=str(
+                reorder_mr.id
+            ),
+            defaults={
+                "title": (
+                    "MR Approval Request - "
+                    f"{reorder_mr.material_request_id}"
+                ),
+                "message": (
+                    f"From Scrap Material Request "
+                    f"{reorder_mr.material_request_id} "
+                    f"requires manager approval."
+                ),
+                "status":
+                    "PENDING_MANAGER",
+                "is_read":
+                    False,
+            },
+        )
+
+        return reorder_mr
+
+
+    @classmethod
+    def send_scrap_reorder_mr_manager_email(
+        cls,
+        material_request_id,
+    ):
+        try:
+            material_request = (
+                MaterialRequest.objects
+                .select_related("requester")
+                .get(pk=material_request_id)
+            )
+        except MaterialRequest.DoesNotExist:
+            return False
+
+        managers = (
+            User.objects
+            .filter(
+                role__iexact="manager",
+                is_active=True,
+            )
+            .exclude(
+                email__isnull=True
+            )
+            .exclude(email="")
+            .order_by("id")
+        )
+
+        requester_name = (
+            material_request.requester_name
+            or "Engineer"
+        )
+
+        sent_any = False
+
+        for manager in managers:
+            sent = send_ipms_email(
+                recipient_email=manager.email,
+                subject=(
+                    f"{material_request.material_request_id} "
+                    f"submitted by {requester_name} "
+                    f"- Approval Required"
+                ),
+                context={
+                    "recipient_name":
+                        cls.get_mail_user_name(
+                            manager,
+                            "Manager",
+                        ),
+                    "message": (
+                        "A new Material Request was "
+                        "automatically created from an "
+                        "approved Engineer Scrap reordering "
+                        "decision and is awaiting your approval."
+                    ),
+                    "table_headers": [
+                        "MR ID",
+                        "Request Type",
+                        "Project",
+                        "Submitted By",
+                        "Required Date",
+                        "Status",
+                    ],
+                    "table_values": [
+                        material_request
+                        .material_request_id,
+                        (
+                            "From Scrap"
+                            if str(
+                                material_request
+                                .request_type
+                                or ""
+                            ).strip().upper()
+                            == "SCRAP"
+                            else material_request
+                            .request_type
+                        ),
+                        material_request
+                        .project,
+                        requester_name,
+                        (
+                            material_request
+                            .required_date
+                            .strftime(
+                                "%d/%m/%Y"
+                            )
+                            if material_request
+                            .required_date
+                            else "-"
+                        ),
+                        "Pending Manager",
+                    ],
+                    "status":
+                        "Pending Manager",
+                    "instruction": (
+                        "Please review the request and "
+                        "take the appropriate action in IPMS."
+                    ),
+                    "button_text":
+                        "Review Request in IPMS",
+                    "action_url": (
+                        f"{cls.get_ipms_base_url()}"
+                        f"/notifications"
+                    ),
+                },
+            )
+
+            if sent:
+                sent_any = True
+
+        return sent_any
+
+    @classmethod
+    def process_engineer_scrap_disposition(
+        cls,
+        *,
+        scrap_entry,
+    ):
+        """
+        Execute the NEW disposition only after final Finance approval
+        and the Engineer clicks Move to Store.
+
+        PARTIAL + YES:
+            Unselected serials go to Scrap.
+            Selected serial quantities create a NEW MR.
+
+        PARTIAL + NO:
+            Unselected serials go to Scrap.
+            Selected serials return to central Inventory.
+
+        TOTAL:
+            Every available issued serial selected in this request is Scrap.
+            No return and no automatic reorder.
+        """
+        metadata = (
+            scrap_entry.inventory_allocations
+            if isinstance(
+                scrap_entry.inventory_allocations,
+                dict,
+            )
+            else {}
+        )
+
+        if (
+            metadata.get("workflow")
+            != "ENGINEER_MR_SCRAP_DISPOSITION_V1"
+        ):
+            return metadata
+
+        if metadata.get(
+            "disposition_processed"
+        ):
+            return metadata
+
+        source_mr = (
+            MaterialRequest.objects
+            .select_for_update()
+            .get(
+                pk=scrap_entry
+                .material_request_id
+            )
+        )
+
+        scrap_mode = str(
+            metadata.get(
+                "scrap_mode",
+                "PARTIAL",
+            )
+        ).strip().upper()
+
+        reorder_choice = str(
+            metadata.get(
+                "reorder_choice",
+                "NONE",
+            )
+        ).strip().upper()
+
+        scrap_items = (
+            metadata.get(
+                "scrap_items",
+                [],
+            )
+            or []
+        )
+
+        return_items = (
+            metadata.get(
+                "return_items",
+                [],
+            )
+            or []
+        )
+
+        reorder_items = (
+            metadata.get(
+                "reorder_items",
+                [],
+            )
+            or []
+        )
+
+        returned_inventory_ids = []
+        reorder_mr = None
+
+        if (
+            scrap_mode == "PARTIAL"
+            and reorder_choice == "NO"
+        ):
+            for item in return_items:
+                inventory_row = (
+                    cls.create_scrap_return_inventory(
+                        source_mr=source_mr,
+                        item=item,
+                    )
+                )
+
+                if inventory_row:
+                    returned_inventory_ids.append(
+                        inventory_row.id
+                    )
+
+        if (
+            scrap_mode == "PARTIAL"
+            and reorder_choice == "YES"
+            and reorder_items
+        ):
+            reorder_mr = (
+                cls.create_scrap_reorder_mr(
+                    scrap_entry=scrap_entry,
+                    source_mr=source_mr,
+                    scrap_items=reorder_items,
+                )
+            )
+
+        metadata["disposition_processed"] = True
+        metadata["processed_at"] = (
+            timezone.now().isoformat()
+        )
+        metadata[
+            "returned_inventory_ids"
+        ] = returned_inventory_ids
+        metadata["replacement_mr_id"] = (
+            reorder_mr.id
+            if reorder_mr
+            else None
+        )
+        metadata[
+            "replacement_mr_number"
+        ] = (
+            reorder_mr.material_request_id
+            if reorder_mr
+            else ""
+        )
+
+        if reorder_mr:
+            transaction.on_commit(
+                lambda mr_id=reorder_mr.id: (
+                    cls.send_scrap_reorder_mr_manager_email(
+                        mr_id
+                    )
+                )
+            )
+
+        return metadata
+
 
     @staticmethod
     def normalize_serials(values):
@@ -2681,15 +3541,15 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
         request,
     ):
         """
-        GET /outward/engineer-scrap/
-            Engineer: own staged Scrap requests.
-            Admin: all Engineer staged Scrap requests.
+        Engineer Scrap flow.
 
-        POST /outward/engineer-scrap/
-            Create a staged Scrap request.
+        MR source supports the new disposition:
+        - ONLY INVENTORY_ISSUED MR
+        - PARTIAL Scrap + Reordering YES/NO
+        - TOTAL Scrap
+        - multi-component / multi-serial Scrap in one approval request
 
-        These rows are intentionally hidden from the normal /outward/
-        list until Move to Inventory is completed.
+        Manager -> Finance approval remains unchanged.
         """
         user = self.require_engineer_or_admin(
             request
@@ -2698,7 +3558,10 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
         if request.method == "GET":
             queryset = (
                 OutwardEntry.objects
-                .select_related("component", "material_request")
+                .select_related(
+                    "component",
+                    "material_request",
+                )
                 .filter(
                     source="ENGINEER",
                     outward_type="SCRAP",
@@ -2727,167 +3590,895 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_200_OK,
             )
 
-        component_id = (
-            request.data.get("component")
-            or request.data.get("component_id")
-        )
-        if not component_id:
-            raise ValidationError({"component": "Select a component."})
-
         out_date = (
             request.data.get("out_date")
             or request.data.get("outDate")
             or request.data.get("date")
         )
+
         if not out_date:
-            raise ValidationError({"out_date": "Select the Scrap date."})
+            raise ValidationError(
+                {
+                    "out_date":
+                        "Select the Scrap date."
+                }
+            )
 
         remarks = str(
-            request.data.get("remarks", request.data.get("reason", "")) or ""
+            request.data.get(
+                "remarks",
+                request.data.get(
+                    "reason",
+                    "",
+                ),
+            )
+            or ""
         ).strip()
+
         if not remarks:
-            raise ValidationError({"remarks": "Enter Scrap remarks."})
+            raise ValidationError(
+                {
+                    "remarks":
+                        "Enter Scrap remarks."
+                }
+            )
 
         scrap_origin = str(
-            request.data.get("scrap_origin", request.data.get("scrapOrigin", "OTHER"))
+            request.data.get(
+                "scrap_origin",
+                request.data.get(
+                    "scrapOrigin",
+                    "OTHER",
+                ),
+            )
             or "OTHER"
         ).strip().upper()
-        if scrap_origin not in {"MR", "OTHER"}:
-            raise ValidationError({"scrap_origin": "Scrap source must be MR or OTHER."})
 
-        requested_serials = self.normalize_serials(
-            request.data.get("serial_numbers")
-            or request.data.get("selected_serials")
-            or request.data.get("serials")
-            or []
-        )
+        if scrap_origin not in {
+            "MR",
+            "OTHER",
+        }:
+            raise ValidationError(
+                {
+                    "scrap_origin":
+                        "Scrap source must be MR or OTHER."
+                }
+            )
+
         mr_reference = (
-            request.data.get("material_request")
-            or request.data.get("material_request_id")
-            or request.data.get("materialRequestId")
-            or request.data.get("mr_id")
+            request.data.get(
+                "material_request"
+            )
+            or request.data.get(
+                "material_request_id"
+            )
+            or request.data.get(
+                "materialRequestId"
+            )
+            or request.data.get(
+                "mr_id"
+            )
         )
-        actor_name = self.get_actor_name(user)
+
+        actor_name = self.get_actor_name(
+            user
+        )
 
         with transaction.atomic():
             material_request = None
+            component_id = None
+            requested_serials = []
+            quantity = 0
+            product_name = ""
+            workflow_metadata = []
+
             if scrap_origin == "MR":
                 if not mr_reference:
-                    raise ValidationError({"material_request": "Select a Material Request."})
-                material_request = self.get_material_request_from_reference(mr_reference, lock=True)
-                if material_request is None:
-                    raise ValidationError({"material_request": "Material Request was not found."})
-                # Do not require the whole MR to be completed.
-                # A partially issued MR/component is valid as soon as the
-                # selected component has exact issued serial number(s).
-                project_rows = self.get_project_rows_for_mr(
-                    material_request,
-                    lock=True,
+                    raise ValidationError(
+                        {
+                            "material_request":
+                                "Select a Material Request."
+                        }
+                    )
+
+                material_request = (
+                    self.get_material_request_from_reference(
+                        mr_reference,
+                        lock=True,
+                    )
                 )
 
-                if not project_rows:
+                if material_request is None:
+                    raise ValidationError(
+                        {
+                            "material_request":
+                                "Material Request was not found."
+                        }
+                    )
+
+                if (
+                    str(
+                        material_request.status
+                        or ""
+                    )
+                    .strip()
+                    .upper()
+                    != "INVENTORY_ISSUED"
+                ):
                     raise ValidationError(
                         {
                             "material_request": (
-                                "This Material Request has no Project "
-                                "Inventory issue records."
+                                "Only an INVENTORY_ISSUED "
+                                "Material Request can be "
+                                "used for Engineer Scrap."
                             )
                         }
                     )
 
-                project_row = next(
-                    (
-                        row
-                        for row in project_rows
-                        if str(
-                            row.component_id
-                        ) == str(
-                            component_id
-                        )
-                    ),
-                    None,
+                component_snapshot = (
+                    self.get_engineer_scrap_component_snapshot(
+                        material_request,
+                        lock=True,
+                    )
                 )
-                if project_row is None:
-                    raise ValidationError({"component": "The selected component does not belong to this Material Request."})
-                issued_serials = self.normalize_serials(
-                    self.normalize_serials(project_row.issued_store_serials)
-                    + self.normalize_serials(project_row.issued_purchased_serials)
-                )
-                if not issued_serials:
+
+                if not component_snapshot:
                     raise ValidationError(
                         {
-                            "serial_numbers": (
-                                "This component has not been issued yet. "
-                                "Only issued or partially issued components "
-                                "with serial numbers can be scrapped."
+                            "material_request": (
+                                "This INVENTORY_ISSUED MR "
+                                "has no issued serials "
+                                "available for Scrap."
                             )
                         }
                     )
-                used_serials = self.get_used_mr_scrap_serials(material_request, lock=True)
-                available = {serial for serial in issued_serials if serial not in used_serials}
-                if not requested_serials:
-                    raise ValidationError({"serial_numbers": "Select at least one serial number."})
-                invalid = [serial for serial in requested_serials if serial not in available]
-                if invalid:
-                    raise ValidationError({"serial_numbers": "One or more selected serial numbers are unavailable: " + ", ".join(invalid)})
-                quantity = len(requested_serials)
-                component = project_row.component
-                code = str(getattr(component, "component_id", "") or "").strip()
-                name = str(getattr(component, "name", "") or "").strip()
-                product_name = " - ".join(v for v in [code, name] if v) or name or code
-            else:
-                try:
-                    quantity = int(request.data.get("quantity", request.data.get("qty", 1)) or 0)
-                except (TypeError, ValueError):
-                    quantity = 0
+
+                snapshot_by_component = {
+                    str(
+                        item["component"]
+                    ): item
+                    for item in component_snapshot
+                }
+
+                scrap_mode = str(
+                    request.data.get(
+                        "scrap_mode",
+                        request.data.get(
+                            "scrapMode",
+                            "PARTIAL",
+                        ),
+                    )
+                    or "PARTIAL"
+                ).strip().upper()
+
+                if scrap_mode not in {
+                    "PARTIAL",
+                    "TOTAL",
+                }:
+                    raise ValidationError(
+                        {
+                            "scrap_mode":
+                                "Scrap type must be PARTIAL or TOTAL."
+                        }
+                    )
+
+                reorder_choice = str(
+                    request.data.get(
+                        "reorder_choice",
+                        request.data.get(
+                            "reorderChoice",
+                            "",
+                        ),
+                    )
+                    or ""
+                ).strip().upper()
+
+                if scrap_mode == "PARTIAL":
+                    if reorder_choice not in {
+                        "YES",
+                        "NO",
+                    }:
+                        raise ValidationError(
+                            {
+                                "reorder_choice": (
+                                    "Select Reordering "
+                                    "Yes or No."
+                                )
+                            }
+                        )
+                else:
+                    reorder_choice = "NONE"
+
+                raw_scrap_items = (
+                    request.data.get(
+                        "scrap_items"
+                    )
+                )
+
+                scrap_items = (
+                    self.normalize_scrap_items(
+                        raw_scrap_items
+                    )
+                )
+
+                # Backward compatibility with old one-component UI.
+                if (
+                    not scrap_items
+                    and request.data.get(
+                        "component"
+                    )
+                ):
+                    fallback_serials = (
+                        self.normalize_serials(
+                            request.data.get(
+                                "serial_numbers"
+                            )
+                            or request.data.get(
+                                "selected_serials"
+                            )
+                            or []
+                        )
+                    )
+
+                    if fallback_serials:
+                        scrap_items = [
+                            {
+                                "component":
+                                    request.data.get(
+                                        "component"
+                                    ),
+                                "serial_numbers":
+                                    fallback_serials,
+                                "quantity":
+                                    len(
+                                        fallback_serials
+                                    ),
+                            }
+                        ]
+
+                if scrap_mode == "TOTAL":
+                    scrap_items = [
+                        {
+                            "component":
+                                item["component"],
+                            "serial_numbers":
+                                list(
+                                    item[
+                                        "available_serials"
+                                    ]
+                                ),
+                            "quantity":
+                                len(
+                                    item[
+                                        "available_serials"
+                                    ]
+                                ),
+                        }
+                        for item in component_snapshot
+                        if item.get(
+                            "available_serials"
+                        )
+                    ]
+
+                if not scrap_items:
+                    raise ValidationError(
+                        {
+                            "serial_numbers":
+                                "Select at least one issued serial number."
+                        }
+                    )
+
+                validated_scrap_items = []
+                selected_serial_set = set()
+
+                for raw_item in scrap_items:
+                    key = str(
+                        raw_item.get(
+                            "component"
+                        )
+                    )
+
+                    snapshot = (
+                        snapshot_by_component
+                        .get(key)
+                    )
+
+                    if snapshot is None:
+                        raise ValidationError(
+                            {
+                                "component": (
+                                    "One selected component "
+                                    "does not belong to this "
+                                    "INVENTORY_ISSUED MR."
+                                )
+                            }
+                        )
+
+                    serials = (
+                        self.normalize_serials(
+                            raw_item.get(
+                                "serial_numbers"
+                            )
+                            or []
+                        )
+                    )
+
+                    available = set(
+                        snapshot.get(
+                            "available_serials",
+                            [],
+                        )
+                        or []
+                    )
+
+                    invalid = [
+                        serial
+                        for serial in serials
+                        if serial not in available
+                    ]
+
+                    if invalid:
+                        raise ValidationError(
+                            {
+                                "serial_numbers": (
+                                    "One or more selected "
+                                    "serial numbers are "
+                                    "unavailable: "
+                                    + ", ".join(
+                                        invalid
+                                    )
+                                )
+                            }
+                        )
+
+                    for serial in serials:
+                        if serial in selected_serial_set:
+                            raise ValidationError(
+                                {
+                                    "serial_numbers":
+                                        f"Duplicate selected serial: {serial}"
+                                }
+                            )
+
+                        selected_serial_set.add(
+                            serial
+                        )
+
+                    if not serials:
+                        continue
+
+                    validated_scrap_items.append(
+                        {
+                            "component":
+                                snapshot[
+                                    "component"
+                                ],
+                            "component_code":
+                                snapshot[
+                                    "component_code"
+                                ],
+                            "component_name":
+                                snapshot[
+                                    "component_name"
+                                ],
+                            "label":
+                                snapshot[
+                                    "label"
+                                ],
+                            "serial_numbers":
+                                serials,
+                            "quantity":
+                                len(serials),
+                        }
+                    )
+
+                if not validated_scrap_items:
+                    raise ValidationError(
+                        {
+                            "serial_numbers":
+                                "Select at least one issued serial number."
+                        }
+                    )
+
+                all_available_items = [
+                    {
+                        "component":
+                            item[
+                                "component"
+                            ],
+                        "component_code":
+                            item[
+                                "component_code"
+                            ],
+                        "component_name":
+                            item[
+                                "component_name"
+                            ],
+                        "label":
+                            item[
+                                "label"
+                            ],
+                        "serial_numbers":
+                            list(
+                                item[
+                                    "available_serials"
+                                ]
+                            ),
+                        "quantity":
+                            len(
+                                item[
+                                    "available_serials"
+                                ]
+                            ),
+                    }
+                    for item in component_snapshot
+                ]
+
+                scrap_by_component = {
+                    str(
+                        item["component"]
+                    ): set(
+                        item[
+                            "serial_numbers"
+                        ]
+                    )
+                    for item in validated_scrap_items
+                }
+
+                # -------------------------------------------------
+                # FINAL Scrap disposition rule
+                # -------------------------------------------------
+                # PARTIAL:
+                #   SELECTED serials are the usable/action serials.
+                #
+                #   Reordering YES:
+                #       selected   -> NEW MR
+                #       unselected -> SCRAP
+                #
+                #   Reordering NO:
+                #       selected   -> INVENTORY / IN STORE
+                #       unselected -> SCRAP
+                #
+                # TOTAL:
+                #       all available serials -> SCRAP
+                # -------------------------------------------------
+
+                selected_items = (
+                    validated_scrap_items
+                )
+
+                selected_by_component = {
+                    str(
+                        item["component"]
+                    ): set(
+                        item[
+                            "serial_numbers"
+                        ]
+                    )
+                    for item in selected_items
+                }
+
+                scrap_items = []
+                return_items = []
+                reorder_items = []
+
+                if scrap_mode == "TOTAL":
+                    scrap_items = (
+                        all_available_items
+                    )
+                else:
+                    # Unselected serials are ALWAYS Scrap.
+                    for item in all_available_items:
+                        selected_serials = (
+                            selected_by_component
+                            .get(
+                                str(
+                                    item[
+                                        "component"
+                                    ]
+                                ),
+                                set(),
+                            )
+                        )
+
+                        unselected_serials = [
+                            serial
+                            for serial in item[
+                                "serial_numbers"
+                            ]
+                            if serial
+                            not in selected_serials
+                        ]
+
+                        if unselected_serials:
+                            scrap_items.append(
+                                {
+                                    "component":
+                                        item[
+                                            "component"
+                                        ],
+                                    "component_code":
+                                        item[
+                                            "component_code"
+                                        ],
+                                    "component_name":
+                                        item[
+                                            "component_name"
+                                        ],
+                                    "label":
+                                        item[
+                                            "label"
+                                        ],
+                                    "serial_numbers":
+                                        unselected_serials,
+                                    "quantity":
+                                        len(
+                                            unselected_serials
+                                        ),
+                                }
+                            )
+
+                    if reorder_choice == "YES":
+                        # Selected serial quantities recreate a NEW MR.
+                        reorder_items = [
+                            {
+                                **item,
+                                "serial_numbers":
+                                    list(
+                                        item[
+                                            "serial_numbers"
+                                        ]
+                                    ),
+                                "quantity":
+                                    len(
+                                        item[
+                                            "serial_numbers"
+                                        ]
+                                    ),
+                            }
+                            for item in selected_items
+                        ]
+                    elif reorder_choice == "NO":
+                        # Selected serials return to central Inventory.
+                        return_items = [
+                            {
+                                **item,
+                                "serial_numbers":
+                                    list(
+                                        item[
+                                            "serial_numbers"
+                                        ]
+                                    ),
+                                "quantity":
+                                    len(
+                                        item[
+                                            "serial_numbers"
+                                        ]
+                                    ),
+                            }
+                            for item in selected_items
+                        ]
+
+                requested_serials = [
+                    serial
+                    for item in scrap_items
+                    for serial in (
+                        item.get(
+                            "serial_numbers",
+                            [],
+                        )
+                        or []
+                    )
+                ]
+
+                quantity = len(
+                    requested_serials
+                )
+
                 if quantity <= 0:
-                    raise ValidationError({"quantity": "Quantity must be greater than zero."})
+                    raise ValidationError(
+                        {
+                            "quantity":
+                                "Scrap quantity must be greater than zero."
+                        }
+                    )
+
+                unique_component_ids = {
+                    str(
+                        item["component"]
+                    )
+                    for item
+                    in scrap_items
+                }
+
+                if (
+                    len(
+                        unique_component_ids
+                    )
+                    == 1
+                    and scrap_items
+                ):
+                    component_id = (
+                        scrap_items[
+                            0
+                        ]["component"]
+                    )
+
+                    product_name = (
+                        scrap_items[
+                            0
+                        ]["label"]
+                    )
+                else:
+                    component_id = None
+                    product_name = (
+                        f"{quantity} Scrap item(s) "
+                        f"from "
+                        f"{material_request.material_request_id}"
+                    )
+
+                workflow_metadata = {
+                    "workflow":
+                        "ENGINEER_MR_SCRAP_DISPOSITION_V1",
+                    "scrap_mode":
+                        scrap_mode,
+                    "reorder_choice":
+                        reorder_choice,
+                    "source_mr_id":
+                        material_request.id,
+                    "source_mr_number":
+                        material_request
+                        .material_request_id,
+                    # Selected serials are the Engineer's usable/action selection.
+                    "selected_items":
+                        selected_items,
+
+                    # Unselected serials are the actual Scrap items.
+                    "scrap_items":
+                        scrap_items,
+
+                    # Selected serials returned to Inventory when Reordering = NO.
+                    "return_items":
+                        return_items,
+
+                    # Selected serial quantities used to create the NEW MR when
+                    # Reordering = YES.
+                    "reorder_items":
+                        reorder_items,
+
+                    "all_available_items":
+                        all_available_items,
+
+                    "selected_quantity":
+                        sum(
+                            item[
+                                "quantity"
+                            ]
+                            for item
+                            in selected_items
+                        ),
+
+                    "scrap_quantity":
+                        quantity,
+
+                    "return_quantity":
+                        sum(
+                            item[
+                                "quantity"
+                            ]
+                            for item
+                            in return_items
+                        ),
+
+                    "reorder_quantity":
+                        sum(
+                            item[
+                                "quantity"
+                            ]
+                            for item
+                            in reorder_items
+                        ),
+                    "disposition_processed":
+                        False,
+                    "replacement_mr_id":
+                        None,
+                    "replacement_mr_number":
+                        "",
+                    "returned_inventory_ids":
+                        [],
+                }
+            else:
+                component_id = (
+                    request.data.get(
+                        "component"
+                    )
+                    or request.data.get(
+                        "component_id"
+                    )
+                )
+
+                if not component_id:
+                    raise ValidationError(
+                        {
+                            "component":
+                                "Select a component."
+                        }
+                    )
+
+                try:
+                    quantity = int(
+                        request.data.get(
+                            "quantity",
+                            request.data.get(
+                                "qty",
+                                1,
+                            ),
+                        )
+                        or 0
+                    )
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    quantity = 0
+
+                if quantity <= 0:
+                    raise ValidationError(
+                        {
+                            "quantity":
+                                "Quantity must be greater than zero."
+                        }
+                    )
+
                 requested_serials = []
-                product_name = str(request.data.get("product_name", request.data.get("productName", "")) or "").strip()
+
+                product_name = str(
+                    request.data.get(
+                        "product_name",
+                        request.data.get(
+                            "productName",
+                            "",
+                        ),
+                    )
+                    or ""
+                ).strip()
 
             payload = {
-                "outward_type": "SCRAP",
-                "item_type": "COMPONENT",
-                "out_date": out_date,
-                "component": component_id,
-                "quantity": quantity,
-                "serial_numbers": requested_serials,
-                "remarks": remarks,
-                "product_name": product_name,
+                "outward_type":
+                    "SCRAP",
+                "item_type":
+                    "COMPONENT",
+                "out_date":
+                    out_date,
+                "component":
+                    component_id,
+                "quantity":
+                    quantity,
+                "serial_numbers":
+                    requested_serials,
+                "remarks":
+                    remarks,
+                "product_name":
+                    product_name,
             }
-            serializer = self.get_serializer(data=payload)
-            serializer.is_valid(raise_exception=True)
-            instance = self.save_stock_aware_entry(serializer)
+
+            serializer = self.get_serializer(
+                data=payload
+            )
+
+            serializer.is_valid(
+                raise_exception=True
+            )
+
+            instance = (
+                self.save_stock_aware_entry(
+                    serializer
+                )
+            )
+
             component = instance.component
-            if component is not None and not str(instance.product_name or "").strip():
-                code = str(getattr(component, "component_id", "") or "").strip()
-                name = str(getattr(component, "name", "") or "").strip()
-                instance.product_name = " - ".join(v for v in [code, name] if v) or name or code
+
+            if (
+                component is not None
+                and not str(
+                    instance.product_name
+                    or ""
+                ).strip()
+            ):
+                code = str(
+                    getattr(
+                        component,
+                        "component_id",
+                        "",
+                    )
+                    or ""
+                ).strip()
+
+                name = str(
+                    getattr(
+                        component,
+                        "name",
+                        "",
+                    )
+                    or ""
+                ).strip()
+
+                instance.product_name = (
+                    " - ".join(
+                        value
+                        for value in [
+                            code,
+                            name,
+                        ]
+                        if value
+                    )
+                    or name
+                    or code
+                )
+
             instance.source = "ENGINEER"
-            instance.scrap_origin = scrap_origin
-            instance.material_request = material_request
-            instance.requested_by = actor_name
-            instance.requested_by_user_id = user.pk
-            instance.moved_to_inventory = False
+            instance.scrap_origin = (
+                scrap_origin
+            )
+            instance.material_request = (
+                material_request
+            )
+            instance.requested_by = (
+                actor_name
+            )
+            instance.requested_by_user_id = (
+                user.pk
+            )
+            instance.moved_to_inventory = (
+                False
+            )
             instance.moved_at = None
-            instance.approval_status = "PENDING_MANAGER"
-            instance.status = "PENDING_MANAGER"
-            instance.save(update_fields=[
-                "product_name", "serial_numbers", "source", "scrap_origin",
-                "material_request", "requested_by", "requested_by_user_id",
-                "moved_to_inventory", "moved_at", "approval_status", "status", "updated_at",
-            ])
-            # Backend-owned Manager-first notification + approval email.
-            # requested_by/requested_by_user_id were already set above,
-            # so the later Approved/Rejected return mail goes to this
-            # exact Engineer.
+            instance.approval_status = (
+                "PENDING_MANAGER"
+            )
+            instance.status = (
+                "PENDING_MANAGER"
+            )
+
+            if (
+                scrap_origin == "MR"
+                and isinstance(
+                    workflow_metadata,
+                    dict,
+                )
+            ):
+                instance.inventory_allocations = (
+                    workflow_metadata
+                )
+
+            instance.save(
+                update_fields=[
+                    "product_name",
+                    "serial_numbers",
+                    "inventory_allocations",
+                    "source",
+                    "scrap_origin",
+                    "material_request",
+                    "requested_by",
+                    "requested_by_user_id",
+                    "moved_to_inventory",
+                    "moved_at",
+                    "approval_status",
+                    "status",
+                    "updated_at",
+                ]
+            )
+
+            # Existing Manager -> Finance Scrap notification flow is unchanged.
             self.register_new_scrap_workflow(
                 instance,
                 user,
             )
 
         return Response(
-            self.get_serializer(instance).data,
+            self.get_serializer(
+                instance
+            ).data,
             status=status.HTTP_201_CREATED,
         )
 
@@ -3305,6 +4896,31 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                     }
                 )
 
+            # Execute the new MR Scrap disposition ONLY NOW:
+            # Finance has approved and Engineer clicked Move to Store.
+            #
+            # This means merely opening/submitting the Scrap popup does not
+            # move good components, create a reorder MR, or finalize Scrap.
+            metadata = (
+                self.process_engineer_scrap_disposition(
+                    scrap_entry=instance,
+                )
+            )
+
+            instance.inventory_allocations = (
+                metadata
+            )
+
+            instance.stock_restored = bool(
+                isinstance(
+                    metadata,
+                    dict,
+                )
+                and metadata.get(
+                    "returned_inventory_ids"
+                )
+            )
+
             instance.moved_to_inventory = (
                 True
             )
@@ -3322,6 +4938,8 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
 
             instance.save(
                 update_fields=[
+                    "inventory_allocations",
+                    "stock_restored",
                     "moved_to_inventory",
                     "moved_at",
                     "approval_status",

@@ -257,6 +257,14 @@ class PurchaseOrderItem(models.Model):
         blank=True,
     )
 
+    # Each component in one Purchase Order can have its own delivery date.
+    # This is especially required when Procurement combines multiple
+    # same-vendor MR components into a single PO.
+    expected_delivery_date = models.DateField(
+        null=True,
+        blank=True,
+    )
+
     @property
     def remaining_quantity(self):
         return max(self.quantity - self.received_quantity, 0)
