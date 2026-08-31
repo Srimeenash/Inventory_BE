@@ -287,7 +287,13 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # EMAIL / ZOHO SMTP
 # ---------------------------------------------------------------------
 
-EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+# ---------------------------------------------------------------------
+# EMAIL / ZOHO SMTP
+# ---------------------------------------------------------------------
+EMAIL_BACKEND = os.environ.get(
+    "EMAIL_BACKEND",
+    "django.core.mail.backends.smtp.EmailBackend",
+)
 
 EMAIL_HOST = os.environ.get(
     "EMAIL_HOST",
@@ -327,10 +333,18 @@ EMAIL_HOST_PASSWORD = os.environ.get(
     "",
 )
 
+EMAIL_TIMEOUT = int(
+    os.environ.get(
+        "EMAIL_TIMEOUT",
+        "20",
+    )
+)
+
 DEFAULT_FROM_EMAIL = os.environ.get(
     "DEFAULT_FROM_EMAIL",
     EMAIL_HOST_USER,
 )
+
 
 IPMS_BASE_URL = os.environ.get(
     "IPMS_BASE_URL",

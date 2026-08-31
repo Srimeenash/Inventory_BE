@@ -70,9 +70,14 @@ class NotificationViewSet(viewsets.ModelViewSet):
         notification before Finance approval.
 
         Scrap workflow authority lives in outward/views.py:
-            Scrap create       -> FINANCE notification
-            Finance approve    -> MANAGER notification
-            Manager decision   -> exact creator notification
+            Scrap / QC Failed  -> MANAGER notification
+            Manager reject     -> STOP
+            Manager approve    -> FINANCE notification
+            Finance reject     -> STOP
+            Finance approve    -> final Scrap / approved Restore path
+
+        The frontend must never create a Finance Scrap notification before
+        Manager approval.
         """
         category = self.normalize_upper(
             serializer.validated_data.get("category")
@@ -88,7 +93,10 @@ class NotificationViewSet(viewsets.ModelViewSet):
             or ""
         ).strip()
 
-        # HARD GUARD AGAINST OLD FRONTEND MANAGER-FIRST SCRAP CREATION.
+        # HARD GUARD:
+        # Manager is the FIRST Scrap / Return-QC approval stage.
+        # This prevents stale/invalid Manager notifications for records that
+        # have already moved past PENDING_MANAGER.
         if category == "SCRAP" and receiver == "MANAGER":
             if notification_status != "PENDING_MANAGER":
                 raise ValidationError(
@@ -155,8 +163,8 @@ class NotificationViewSet(viewsets.ModelViewSet):
                 raise ValidationError(
                     {
                         "detail": (
-                            "Manager Scrap notification is blocked until "
-                            "Finance approves the Scrap. "
+                            "Manager Scrap notification is allowed only while "
+                            "the Scrap/QC-Failed record is PENDING_MANAGER. "
                             f"Current state: {current or 'UNKNOWN'}."
                         )
                     }

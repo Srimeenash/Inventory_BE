@@ -15,6 +15,7 @@ from inventory.models import (
     InventoryReservation,
     ProjectInventory,
 )
+from inventory.views import ProjectInventoryViewSet
 from notifications.email_service import send_ipms_email
 from notifications.models import Notification
 from procurement.models import (
@@ -72,14 +73,11 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
         material_request,
     ):
         """
-        Detect both NEW and already-created legacy derived Scrap MRs.
+        Detect only the retired SCRAP_ONLY workflow.
 
-        New records:
-            request_type = SCRAP
-
-        Legacy records from the previous implementation can still have
-        request_type = BOM/R&D but their remarks identify that they were
-        automatically recreated from Scrap.
+        New rebuild MRs preserve BOM/Custom BOM/R&D and must use the normal
+        In Store + Procurement split. They are identified for display through
+        their FROM_SCRAP metadata, not routed through this legacy shortcut.
         """
         request_type = str(
             getattr(
@@ -90,38 +88,50 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
             or ""
         ).strip().upper()
 
-        if request_type == "SCRAP":
-            return True
+        return request_type == "SCRAP_ONLY"
 
-        remarks = str(
-            getattr(
-                material_request,
-                "remarks",
-                "",
-            )
-            or ""
-        ).strip().lower()
 
+    @staticmethod
+    def is_retail_sales_request(material_request):
         return (
-            "automatically recreated from scrap"
-            in remarks
-            or "automatically created from scrap"
-            in remarks
-            or "from scrap "
-            in remarks
+            str(
+                getattr(
+                    material_request,
+                    "request_type",
+                    "",
+                )
+                or ""
+            )
+            .strip()
+            .upper()
+            == "RETAIL_SALES"
         )
-
 
     def get_request_items(self, material_request, *, lock=False):
         request_type = str(
             material_request.request_type or ""
         ).strip().upper()
 
-        manager = (
-            material_request.rd_items
-            if request_type in {"R&D", "RD"}
-            else material_request.bom_items
-        )
+        if request_type in {"R&D", "RD"}:
+            manager = material_request.rd_items
+        elif request_type in {"RETAIL_SALES", "RETURNABLE"}:
+            # Retail Sales / Returnable use the general request_items
+            # relation sent by the New Material Request page.
+            manager = getattr(
+                material_request,
+                "request_items",
+                None,
+            )
+            if manager is None:
+                raise ValidationError(
+                    {
+                        "items": [
+                            "This request type requires the request_items relation."
+                        ]
+                    }
+                )
+        else:
+            manager = material_request.bom_items
 
         queryset = manager.all().order_by("id")
 
@@ -1104,6 +1114,155 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
         return sent_any
 
 
+    def send_retail_sales_inventory_completed_email(
+        self,
+        material_request_id,
+    ):
+        """
+        Inform Inventory after a fully available Retail Sales MR is
+        automatically issued on Manager approval. This is informational
+        only; Inventory has no further issue action to perform.
+        """
+        try:
+            material_request = (
+                MaterialRequest.objects
+                .select_related("requester")
+                .get(pk=material_request_id)
+            )
+        except MaterialRequest.DoesNotExist:
+            return False
+
+        project_rows = list(
+            ProjectInventory.objects
+            .select_related("component")
+            .filter(material_request=material_request)
+            .order_by("id")
+        )
+
+        if not project_rows:
+            return False
+
+        inventory_users = (
+            User.objects
+            .filter(
+                role__iexact="inventory",
+                is_active=True,
+            )
+            .exclude(email__isnull=True)
+            .exclude(email="")
+            .order_by("id")
+        )
+
+        if not inventory_users.exists():
+            return False
+
+        requester_name = (
+            material_request.requester_name
+            or self.get_user_display_name(
+                material_request.requester,
+                "User",
+            )
+        )
+
+        component_lines = []
+        total_issued = 0
+
+        for project_row in project_rows:
+            issued_quantity = max(
+                int(
+                    project_row.issued_store_quantity
+                    or 0
+                )
+                + int(
+                    project_row.issued_purchased_quantity
+                    or 0
+                ),
+                0,
+            )
+
+            total_issued += issued_quantity
+
+            component_code, component_name = (
+                self.get_component_identity(
+                    project_row.component
+                )
+            )
+
+            component_lines.append(
+                (
+                    f"{component_code} {component_name} - "
+                    f"Issued: {issued_quantity}"
+                ).strip()
+            )
+
+        component_summary = "; ".join(
+            component_lines
+        )
+
+        subject = (
+            f"{material_request.material_request_id} "
+            "Retail Sales issued - In Drone"
+        )
+
+        action_url = (
+            f"{self.get_ipms_base_url()}"
+            f"/inventory-notifications"
+        )
+
+        sent_any = False
+
+        for inventory_user in inventory_users:
+            sent = send_ipms_email(
+                recipient_email=inventory_user.email,
+                subject=subject,
+                context={
+                    "recipient_name": (
+                        self.get_user_display_name(
+                            inventory_user,
+                            "Inventory",
+                        )
+                    ),
+                    "message": (
+                        f"Retail Sales Material Request "
+                        f"{material_request.material_request_id} "
+                        "was approved by Manager. All requested "
+                        "components were available in In Store and "
+                        "were automatically issued. The request is "
+                        "now visible in Inventory → In Drone."
+                    ),
+                    "table_headers": [
+                        "MR ID",
+                        "Requested By",
+                        "Issued Qty",
+                        "Components",
+                        "Status",
+                    ],
+                    "table_values": [
+                        material_request.material_request_id,
+                        requester_name,
+                        total_issued,
+                        component_summary,
+                        "Retail Sales - In Drone",
+                    ],
+                    "status": "Inventory Issued",
+                    "instruction": (
+                        "No Inventory issue action is required. "
+                        "Open Inventory Notifications to review the "
+                        "completed Retail Sales issue."
+                    ),
+                    "button_text": (
+                        "Open Inventory Notifications"
+                    ),
+                    "action_url": action_url,
+                },
+            )
+
+            if sent:
+                sent_any = True
+
+        return sent_any
+
+
     def create_manager_notification(self, material_request):
         self.upsert_notification(
             material_request,
@@ -1121,9 +1280,158 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
             is_read=False,
         )
 
+    def auto_issue_fully_available_retail_sales(
+        self,
+        material_request,
+        allocations,
+    ):
+        """
+        Immediately issue a fully In-Store Retail Sales request.
+
+        This method runs inside the Manager approval transaction. The stock
+        was already reserved by reserve_request_components(), so each
+        allocation must have zero shortage before this method is called.
+        Exact serials are deducted through the existing ProjectInventory
+        STORE issue path so Inventory, reservation and ProjectInventory stay
+        synchronized.
+        """
+        if not self.is_retail_sales_request(material_request):
+            return False
+
+        if not allocations:
+            raise ValidationError(
+                {
+                    "items": [
+                        "Retail Sales has no valid components to issue."
+                    ]
+                }
+            )
+
+        for allocation in allocations:
+            required_quantity = max(
+                int(
+                    allocation.get(
+                        "required_quantity",
+                        0,
+                    )
+                    or 0
+                ),
+                0,
+            )
+            reserved_quantity = max(
+                int(
+                    allocation.get(
+                        "reserved_store_quantity",
+                        0,
+                    )
+                    or 0
+                ),
+                0,
+            )
+            shortage_quantity = max(
+                int(
+                    allocation.get(
+                        "shortage_quantity",
+                        0,
+                    )
+                    or 0
+                ),
+                0,
+            )
+
+            if (
+                required_quantity <= 0
+                or shortage_quantity > 0
+                or reserved_quantity < required_quantity
+            ):
+                return False
+
+            project_row = (
+                ProjectInventory.objects
+                .select_for_update()
+                .get(
+                    material_request=material_request,
+                    component_id=allocation["component_id"],
+                )
+            )
+
+            # issue_store_quantity() performs FIFO serial deduction from
+            # Inventory and synchronizes both ProjectInventory and the
+            # corresponding InventoryReservation. Passing None issues the
+            # complete remaining reserved Store quantity.
+            ProjectInventoryViewSet.issue_store_quantity(
+                project_row,
+                None,
+            )
+            project_row.save()
+
+        project_rows = list(
+            ProjectInventory.objects
+            .select_for_update()
+            .filter(material_request=material_request)
+            .order_by("id")
+        )
+
+        if not project_rows or not all(
+            row.is_fulfilled
+            for row in project_rows
+        ):
+            raise ValidationError(
+                {
+                    "detail": (
+                        "Retail Sales automatic In-Store issue did not "
+                        "fully complete every requested component."
+                    )
+                }
+            )
+
+        # In Drone already treats INVENTORY_ISSUED as a completed issue.
+        # No Inventory/Procurement action is required for this Retail Sale.
+        material_request.status = "INVENTORY_ISSUED"
+        material_request.po_raised = False
+        material_request.save(
+            update_fields=[
+                "status",
+                "approval_status",
+                "po_raised",
+            ]
+        )
+
+        # Retail Sales is already physically issued, so Procurement has
+        # no work. Inventory still receives an informational completed
+        # notification and email so the movement into In Drone is visible.
+        Notification.objects.filter(
+            category="MR",
+            reference_id=str(material_request.id),
+            receiver="PROCUREMENT",
+        ).delete()
+
+        self.upsert_notification(
+            material_request,
+            receiver="INVENTORY",
+            title=(
+                "Retail Sales Ready in In Drone - "
+                f"{material_request.material_request_id}"
+            ),
+            message=(
+                f"Manager approved Retail Sales "
+                f"{material_request.material_request_id}. "
+                "All requested components were available in In Store "
+                "and were automatically issued. The completed request "
+                "is now visible in Inventory → In Drone. No Inventory "
+                "issue action is required."
+            ),
+            notification_status="INVENTORY_ISSUED",
+            is_read=False,
+        )
+
+        return True
+
     def route_after_manager_approval(
         self,
         material_request,
+        *,
+        approval_source="MANAGER",
     ):
         """
         Reserve existing stock and route the Material Request source-wise.
@@ -1209,6 +1517,14 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
 
             return
 
+        approval_source = str(approval_source or "MANAGER").strip().upper()
+        is_finance_approved_scrap_rebuild = approval_source == "FINANCE"
+        approval_message = (
+            "Finance-approved From Scrap rebuild"
+            if is_finance_approved_scrap_rebuild
+            else "Manager approved"
+        )
+
         allocations, shortages = (
             self.reserve_request_components(
                 material_request
@@ -1227,8 +1543,23 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
         )
 
         material_request.approval_status = (
-            "MANAGER_APPROVED"
+            "FINANCE_APPROVED"
+            if is_finance_approved_scrap_rebuild
+            else "MANAGER_APPROVED"
         )
+
+        # ----------------------------------------------------------
+        # RETAIL SALES USES THE NORMAL MATERIAL REQUEST FLOW
+        # ----------------------------------------------------------
+        # Do NOT auto-issue Retail Sales at Manager approval.
+        # Retail Sales follows the same stock routing as BOM / R&D /
+        # component-based Returnable:
+        #   Manager approval
+        #       -> available In-Store qty => Inventory issue
+        #       -> shortage => Procurement / PO / Inward / QC
+        #       -> after full Inventory issue => In Drone
+        #       -> Finance can then choose Sales
+        #       -> Management approval => Outward Sales approved.
 
         # ----------------------------------------------------------
         # Source-wise split.
@@ -1306,7 +1637,7 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
                     f"{material_request.material_request_id}"
                 ),
                 message=(
-                    f"Manager approved "
+                    f"{approval_message} "
                     f"{material_request.material_request_id}. "
                     f"{total_store_ready} unit(s) are reserved "
                     f"and ready to issue from In Store: "
@@ -1365,7 +1696,7 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
                     f"{material_request.material_request_id}"
                 ),
                 message=(
-                    f"Manager approved "
+                    f"{approval_message} "
                     f"{material_request.material_request_id}. "
                     f"Raise Purchase Order only for the "
                     f"{total_shortage} unit(s) still short: "
@@ -1620,7 +1951,25 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
                 .exists()
             )
 
-            if has_inventory_allocation:
+            retail_sales_auto_issued = (
+                self.is_retail_sales_request(
+                    material_request
+                )
+                and str(
+                    material_request.status or ""
+                ).strip().upper()
+                == "INVENTORY_ISSUED"
+            )
+
+            if retail_sales_auto_issued:
+                transaction.on_commit(
+                    lambda mr_id=material_request.id: (
+                        self.send_retail_sales_inventory_completed_email(
+                            mr_id
+                        )
+                    )
+                )
+            elif has_inventory_allocation:
                 transaction.on_commit(
                     lambda mr_id=material_request.id: (
                         self.send_inventory_required_email(

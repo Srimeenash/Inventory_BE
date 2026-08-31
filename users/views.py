@@ -907,20 +907,20 @@ class LoginResendView(APIView):
 
 class SwitchRoleView(APIView):
     """
-    Re-authenticate the currently logged-in user before entering
-    another role assigned by Admin.
+    Switch the currently authenticated IPMS session to another role
+    already assigned to the same user.
 
     IMPORTANT:
-    - This does NOT log the user out.
-    - The existing session remains active until verification succeeds.
-    - A fresh JWT pair is issued only after the same user's email,
-      password and requested role are verified.
+    - No email is required.
+    - No password is required.
+    - No OTP / mail verification is required.
+    - The user must already be authenticated with a valid JWT.
+    - The requested role must already be assigned to request.user.
+    - A fresh JWT pair is issued with the selected active_role.
 
     POST body:
         {
-            "role": "procurement",
-            "email": "user@company.com",
-            "password": "current-password"
+            "role": "procurement"
         }
     """
 
@@ -945,18 +945,6 @@ class SwitchRoleView(APIView):
             or ""
         ).strip().lower()
 
-        email = str(
-            request.data.get(
-                "email",
-                "",
-            )
-            or ""
-        ).strip().lower()
-
-        password = request.data.get(
-            "password"
-        )
-
         if not requested_role:
             return Response(
                 {
@@ -968,29 +956,21 @@ class SwitchRoleView(APIView):
                 ),
             )
 
-        if not email:
-            return Response(
-                {
-                    "detail":
-                        "Email is required."
-                },
-                status=(
-                    status.HTTP_400_BAD_REQUEST
-                ),
-            )
-
-        if not password:
-            return Response(
-                {
-                    "detail":
-                        "Password is required."
-                },
-                status=(
-                    status.HTTP_400_BAD_REQUEST
-                ),
-            )
-
         current_user = request.user
+
+        if not (
+            current_user
+            and current_user.is_authenticated
+        ):
+            return Response(
+                {
+                    "detail":
+                        "Authentication is required."
+                },
+                status=(
+                    status.HTTP_401_UNAUTHORIZED
+                ),
+            )
 
         if not current_user.is_active:
             return Response(
@@ -1000,35 +980,6 @@ class SwitchRoleView(APIView):
                 },
                 status=(
                     status.HTTP_403_FORBIDDEN
-                ),
-            )
-
-        current_email = str(
-            current_user.email
-            or ""
-        ).strip().lower()
-
-        if email != current_email:
-            return Response(
-                {
-                    "detail":
-                        "Incorrect email or password."
-                },
-                status=(
-                    status.HTTP_400_BAD_REQUEST
-                ),
-            )
-
-        if not current_user.check_password(
-            password
-        ):
-            return Response(
-                {
-                    "detail":
-                        "Incorrect email or password."
-                },
-                status=(
-                    status.HTTP_400_BAD_REQUEST
                 ),
             )
 
@@ -1042,26 +993,35 @@ class SwitchRoleView(APIView):
                     "detail": (
                         "You do not have access "
                         "to this role."
-                    )
+                    ),
+                    "allowed_roles": allowed_roles,
                 },
                 status=(
                     status.HTTP_403_FORBIDDEN
                 ),
             )
 
+        # Issue a fresh JWT pair containing the selected active_role.
         payload = token_response_for_user(
             current_user,
             request,
             active_role=requested_role,
         )
 
-        payload[
-            "verification_required"
-        ] = False
+        if not payload:
+            return Response(
+                {
+                    "detail":
+                        "Unable to create the role session."
+                },
+                status=(
+                    status.HTTP_500_INTERNAL_SERVER_ERROR
+                ),
+            )
 
-        payload[
-            "role_reauthenticated"
-        ] = True
+        payload["verification_required"] = False
+        payload["role_switched"] = True
+        payload["active_role"] = requested_role
 
         return Response(
             payload,

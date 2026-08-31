@@ -7,7 +7,7 @@ from inventory.models import (
     InventoryReservation,
 )
 
-from .models import BOMItem, MaterialRequest, RDItem
+from .models import BOMItem, MaterialRequest, RDItem, RequestItem
 
 
 class ReservationFieldsMixin:
@@ -523,6 +523,55 @@ class RDItemSerializer(
         )
 
 
+
+
+class RequestItemSerializer(
+    ReservationFieldsMixin,
+    serializers.ModelSerializer,
+):
+    material_request = serializers.PrimaryKeyRelatedField(read_only=True)
+    component_code = serializers.CharField(
+        source="component.component_id",
+        read_only=True,
+        default="",
+    )
+    component_name = serializers.CharField(
+        source="component.name",
+        read_only=True,
+        default="",
+    )
+    available_inventory_quantity = serializers.SerializerMethodField()
+    physical_inventory_quantity = serializers.SerializerMethodField()
+    reserved_by_other_mrs = serializers.SerializerMethodField()
+    reserved_by_other_mr_details = serializers.SerializerMethodField()
+    reserved_store_quantity = serializers.SerializerMethodField()
+    procurement_shortage_quantity = serializers.SerializerMethodField()
+    issued_store_quantity = serializers.SerializerMethodField()
+    remaining_reserved_quantity = serializers.SerializerMethodField()
+    reservation_status = serializers.SerializerMethodField()
+
+    class Meta:
+        model = RequestItem
+        fields = "__all__"
+        read_only_fields = (
+            "material_request",
+            "inventory_quantity",
+            "available_inventory_quantity",
+            "physical_inventory_quantity",
+            "reserved_by_other_mrs",
+            "reserved_by_other_mr_details",
+            "po_raised_quantity",
+            "delivered_quantity",
+            "qc_passed_quantity",
+            "qc_failed_quantity",
+            "project_inventory_quantity",
+            "reserved_store_quantity",
+            "procurement_shortage_quantity",
+            "issued_store_quantity",
+            "remaining_reserved_quantity",
+            "reservation_status",
+        )
+
 class MaterialRequestSerializer(
     serializers.ModelSerializer
 ):
@@ -552,6 +601,11 @@ class MaterialRequestSerializer(
     )
 
     rd_items = RDItemSerializer(
+        many=True,
+        required=False,
+    )
+
+    request_items = RequestItemSerializer(
         many=True,
         required=False,
     )
@@ -595,32 +649,117 @@ class MaterialRequestSerializer(
         request_type = str(
             attrs.get(
                 "request_type",
-                getattr(
-                    self.instance,
-                    "request_type",
-                    "BOM",
-                ),
+                getattr(self.instance, "request_type", "BOM"),
             )
             or ""
         ).strip().upper()
 
+        if request_type not in {
+            "BOM",
+            "R&D",
+            "RETURNABLE",
+            "RETAIL_SALES",
+        }:
+            raise serializers.ValidationError(
+                {"request_type": ["Invalid request type."]}
+            )
+
+        project = str(
+            attrs.get(
+                "project",
+                getattr(self.instance, "project", ""),
+            )
+            or ""
+        ).strip()
+
         bom = attrs.get(
             "bom",
-            getattr(
-                self.instance,
-                "bom",
-                None,
-            ),
+            getattr(self.instance, "bom", None),
         )
+
+        if request_type in {"BOM", "R&D"} and not project:
+            raise serializers.ValidationError(
+                {"project": ["Project is required for BOM and R&D requests."]}
+            )
 
         if request_type == "BOM" and not bom:
             raise serializers.ValidationError(
-                {
-                    "bom": [
-                        "Please select a BOM."
-                    ]
-                }
+                {"bom": ["Please select a BOM."]}
             )
+
+        if request_type != "BOM":
+            attrs["bom"] = None
+            attrs["customized_bom"] = False
+
+        if request_type in {"RETURNABLE", "RETAIL_SALES"}:
+            attrs["project"] = ""
+
+        if request_type == "RETURNABLE":
+            purpose = str(
+                attrs.get(
+                    "returnable_purpose",
+                    getattr(self.instance, "returnable_purpose", ""),
+                )
+                or ""
+            ).strip().upper()
+
+            # Every Returnable purpose may create a NEW MR when the user
+            # chooses Components on the New Material Request page.
+            #
+            # Drone mode does not call this serializer at all; it reuses an
+            # existing In-Drone MR through componentusage/move-from-in-drone.
+            valid_purposes = {
+                choice[0]
+                for choice in MaterialRequest.RETURNABLE_PURPOSE_CHOICES
+            }
+
+            if purpose not in valid_purposes:
+                raise serializers.ValidationError(
+                    {
+                        "returnable_purpose": [
+                            "Please select a valid Returnable purpose."
+                        ]
+                    }
+                )
+
+            remarks = str(
+                attrs.get(
+                    "remarks",
+                    getattr(self.instance, "remarks", ""),
+                )
+                or ""
+            ).strip()
+
+            if not remarks:
+                raise serializers.ValidationError(
+                    {"remarks": ["Remarks are mandatory for Returnable requests."]}
+                )
+
+            request_date = attrs.get(
+                "date",
+                getattr(self.instance, "date", None),
+            )
+            return_date = attrs.get(
+                "required_date",
+                getattr(self.instance, "required_date", None),
+            )
+
+            if request_date and return_date:
+                if return_date < request_date:
+                    raise serializers.ValidationError(
+                        {"required_date": ["Returnable date cannot be before request date."]}
+                    )
+
+                if purpose in {
+                    "FLIGHT_TEST",
+                    "QC_CHECK",
+                    "MISCELLANEOUS_USAGE",
+                } and (return_date - request_date).days > 4:
+                    raise serializers.ValidationError(
+                        {"required_date": ["This Returnable purpose allows a maximum of 4 days."]}
+                    )
+        else:
+            attrs["returnable_purpose"] = ""
 
         return attrs
 
@@ -701,6 +840,10 @@ class MaterialRequestSerializer(
         )
         rd_items = validated_data.pop(
             "rd_items",
+            [],
+        )
+        request_items = validated_data.pop(
+            "request_items",
             [],
         )
 
@@ -797,6 +940,23 @@ class MaterialRequestSerializer(
                 ),
             )
 
+        for item in request_items:
+            RequestItem.objects.create(
+                material_request=material_request,
+                component=item.get("component"),
+                category=item.get("category", ""),
+                specifications=item.get("specifications", ""),
+                quantity=item.get("quantity", 1),
+                inventory_quantity=(
+                    self.get_creation_inventory_quantity(
+                        item.get("component")
+                    )
+                ),
+                unit=item.get("unit", "pc"),
+                vendor=item.get("vendor", "N/A"),
+                remarks=item.get("remarks", ""),
+            )
+
         return material_request
 
     def update(self, instance, validated_data):
@@ -809,6 +969,7 @@ class MaterialRequestSerializer(
         """
         validated_data.pop("bom_items", None)
         validated_data.pop("rd_items", None)
+        validated_data.pop("request_items", None)
 
         approval_status = validated_data.get(
             "approval_status"

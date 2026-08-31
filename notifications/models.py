@@ -10,6 +10,7 @@ class Notification(models.Model):
         ("PROC", "Procurement"),
         ("SCRAP", "Scrap"),
         ("BOM", "BOM"),
+        ("SALES", "Sales"),
     ]
 
     STATUS_CHOICES = [
@@ -21,6 +22,11 @@ class Notification(models.Model):
         ("PENDING_MANAGER", "Pending Manager"),
         ("MANAGER_APPROVED", "Manager Approved"),
         ("MANAGER_REJECTED", "Manager Rejected"),
+
+        # Management / Sales flow
+        ("PENDING_MANAGEMENT", "Pending Management"),
+        ("MANAGEMENT_APPROVED", "Management Approved"),
+        ("MANAGEMENT_REJECTED", "Management Rejected"),
 
         # Procurement / MR flow
         ("PROCUREMENT_PENDING", "Procurement Pending"),
@@ -34,10 +40,7 @@ class Notification(models.Model):
 
         # QC / Inventory flow
         ("INVENTORY_PENDING", "Inventory Pending"),
-        (
-            "INVENTORY_CHECK_PENDING",
-            "Inventory Check Pending",
-        ),
+        ("INVENTORY_CHECK_PENDING", "Inventory Check Pending"),
         ("QC_CHECKED", "QC Checked"),
         (
             "PROJECT_INVENTORY_READY",
@@ -57,6 +60,7 @@ class Notification(models.Model):
         ("PROCUREMENT", "Procurement"),
         ("INVENTORY", "Inventory"),
         ("FINANCE", "Finance"),
+        ("MANAGEMENT", "Management"),
     ]
 
     category = models.CharField(
@@ -82,8 +86,25 @@ class Notification(models.Model):
         db_index=True,
     )
 
-    # Display/audit name of the user who originally created
-    # or requested this notification.
+    # Exact-user notification target.
+    #
+    # Existing notifications/views.py uses:
+    #   select_related("recipient_user")
+    #   Q(recipient_user__isnull=True) | Q(recipient_user=request.user)
+    #
+    # Scrap final-result notifications also create Notification rows with
+    # recipient_user=<original requester>. Keep this field even though most
+    # approval notifications are role-level and use receiver instead.
+    recipient_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        related_name="ipms_received_notifications",
+    )
+
+    # User name that created/requested the notification.
+    # This is what the Manager Scrap table displays.
     requested_by = models.CharField(
         max_length=150,
         blank=True,
@@ -98,40 +119,11 @@ class Notification(models.Model):
         db_index=True,
     )
 
-    # Role-level destination.
-    #
-    # Examples:
-    #   FINANCE -> every Finance user can see it
-    #   MANAGER -> every Manager can see it
-    #
-    # For a notification addressed to one exact user,
-    # receiver can remain NULL and recipient_user is used.
     receiver = models.CharField(
         max_length=20,
         choices=ROLE_CHOICES,
         blank=True,
         null=True,
-        db_index=True,
-    )
-
-    # Exact-user destination.
-    #
-    # This is required for the Scrap workflow:
-    #
-    # Inventory / Engineer creates Scrap
-    #        ↓
-    # Finance approves
-    #        ↓
-    # Manager approves
-    #        ↓
-    # Final notification goes ONLY to the user
-    # who originally created that Scrap.
-    recipient_user = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-        blank=True,
-        null=True,
-        related_name="ipms_notifications",
         db_index=True,
     )
 
@@ -152,7 +144,6 @@ class Notification(models.Model):
         ]
 
         indexes = [
-            # Fast role-based notification lookup.
             models.Index(
                 fields=[
                     "receiver",
@@ -161,8 +152,6 @@ class Notification(models.Model):
                 ],
                 name="notif_recv_stat_idx",
             ),
-
-            # Fast workflow-reference lookup.
             models.Index(
                 fields=[
                     "category",
@@ -170,16 +159,6 @@ class Notification(models.Model):
                     "receiver",
                 ],
                 name="notif_ref_recv_idx",
-            ),
-
-            # Fast exact-user notification lookup.
-            models.Index(
-                fields=[
-                    "recipient_user",
-                    "category",
-                    "status",
-                ],
-                name="notif_user_cat_stat_idx",
             ),
         ]
 

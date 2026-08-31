@@ -19,6 +19,7 @@ from inventory.models import (
     ProjectInventory,
 )
 from materialrequest.models import MaterialRequest, BOMItem, RDItem
+from procurement.models import PurchaseOrder, PurchaseOrderItem
 from notifications.email_service import send_ipms_email
 from notifications.models import Notification
 
@@ -70,8 +71,9 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
         """
         Normal Inventory/Outward screens call GET /outward/.
 
-        Engineer-raised Scrap must NOT appear there until the Engineer
-        explicitly clicks "Move to Inventory" after Manager approval.
+        Engineer-raised Scrap appears after Finance has executed the final
+        disposition. New rows persist moved_to_inventory=True; older rows are
+        also recognized through disposition_processed metadata.
 
         Detail/custom actions still see the staged row so Manager
         Notifications can approve/reject it by ID.
@@ -84,6 +86,19 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                 | Q(
                     source="ENGINEER",
                     moved_to_inventory=True,
+                )
+                | Q(
+                    source="ENGINEER",
+                    inventory_allocations__disposition_processed=True,
+                )
+                # Returned-drone QC failures must be visible immediately in
+                # Outward -> Failed QC while Manager / Finance approval is
+                # still pending. Other staged Engineer Scrap remains hidden.
+                | Q(
+                    inventory_allocations__workflow__in=[
+                        "RETURNABLE_DRONE_QC_V1",
+                        "RETURNABLE_COMPONENT_QC_V1",
+                    ],
                 )
             )
 
@@ -2145,17 +2160,12 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
         scrap_items,
     ):
         """
-        Create a dedicated FROM-SCRAP Material Request.
+        Create a full rebuild MR from the original MR structure.
 
-        IMPORTANT:
-        - This is NOT a BOM / Custom BOM / R&D procurement request.
-        - The physical components already come from the scrapped drone.
-        - The selected serial numbers are carried directly into this MR.
-        - Manager approval must NOT reserve In-Store stock and must NOT
-          create Project Inventory / Procurement work for this request.
-
-        No schema migration is required. The existing CharField stores the
-        internal request_type value "SCRAP".
+        Reusable serials are recovered into In Store and tagged on the cloned
+        MR rows. Every original BOM/Custom BOM/R&D component is cloned. The
+        normal MR approval router then reserves available stock and sends only
+        the remaining shortage to Procurement.
         """
         requester = None
 
@@ -2185,7 +2195,7 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
             or "Engineer"
         )
 
-        total_quantity = sum(
+        recovered_quantity = sum(
             max(
                 int(
                     item.get(
@@ -2197,6 +2207,19 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                 0,
             )
             for item in scrap_items
+        )
+
+        source_items_manager = (
+            source_mr.rd_items
+            if str(source_mr.request_type or "").strip().upper() in {"R&D", "RD"}
+            else source_mr.bom_items
+        )
+        source_items = list(
+            source_items_manager.select_related("component").all().order_by("id")
+        )
+        total_quantity = sum(
+            max(int(getattr(item, "quantity", 0) or 0), 0)
+            for item in source_items
         )
 
         reorder_mr = MaterialRequest.objects.create(
@@ -2211,10 +2234,10 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
             date=timezone.localdate(),
             project=source_mr.project,
 
-            # FROM-SCRAP is intentionally independent of BOM.
-            bom=None,
-            customized_bom=False,
-            request_type="SCRAP",
+            # Preserve the original MR definition exactly.
+            bom=source_mr.bom,
+            customized_bom=source_mr.customized_bom,
+            request_type=source_mr.request_type,
 
             required_quantity=max(
                 total_quantity,
@@ -2226,169 +2249,88 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
             remarks=(
                 f"Automatically created From Scrap for "
                 f"{source_mr.material_request_id}. "
-                f"Selected quantity: "
-                f"{total_quantity}."
+                f"Source Scrap: {scrap_entry.code}. "
+                f"Original MR: {source_mr.material_request_id}. "
+                f"Recovered reusable quantity: {recovered_quantity}. "
+                "Missing quantities follow normal In Store and Procurement routing."
             ),
             status="PENDING_MANAGER",
             approval_status="PENDING_MANAGER",
             po_raised=False,
         )
 
+        recovered_by_component = {
+            str(item.get("component")): cls.normalize_serials(
+                item.get("serial_numbers") or []
+            )
+            for item in scrap_items
+        }
+
+        # Make reusable physical units available to the normal MR reservation
+        # engine. Their exact serials remain auditable in both Inventory and the
+        # cloned MR item remarks.
         for item in scrap_items:
-            component_id = item.get(
-                "component"
+            cls.create_scrap_return_inventory(
+                source_mr=source_mr,
+                item=item,
             )
 
-            serial_numbers = (
-                cls.normalize_serials(
-                    item.get(
-                        "serial_numbers"
-                    )
-                    or []
-                )
+        for source_item in source_items:
+            serial_numbers = recovered_by_component.get(
+                str(getattr(source_item, "component_id", "")),
+                [],
+            )
+            marker = (
+                f"FROM_SCRAP_SERIALS:{'|'.join(serial_numbers)}"
+                f"\nSOURCE_SCRAP:{scrap_entry.code}"
+                f"\nSOURCE_MR:{source_mr.material_request_id}"
+                f"\nCOMPONENT_SOURCE:{'RECOVERED_FROM_SCRAP' if serial_numbers else 'IN_STORE_OR_PROCUREMENT'}"
             )
 
-            # Selected quantity must match exact selected serials.
-            quantity = len(serial_numbers)
+            item_model = (
+                RDItem
+                if str(source_mr.request_type or "").strip().upper() in {"R&D", "RD"}
+                else BOMItem
+            )
+            clone = item_model()
 
-            if (
-                not component_id
-                or quantity <= 0
+            # Clone all compatible concrete fields, preserving Custom BOM and
+            # R&D-specific attributes without hard-coding their model schema.
+            for field in source_item._meta.concrete_fields:
+                if field.primary_key or field.name == "material_request":
+                    continue
+                if any(candidate.name == field.name for candidate in clone._meta.concrete_fields):
+                    setattr(clone, field.attname, getattr(source_item, field.attname))
+
+            clone.material_request = reorder_mr
+            for quantity_field in (
+                "po_raised_quantity",
+                "delivered_quantity",
+                "qc_passed_quantity",
+                "qc_failed_quantity",
+                "project_inventory_quantity",
             ):
-                continue
+                if hasattr(clone, quantity_field):
+                    setattr(clone, quantity_field, 0)
+            if hasattr(clone, "inventory_quantity"):
+                clone.inventory_quantity = len(serial_numbers)
+            if hasattr(clone, "vendor"):
+                clone.vendor = None
+            if hasattr(clone, "remarks"):
+                existing_remarks = str(getattr(source_item, "remarks", "") or "").strip()
+                clone.remarks = f"{existing_remarks}\n{marker}".strip()
+            clone.save()
 
-            source_item = (
-                cls.get_source_mr_item(
-                    source_mr,
-                    component_id,
-                )
-            )
+        # Finance has already approved the parent Scrap. Do not request a
+        # second Manager approval for the generated MR. Route it immediately
+        # through the normal live-stock split:
+        #   available stock -> Inventory
+        #   shortage        -> Procurement
+        from materialrequest.views import MaterialRequestViewSet
 
-            if source_item is None:
-                continue
-
-            component = getattr(
-                source_item,
-                "component",
-                None,
-            )
-
-            if component is None:
-                continue
-
-            unit_price = getattr(
-                source_item,
-                "unit_price",
-                0,
-            ) or 0
-
-            price = (
-                Decimal(
-                    str(unit_price)
-                )
-                * Decimal(quantity)
-            )
-
-            # Always store FROM-SCRAP rows in BOMItem.
-            # This is only a detail container; it is NOT a BOM workflow.
-            BOMItem.objects.create(
-                material_request=reorder_mr,
-                component=component,
-                category=(
-                    getattr(
-                        source_item,
-                        "category",
-                        "",
-                    )
-                    or getattr(
-                        component,
-                        "category",
-                        "",
-                    )
-                    or ""
-                ),
-                specification=(
-                    getattr(
-                        source_item,
-                        "specification",
-                        "",
-                    )
-                    or getattr(
-                        source_item,
-                        "specifications",
-                        "",
-                    )
-                    or getattr(
-                        component,
-                        "specifications",
-                        "",
-                    )
-                    or ""
-                ),
-                quantity=quantity,
-                unit=(
-                    getattr(
-                        source_item,
-                        "unit",
-                        "pc",
-                    )
-                    or "pc"
-                ),
-                unit_price=unit_price,
-                price=price,
-                tax=(
-                    getattr(
-                        source_item,
-                        "tax",
-                        0,
-                    )
-                    or 0
-                ),
-
-                # Do NOT treat these items as coming from In Store.
-                inventory_quantity=0,
-                po_raised_quantity=0,
-                delivered_quantity=0,
-                qc_passed_quantity=0,
-                qc_failed_quantity=0,
-                project_inventory_quantity=0,
-
-                vendor=None,
-
-                # Persist exact selected serials without a new DB field.
-                # MaterialRequestsPage parses this marker for the
-                # dedicated "From Scrap Details" popup.
-                remarks=(
-                    f"FROM_SCRAP_SERIALS:"
-                    f"{'|'.join(serial_numbers)}"
-                    f"\nSOURCE_SCRAP:{scrap_entry.code}"
-                    f"\nSOURCE_MR:"
-                    f"{source_mr.material_request_id}"
-                ),
-            )
-
-        # Keep the existing Manager notification stage.
-        Notification.objects.update_or_create(
-            category="MR",
-            receiver="MANAGER",
-            reference_id=str(
-                reorder_mr.id
-            ),
-            defaults={
-                "title": (
-                    "MR Approval Request - "
-                    f"{reorder_mr.material_request_id}"
-                ),
-                "message": (
-                    f"From Scrap Material Request "
-                    f"{reorder_mr.material_request_id} "
-                    f"requires manager approval."
-                ),
-                "status":
-                    "PENDING_MANAGER",
-                "is_read":
-                    False,
-            },
+        MaterialRequestViewSet().route_after_manager_approval(
+            reorder_mr,
+            approval_source="FINANCE",
         )
 
         return reorder_mr
@@ -2512,152 +2454,143 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
         scrap_entry,
     ):
         """
-        Execute the NEW disposition only after final Finance approval
-        and the Engineer clicks Move to Store.
+        Execute the final Finance-approved disposition.
 
-        PARTIAL + YES:
-            Unselected serials go to Scrap.
-            Selected serial quantities create a NEW MR.
+        Supported workflows:
+        - ENGINEER_MR_SCRAP_DISPOSITION_V1 (existing Engineer Scrap)
+        - RETURNABLE_DRONE_QC_V1          (returned assembled drone QC fail)
+        - RETURNABLE_COMPONENT_QC_V1      (returned loose component QC fail)
 
-        PARTIAL + NO:
-            Unselected serials go to Scrap.
-            Selected serials return to central Inventory.
-
-        TOTAL:
-            Every available issued serial selected in this request is Scrap.
-            No return and no automatic reorder.
+        Nothing is restored/rebuilt/procured before Finance approval.
         """
         metadata = (
             scrap_entry.inventory_allocations
-            if isinstance(
-                scrap_entry.inventory_allocations,
-                dict,
-            )
+            if isinstance(scrap_entry.inventory_allocations, dict)
             else {}
         )
-
-        if (
-            metadata.get("workflow")
-            != "ENGINEER_MR_SCRAP_DISPOSITION_V1"
-        ):
+        workflow = str(metadata.get("workflow") or "").strip().upper()
+        supported = {
+            "ENGINEER_MR_SCRAP_DISPOSITION_V1",
+            "RETURNABLE_DRONE_QC_V1",
+            "RETURNABLE_COMPONENT_QC_V1",
+        }
+        if workflow not in supported:
+            return metadata
+        if metadata.get("disposition_processed"):
             return metadata
 
-        if metadata.get(
-            "disposition_processed"
-        ):
-            return metadata
-
-        source_mr = (
-            MaterialRequest.objects
-            .select_for_update()
-            .get(
-                pk=scrap_entry
-                .material_request_id
+        source_mr = None
+        if scrap_entry.material_request_id:
+            source_mr = (
+                MaterialRequest.objects.select_for_update()
+                .filter(pk=scrap_entry.material_request_id)
+                .first()
             )
-        )
 
-        scrap_mode = str(
-            metadata.get(
-                "scrap_mode",
-                "PARTIAL",
-            )
-        ).strip().upper()
-
-        reorder_choice = str(
-            metadata.get(
-                "reorder_choice",
-                "NONE",
-            )
-        ).strip().upper()
-
-        scrap_items = (
-            metadata.get(
-                "scrap_items",
-                [],
-            )
-            or []
-        )
-
-        return_items = (
-            metadata.get(
-                "return_items",
-                [],
-            )
-            or []
-        )
-
-        reorder_items = (
-            metadata.get(
-                "reorder_items",
-                [],
-            )
-            or []
-        )
-
+        reorder_choice = str(metadata.get("reorder_choice", "NONE") or "NONE").strip().upper()
+        selected_items = metadata.get("selected_items", []) or []
+        return_items = metadata.get("return_items", []) or []
+        reorder_items = metadata.get("reorder_items", []) or []
         returned_inventory_ids = []
         reorder_mr = None
 
-        if (
-            scrap_mode == "PARTIAL"
-            and reorder_choice == "NO"
-        ):
-            for item in return_items:
-                inventory_row = (
-                    cls.create_scrap_return_inventory(
+        if workflow == "RETURNABLE_COMPONENT_QC_V1":
+            # Failed returned components remain Scrap after Finance approval.
+            # Restore=YES means Procurement is now allowed to raise a replacement PO.
+            metadata["procurement_restore_ready"] = reorder_choice == "YES"
+            metadata["procurement_restore_status"] = (
+                "PENDING_PROCUREMENT" if reorder_choice == "YES" else "NOT_REQUIRED"
+            )
+
+        elif workflow == "RETURNABLE_DRONE_QC_V1":
+            if source_mr is None:
+                raise ValidationError({"detail": "Source Material Request for returned drone was not found."})
+
+            if reorder_choice == "NO":
+                # Drone is retired: reusable GOOD components return to In Store;
+                # BAD components remain Scrap.
+                for item in (return_items or selected_items):
+                    inventory_row = cls.create_scrap_return_inventory(
                         source_mr=source_mr,
                         item=item,
                     )
+                    if inventory_row:
+                        returned_inventory_ids.append(inventory_row.id)
+
+            elif reorder_choice == "YES":
+                # Rebuild from the original BOM/R&D structure. Good serials are
+                # recovered first; missing/bad quantities use normal Inventory /
+                # Procurement routing. An empty good list is valid: rebuild all.
+                reorder_mr = cls.create_scrap_reorder_mr(
+                    scrap_entry=scrap_entry,
+                    source_mr=source_mr,
+                    scrap_items=(reorder_items or selected_items),
                 )
 
-                if inventory_row:
-                    returned_inventory_ids.append(
-                        inventory_row.id
+        else:
+            # Existing Engineer Scrap behavior remains unchanged.
+            scrap_mode = str(metadata.get("scrap_mode", "PARTIAL") or "PARTIAL").strip().upper()
+            if scrap_mode == "PARTIAL" and reorder_choice == "NO":
+                for item in return_items:
+                    inventory_row = cls.create_scrap_return_inventory(
+                        source_mr=source_mr,
+                        item=item,
                     )
-
-        if (
-            scrap_mode == "PARTIAL"
-            and reorder_choice == "YES"
-            and reorder_items
-        ):
-            reorder_mr = (
-                cls.create_scrap_reorder_mr(
+                    if inventory_row:
+                        returned_inventory_ids.append(inventory_row.id)
+            if scrap_mode == "PARTIAL" and reorder_choice == "YES" and reorder_items:
+                reorder_mr = cls.create_scrap_reorder_mr(
                     scrap_entry=scrap_entry,
                     source_mr=source_mr,
                     scrap_items=reorder_items,
                 )
-            )
 
         metadata["disposition_processed"] = True
-        metadata["processed_at"] = (
-            timezone.now().isoformat()
-        )
-        metadata[
-            "returned_inventory_ids"
-        ] = returned_inventory_ids
-        metadata["replacement_mr_id"] = (
-            reorder_mr.id
-            if reorder_mr
-            else None
-        )
-        metadata[
-            "replacement_mr_number"
-        ] = (
-            reorder_mr.material_request_id
-            if reorder_mr
-            else ""
-        )
-
-        if reorder_mr:
-            transaction.on_commit(
-                lambda mr_id=reorder_mr.id: (
-                    cls.send_scrap_reorder_mr_manager_email(
-                        mr_id
-                    )
-                )
-            )
-
+        metadata["processed_at"] = timezone.now().isoformat()
+        metadata["returned_inventory_ids"] = returned_inventory_ids
+        metadata["replacement_mr_id"] = reorder_mr.id if reorder_mr else None
+        metadata["replacement_mr_number"] = reorder_mr.material_request_id if reorder_mr else ""
         return metadata
 
+    @staticmethod
+    def sync_returnable_usage_status(metadata, approval_status, *, reason=""):
+        """Synchronize ComponentUsage rows linked to a Returnable QC Scrap."""
+        if not isinstance(metadata, dict):
+            return
+        usage_ids = [
+            value for value in (metadata.get("returnable_usage_ids") or [])
+            if str(value).strip()
+        ]
+        if not usage_ids:
+            return
+        from componentusage.models import ComponentUsage
+        rows = ComponentUsage.objects.select_for_update().filter(pk__in=usage_ids)
+        for usage in rows:
+            usage.return_approval_status = approval_status
+            if reason:
+                current = str(usage.return_reason or "").strip()
+                usage.return_reason = f"{current}\n{reason}".strip()
+            detail = usage.inventory_issue_details if isinstance(usage.inventory_issue_details, dict) else {}
+            detail["scrap_approval_status"] = approval_status
+            if reason:
+                detail["scrap_approval_reason"] = reason
+            usage.inventory_issue_details = detail
+            usage.save(update_fields=["return_approval_status", "return_reason", "inventory_issue_details"])
+
+    @staticmethod
+    def generate_restore_po_number():
+        """Generate the same NN/YY-YY PO format used by the frontend."""
+        today = timezone.localdate()
+        start_year = today.year if today.month >= 4 else today.year - 1
+        fy = f"{str(start_year)[-2:]}-{str(start_year + 1)[-2:]}"
+        highest = 0
+        for value in PurchaseOrder.objects.filter(po_number__endswith=f"/{fy}").values_list("po_number", flat=True):
+            try:
+                prefix = str(value).split("/", 1)[0]
+                highest = max(highest, int(prefix))
+            except (TypeError, ValueError):
+                continue
+        return f"{highest + 1:02d}/{fy}"
 
     @staticmethod
     def normalize_serials(values):
@@ -3071,6 +3004,790 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
 
         return cls.normalize_serials(
             existing_returned + serials_to_restore
+        )
+
+    # =========================================================
+    # IN-DRONE SALES: FINANCE -> MANAGEMENT APPROVAL
+    # =========================================================
+    # This flow is deliberately separate from normal direct SALES.
+    # Components are already physically issued to the MR/In-Drone, so
+    # creating a Sales approval request MUST NOT deduct In-Store stock again.
+
+    @classmethod
+    def get_active_role(cls, request):
+        token = getattr(request, "auth", None)
+        token_role = ""
+
+        if token is not None:
+            try:
+                token_role = cls.normalize_role_value(
+                    token.get("active_role", "")
+                )
+            except (AttributeError, TypeError, ValueError):
+                token_role = ""
+
+        if token_role:
+            return token_role
+
+        return cls.normalize_role_value(
+            getattr(getattr(request, "user", None), "role", "")
+        )
+
+    @classmethod
+    def require_finance_for_in_drone_sales(cls, request):
+        user = getattr(request, "user", None)
+
+        if not user or not getattr(user, "is_authenticated", False):
+            raise PermissionDenied("Authentication is required.")
+
+        role = cls.get_active_role(request)
+
+        if role not in {"finance", "admin"} and not getattr(
+            user, "is_superuser", False
+        ):
+            raise PermissionDenied(
+                "Only Finance can send an In-Drone request for Sales approval."
+            )
+
+        return user
+
+    @classmethod
+    def require_management_for_sales(cls, request):
+        user = getattr(request, "user", None)
+
+        if not user or not getattr(user, "is_authenticated", False):
+            raise PermissionDenied("Authentication is required.")
+
+        role = cls.get_active_role(request)
+
+        if role not in {"management", "admin"} and not getattr(
+            user, "is_superuser", False
+        ):
+            raise PermissionDenied(
+                "Only Management can approve or reject Sales."
+            )
+
+        return user
+
+    @classmethod
+    def get_assigned_roles(cls, user):
+        if not user:
+            return set()
+
+        get_all_roles = getattr(user, "get_all_roles", None)
+
+        if callable(get_all_roles):
+            try:
+                values = get_all_roles() or []
+            except Exception:
+                values = []
+        else:
+            values = [
+                getattr(user, "role", ""),
+                *(getattr(user, "additional_roles", []) or []),
+            ]
+
+        return {
+            cls.normalize_role_value(value)
+            for value in values
+            if cls.normalize_role_value(value)
+        }
+
+    @classmethod
+    def get_management_email_users(cls):
+        candidates = (
+            User.objects
+            .filter(is_active=True)
+            .exclude(email__isnull=True)
+            .exclude(email="")
+            .order_by("id")
+        )
+
+        result = []
+        seen = set()
+
+        for candidate in candidates:
+            if "management" not in cls.get_assigned_roles(candidate):
+                continue
+
+            email_key = str(candidate.email or "").strip().casefold()
+            if not email_key or email_key in seen:
+                continue
+
+            seen.add(email_key)
+            result.append(candidate)
+
+        return result
+
+    @classmethod
+    def send_management_sales_approval_email(cls, outward_id):
+        try:
+            first_row = (
+                OutwardEntry.objects
+                .select_related("material_request")
+                .get(pk=outward_id, outward_type="SALES")
+            )
+        except OutwardEntry.DoesNotExist:
+            return False
+
+        if str(first_row.approval_status or "").strip().upper() != "PENDING_MANAGEMENT":
+            return False
+
+        material_request = first_row.material_request
+        mr_number = (
+            getattr(material_request, "material_request_id", "")
+            or "-"
+        )
+
+        sales_rows = OutwardEntry.objects.filter(
+            outward_type="SALES",
+            material_request=material_request,
+        ).select_related("component")
+
+        component_summary = ", ".join(
+            f"{(getattr(row.component, 'name', '') or row.product_name or 'Component')}-{int(row.quantity or 0)}"
+            for row in sales_rows
+        ) or "-"
+
+        requester_name = str(first_row.requested_by or "Finance").strip() or "Finance"
+        subject = f"{mr_number} - Sales Approval Required"
+        sent_any = False
+
+        for management_user in cls.get_management_email_users():
+            try:
+                sent = send_ipms_email(
+                    recipient_email=management_user.email,
+                    subject=subject,
+                    context={
+                        "recipient_name": cls.get_mail_user_name(
+                            management_user,
+                            "Management",
+                        ),
+                        "message": (
+                            f"Finance submitted In-Drone Sales for {mr_number}. "
+                            "Management approval is required before the Sales is finalized."
+                        ),
+                        "table_headers": [
+                            "Material Request",
+                            "Components",
+                            "Requested By",
+                            "Status",
+                        ],
+                        "table_values": [
+                            mr_number,
+                            component_summary,
+                            requester_name,
+                            "Pending Management",
+                        ],
+                        "status": "Pending Management",
+                        "instruction": (
+                            "Please review the Sales request and approve or reject it in IPMS."
+                        ),
+                        "button_text": "Review Sales in IPMS",
+                        "action_url": (
+                            f"{cls.get_ipms_base_url()}"
+                            f"/management-notifications"
+                        ),
+                    },
+                )
+                if sent:
+                    sent_any = True
+            except Exception as exc:
+                print(
+                    "SALES MANAGEMENT EMAIL ERROR:",
+                    management_user.email,
+                    exc,
+                )
+
+        return sent_any
+
+    @staticmethod
+    def _resolve_material_request(reference):
+        raw = str(reference or "").strip()
+        if not raw:
+            raise ValidationError(
+                {"material_request_id": "Material Request is required."}
+            )
+
+        query = Q(material_request_id=raw)
+        if raw.isdigit():
+            query |= Q(pk=int(raw))
+
+        material_request = (
+            MaterialRequest.objects
+            .filter(query)
+            .first()
+        )
+
+        if material_request is None:
+            raise ValidationError(
+                {"material_request_id": "Material Request was not found."}
+            )
+
+        return material_request
+
+    @staticmethod
+    def _project_row_issued_quantity(project_row):
+        direct = getattr(project_row, "calculated_issued_quantity", None)
+        if direct is not None:
+            try:
+                return max(int(direct or 0), 0)
+            except (TypeError, ValueError):
+                pass
+
+        return max(
+            int(getattr(project_row, "issued_store_quantity", 0) or 0),
+            0,
+        ) + max(
+            int(getattr(project_row, "issued_purchased_quantity", 0) or 0),
+            0,
+        )
+
+    @classmethod
+    def _sales_rows_for_instance(cls, instance, *, lock=False):
+        queryset = OutwardEntry.objects.filter(
+            outward_type="SALES",
+        )
+
+        if instance.material_request_id:
+            queryset = queryset.filter(
+                material_request_id=instance.material_request_id,
+            )
+        else:
+            queryset = queryset.filter(pk=instance.pk)
+
+        if lock:
+            queryset = queryset.select_for_update()
+
+        return queryset.order_by("id")
+
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="in-drone-sales",
+    )
+    def in_drone_sales(self, request):
+        """
+        Finance sends an already-issued In-Drone MR to Sales.
+
+        The exact issued ProjectInventory component quantities/serials are
+        copied into Outward as SALES rows in PENDING_MANAGEMENT state.
+        No Inventory quantity is deducted here because the stock has already
+        left In Store when the MR reached In Drone.
+        """
+        user = self.require_finance_for_in_drone_sales(request)
+        material_request = self._resolve_material_request(
+            request.data.get("material_request_id")
+            or request.data.get("materialRequestId")
+        )
+
+        current_mr_status = str(
+            material_request.status or ""
+        ).strip().upper()
+
+        if current_mr_status not in {
+            "INVENTORY_ISSUED",
+            "MR_COMPLETED",
+            "ISSUED",
+            "COMPLETED",
+        }:
+            raise ValidationError(
+                {
+                    "detail": (
+                        "Sales can be requested only after every component "
+                        "has been issued and the Material Request is in In Drone."
+                    )
+                }
+            )
+
+        project_rows = list(
+            ProjectInventory.objects
+            .select_related("component")
+            .filter(material_request=material_request)
+            .order_by("id")
+        )
+
+        if not project_rows:
+            raise ValidationError(
+                {
+                    "detail": (
+                        "No issued Project Inventory components were found "
+                        "for this Material Request."
+                    )
+                }
+            )
+
+        prepared_rows = []
+
+        for project_row in project_rows:
+            requested = max(
+                int(getattr(project_row, "requested_quantity", 0) or 0),
+                0,
+            )
+            issued = self._project_row_issued_quantity(project_row)
+
+            if requested <= 0 or issued < requested:
+                raise ValidationError(
+                    {
+                        "detail": (
+                            "All requested components must be fully issued "
+                            "before Finance can send this request to Sales."
+                        )
+                    }
+                )
+
+            store_serials = self.normalize_serials(
+                getattr(project_row, "issued_store_serials", [])
+            )
+            purchased_serials = self.normalize_serials(
+                getattr(project_row, "issued_purchased_serials", [])
+            )
+            serials = self.normalize_serials(
+                store_serials + purchased_serials
+            )
+
+            component = project_row.component
+            component_code = str(
+                getattr(component, "component_id", "") or ""
+            ).strip()
+            component_name = str(
+                getattr(component, "name", "") or ""
+            ).strip()
+            component_label = " - ".join(
+                value
+                for value in [component_code, component_name]
+                if value
+            ) or component_name or component_code or "Component"
+
+            prepared_rows.append(
+                {
+                    "component": component,
+                    "quantity": issued,
+                    "serial_numbers": serials,
+                    "product_name": component_label,
+                }
+            )
+
+        requester_name = self.get_actor_name(user)
+        client = str(request.data.get("client") or "").strip()
+        invoice_number = str(
+            request.data.get("invoice_number")
+            or request.data.get("invoiceNumber")
+            or ""
+        ).strip()
+        remarks = str(request.data.get("remarks") or "").strip()
+
+        with transaction.atomic():
+            existing_rows = list(
+                OutwardEntry.objects
+                .select_for_update()
+                .filter(
+                    outward_type="SALES",
+                    material_request=material_request,
+                )
+                .order_by("id")
+            )
+
+            if existing_rows:
+                existing_statuses = {
+                    str(row.approval_status or row.status or "")
+                    .strip()
+                    .upper()
+                    for row in existing_rows
+                }
+
+                if "APPROVED" in existing_statuses:
+                    return Response(
+                        {
+                            "material_request_id": material_request.material_request_id,
+                            "status": "APPROVED",
+                            "detail": "This In-Drone request is already approved for Sales.",
+                            "sales": self.get_serializer(
+                                existing_rows,
+                                many=True,
+                            ).data,
+                        },
+                        status=status.HTTP_200_OK,
+                    )
+
+                # Re-request after a Management rejection, or return the same
+                # pending rows without creating duplicates.
+                for row in existing_rows:
+                    row.approval_status = "PENDING_MANAGEMENT"
+                    row.status = "PENDING_MANAGEMENT"
+                    row.rejection_reason = None
+                    row.rejected_by = None
+                    row.requested_by = requester_name
+                    row.requested_by_user_id = user.pk
+                    if client:
+                        row.client = client
+                    if invoice_number:
+                        row.invoice_number = invoice_number
+                    if remarks:
+                        row.remarks = remarks
+                    row.save(
+                        update_fields=[
+                            "approval_status",
+                            "status",
+                            "rejection_reason",
+                            "rejected_by",
+                            "requested_by",
+                            "requested_by_user_id",
+                            "client",
+                            "invoice_number",
+                            "remarks",
+                            "updated_at",
+                        ]
+                    )
+
+                sales_rows = existing_rows
+            else:
+                sales_rows = []
+
+                for prepared in prepared_rows:
+                    stamp = timezone.now().strftime("%Y%m%d%H%M%S%f")
+                    code = f"OUT-{stamp}-{uuid4().hex[:6].upper()}"
+
+                    sales_rows.append(
+                        OutwardEntry.objects.create(
+                            code=code,
+                            outward_type="SALES",
+                            item_type="COMPONENT",
+                            out_date=timezone.localdate(),
+                            product_name=prepared["product_name"],
+                            component=prepared["component"],
+                            quantity=prepared["quantity"],
+                            no_of_components=prepared["quantity"],
+                            serial_numbers=prepared["serial_numbers"],
+                            inventory_allocations=[],
+                            stock_deducted=False,
+                            stock_restored=False,
+                            material_request=material_request,
+                            source="DIRECT",
+                            requested_by=requester_name,
+                            requested_by_user_id=user.pk,
+                            client=client or None,
+                            invoice_number=invoice_number or None,
+                            remarks=remarks or None,
+                            approval_status="PENDING_MANAGEMENT",
+                            status="PENDING_MANAGEMENT",
+                        )
+                    )
+
+            first_row = sales_rows[0]
+            reference_id = str(first_row.pk)
+
+            notification_qs = Notification.objects.filter(
+                category="SALES",
+                receiver="MANAGEMENT",
+                reference_id=reference_id,
+            ).order_by("-id")
+            notification = notification_qs.first()
+
+            title = (
+                "Sales Approval Required - "
+                f"{material_request.material_request_id}"
+            )
+            message = (
+                f"Finance submitted {material_request.material_request_id} "
+                "from In Drone for Sales. Management approval is required."
+            )
+
+            if notification is None:
+                notification = Notification.objects.create(
+                    category="SALES",
+                    receiver="MANAGEMENT",
+                    reference_id=reference_id,
+                    requested_by=requester_name,
+                    title=title,
+                    message=message,
+                    status="PENDING_MANAGEMENT",
+                    is_read=False,
+                )
+            else:
+                notification.requested_by = requester_name
+                notification.title = title
+                notification.message = message
+                notification.status = "PENDING_MANAGEMENT"
+                notification.is_read = False
+                notification.save(
+                    update_fields=[
+                        "requested_by",
+                        "title",
+                        "message",
+                        "status",
+                        "is_read",
+                    ]
+                )
+
+            notification_qs.exclude(pk=notification.pk).delete()
+
+            transaction.on_commit(
+                lambda outward_id=first_row.pk: (
+                    self.send_management_sales_approval_email(outward_id)
+                )
+            )
+
+        return Response(
+            {
+                "material_request_id": material_request.material_request_id,
+                "status": "PENDING_MANAGEMENT",
+                "detail": "Sales sent to Management for approval.",
+                "sales": self.get_serializer(sales_rows, many=True).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="management-sales-approve",
+    )
+    def management_sales_approve(self, request, pk=None):
+        management_user = self.require_management_for_sales(request)
+
+        with transaction.atomic():
+            instance = (
+                OutwardEntry.objects
+                .select_for_update()
+                .select_related("material_request")
+                .get(pk=pk)
+            )
+
+            if str(instance.outward_type or "").strip().upper() != "SALES":
+                raise ValidationError(
+                    {"detail": "This action can approve only Sales records."}
+                )
+
+            sales_rows = list(
+                self._sales_rows_for_instance(instance, lock=True)
+            )
+
+            current_statuses = {
+                str(row.approval_status or row.status or "")
+                .strip()
+                .upper()
+                for row in sales_rows
+            }
+
+            if current_statuses == {"APPROVED"}:
+                return Response(
+                    self.get_serializer(sales_rows, many=True).data,
+                    status=status.HTTP_200_OK,
+                )
+
+            if "PENDING_MANAGEMENT" not in current_statuses:
+                raise ValidationError(
+                    {"detail": "This Sales request is not pending Management approval."}
+                )
+
+            for row in sales_rows:
+                row.approval_status = "APPROVED"
+                row.status = "APPROVED"
+                row.rejection_reason = None
+                row.rejected_by = None
+                row.save(
+                    update_fields=[
+                        "approval_status",
+                        "status",
+                        "rejection_reason",
+                        "rejected_by",
+                        "updated_at",
+                    ]
+                )
+
+            first_row = sales_rows[0]
+            management_name = self.get_actor_name(management_user)
+
+            Notification.objects.filter(
+                category="SALES",
+                receiver="MANAGEMENT",
+                reference_id=str(first_row.pk),
+            ).update(
+                status="MANAGEMENT_APPROVED",
+                is_read=True,
+                message=(
+                    "Management approved Sales for "
+                    f"{getattr(first_row.material_request, 'material_request_id', '') or first_row.code}."
+                ),
+            )
+
+            finance_qs = Notification.objects.filter(
+                category="SALES",
+                receiver="FINANCE",
+                reference_id=str(first_row.pk),
+            ).order_by("-id")
+            finance_notification = finance_qs.first()
+            finance_message = (
+                "Management approved Sales for "
+                f"{getattr(first_row.material_request, 'material_request_id', '') or first_row.code}."
+            )
+
+            if finance_notification is None:
+                finance_notification = Notification.objects.create(
+                    category="SALES",
+                    receiver="FINANCE",
+                    reference_id=str(first_row.pk),
+                    requested_by=management_name,
+                    title="Sales Approved by Management",
+                    message=finance_message,
+                    status="APPROVED",
+                    is_read=False,
+                )
+            else:
+                finance_notification.requested_by = management_name
+                finance_notification.title = "Sales Approved by Management"
+                finance_notification.message = finance_message
+                finance_notification.status = "APPROVED"
+                finance_notification.is_read = False
+                finance_notification.save(
+                    update_fields=[
+                        "requested_by",
+                        "title",
+                        "message",
+                        "status",
+                        "is_read",
+                    ]
+                )
+
+            finance_qs.exclude(pk=finance_notification.pk).delete()
+
+        return Response(
+            {
+                "status": "APPROVED",
+                "detail": "Sales approved by Management.",
+                "sales": self.get_serializer(sales_rows, many=True).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="management-sales-reject",
+    )
+    def management_sales_reject(self, request, pk=None):
+        management_user = self.require_management_for_sales(request)
+        reason = str(
+            request.data.get("reason")
+            or request.data.get("rejection_reason")
+            or ""
+        ).strip()
+
+        if not reason:
+            raise ValidationError(
+                {"reason": "Rejection reason is required."}
+            )
+
+        with transaction.atomic():
+            instance = (
+                OutwardEntry.objects
+                .select_for_update()
+                .select_related("material_request")
+                .get(pk=pk)
+            )
+
+            if str(instance.outward_type or "").strip().upper() != "SALES":
+                raise ValidationError(
+                    {"detail": "This action can reject only Sales records."}
+                )
+
+            sales_rows = list(
+                self._sales_rows_for_instance(instance, lock=True)
+            )
+
+            if not any(
+                str(row.approval_status or row.status or "")
+                .strip()
+                .upper() == "PENDING_MANAGEMENT"
+                for row in sales_rows
+            ):
+                raise ValidationError(
+                    {"detail": "This Sales request is not pending Management approval."}
+                )
+
+            management_name = self.get_actor_name(management_user)
+
+            for row in sales_rows:
+                row.approval_status = "MANAGEMENT_REJECTED"
+                row.status = "MANAGEMENT_REJECTED"
+                row.rejection_reason = reason
+                row.rejected_by = management_name
+                row.save(
+                    update_fields=[
+                        "approval_status",
+                        "status",
+                        "rejection_reason",
+                        "rejected_by",
+                        "updated_at",
+                    ]
+                )
+
+            first_row = sales_rows[0]
+
+            Notification.objects.filter(
+                category="SALES",
+                receiver="MANAGEMENT",
+                reference_id=str(first_row.pk),
+            ).update(
+                status="MANAGEMENT_REJECTED",
+                is_read=True,
+                message=(
+                    "Management rejected Sales for "
+                    f"{getattr(first_row.material_request, 'material_request_id', '') or first_row.code}. "
+                    f"Reason: {reason}"
+                ),
+            )
+
+            finance_qs = Notification.objects.filter(
+                category="SALES",
+                receiver="FINANCE",
+                reference_id=str(first_row.pk),
+            ).order_by("-id")
+            finance_notification = finance_qs.first()
+            finance_message = (
+                "Management rejected Sales for "
+                f"{getattr(first_row.material_request, 'material_request_id', '') or first_row.code}. "
+                f"Reason: {reason}"
+            )
+
+            if finance_notification is None:
+                finance_notification = Notification.objects.create(
+                    category="SALES",
+                    receiver="FINANCE",
+                    reference_id=str(first_row.pk),
+                    requested_by=management_name,
+                    title="Sales Rejected by Management",
+                    message=finance_message,
+                    status="MANAGEMENT_REJECTED",
+                    is_read=False,
+                )
+            else:
+                finance_notification.requested_by = management_name
+                finance_notification.title = "Sales Rejected by Management"
+                finance_notification.message = finance_message
+                finance_notification.status = "MANAGEMENT_REJECTED"
+                finance_notification.is_read = False
+                finance_notification.save(
+                    update_fields=[
+                        "requested_by",
+                        "title",
+                        "message",
+                        "status",
+                        "is_read",
+                    ]
+                )
+
+            finance_qs.exclude(pk=finance_notification.pk).delete()
+
+        return Response(
+            {
+                "status": "MANAGEMENT_REJECTED",
+                "detail": "Sales rejected by Management.",
+                "reason": reason,
+                "sales": self.get_serializer(sales_rows, many=True).data,
+            },
+            status=status.HTTP_200_OK,
         )
 
     def save_stock_aware_entry(self, serializer):
@@ -3545,7 +4262,8 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
 
         MR source supports the new disposition:
         - ONLY INVENTORY_ISSUED MR
-        - PARTIAL Scrap + Reordering YES/NO
+        - Engineer selects GOOD / REUSABLE serial numbers
+        - Manager chooses Rebuild YES/NO during approval
         - TOTAL Scrap
         - multi-component / multi-serial Scrap in one approval request
 
@@ -3762,32 +4480,9 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                         }
                     )
 
-                reorder_choice = str(
-                    request.data.get(
-                        "reorder_choice",
-                        request.data.get(
-                            "reorderChoice",
-                            "",
-                        ),
-                    )
-                    or ""
-                ).strip().upper()
-
-                if scrap_mode == "PARTIAL":
-                    if reorder_choice not in {
-                        "YES",
-                        "NO",
-                    }:
-                        raise ValidationError(
-                            {
-                                "reorder_choice": (
-                                    "Select Reordering "
-                                    "Yes or No."
-                                )
-                            }
-                        )
-                else:
-                    reorder_choice = "NONE"
+                # The Engineer no longer decides the disposition. Manager
+                # records YES/NO during approval; Finance executes it later.
+                reorder_choice = "PENDING_MANAGER"
 
                 raw_scrap_items = (
                     request.data.get(
@@ -4118,46 +4813,9 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                                 }
                             )
 
-                    if reorder_choice == "YES":
-                        # Selected serial quantities recreate a NEW MR.
-                        reorder_items = [
-                            {
-                                **item,
-                                "serial_numbers":
-                                    list(
-                                        item[
-                                            "serial_numbers"
-                                        ]
-                                    ),
-                                "quantity":
-                                    len(
-                                        item[
-                                            "serial_numbers"
-                                        ]
-                                    ),
-                            }
-                            for item in selected_items
-                        ]
-                    elif reorder_choice == "NO":
-                        # Selected serials return to central Inventory.
-                        return_items = [
-                            {
-                                **item,
-                                "serial_numbers":
-                                    list(
-                                        item[
-                                            "serial_numbers"
-                                        ]
-                                    ),
-                                "quantity":
-                                    len(
-                                        item[
-                                            "serial_numbers"
-                                        ]
-                                    ),
-                            }
-                            for item in selected_items
-                        ]
+                    # Keep both lists empty until Manager records YES/NO.
+                    # selected_items is the authoritative reusable-component
+                    # selection supplied by the Engineer.
 
                 requested_serials = [
                     serial
@@ -4229,6 +4887,10 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                     "source_mr_number":
                         material_request
                         .material_request_id,
+                    "source_mr_request_type":
+                        material_request.request_type,
+                    "source_mr_customized_bom":
+                        bool(material_request.customized_bom),
                     # Selected serials are the Engineer's usable/action selection.
                     "selected_items":
                         selected_items,
@@ -4237,12 +4899,11 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                     "scrap_items":
                         scrap_items,
 
-                    # Selected serials returned to Inventory when Reordering = NO.
+                    # Populated only after Manager selects NO.
                     "return_items":
                         return_items,
 
-                    # Selected serial quantities used to create the NEW MR when
-                    # Reordering = YES.
+                    # Populated only after Manager selects YES.
                     "reorder_items":
                         reorder_items,
 
@@ -4280,6 +4941,9 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                         ),
                     "disposition_processed":
                         False,
+                    "manager_disposition_decision": "",
+                    "manager_decided_by": "",
+                    "manager_decided_at": "",
                     "replacement_mr_id":
                         None,
                     "replacement_mr_number":
@@ -4896,11 +5560,9 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                     }
                 )
 
-            # Execute the new MR Scrap disposition ONLY NOW:
-            # Finance has approved and Engineer clicked Move to Store.
-            #
-            # This means merely opening/submitting the Scrap popup does not
-            # move good components, create a reorder MR, or finalize Scrap.
+            # Backward-compatible idempotent endpoint. Finance approval now
+            # executes the disposition; this call only confirms the already
+            # processed result for older clients.
             metadata = (
                 self.process_engineer_scrap_disposition(
                     scrap_entry=instance,
@@ -5019,12 +5681,63 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
             instance.rejection_reason = None
             instance.rejected_by = None
 
+            # Finance is the final authority. Execute the Manager-selected
+            # disposition here, inside the same transaction.
+            instance.inventory_allocations = (
+                self.process_engineer_scrap_disposition(
+                    scrap_entry=instance,
+                )
+            )
+
+            metadata = (
+                instance.inventory_allocations
+                if isinstance(instance.inventory_allocations, dict)
+                else {}
+            )
+            workflow = str(metadata.get("workflow") or "").strip().upper()
+            restore_choice = str(metadata.get("reorder_choice") or "NO").strip().upper()
+
+            if workflow == "RETURNABLE_COMPONENT_QC_V1" and restore_choice == "YES":
+                source_mr = str(metadata.get("source_mr_number") or "").strip()
+                notification, _ = Notification.objects.update_or_create(
+                    category="PROC",
+                    receiver="PROCUREMENT",
+                    reference_id=str(instance.pk),
+                    defaults={
+                        "title": f"Returnable Restore Required - {source_mr or instance.code}",
+                        "message": (
+                            "Manager and Finance approved the failed Returnable component for "
+                            "restore/replacement. Open Outward > Failed QC and click Restore to raise the replacement PO."
+                        ),
+                        "requested_by": instance.requested_by or finance_name,
+                        "status": "PROCUREMENT_PENDING",
+                        "is_read": False,
+                    },
+                )
+                self.sync_returnable_usage_status(metadata, "APPROVED")
+            else:
+                # Final Scrap / drone rebuild or retirement is complete after Finance.
+                self.sync_returnable_usage_status(metadata, "COMPLETED")
+
+            instance.moved_to_inventory = True
+            instance.moved_at = timezone.now()
+            instance.stock_restored = bool(
+                isinstance(instance.inventory_allocations, dict)
+                and instance.inventory_allocations.get(
+                    "returned_inventory_ids"
+                )
+            )
+
             instance.save(
                 update_fields=[
                     "approval_status",
                     "status",
                     "rejection_reason",
                     "rejected_by",
+                    "inventory_allocations",
+                    "moved_to_inventory",
+                    "moved_at",
+                    "stock_restored",
                     "updated_at",
                 ]
             )
@@ -5168,6 +5881,17 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                 ),
             )
 
+            metadata = (
+                instance.inventory_allocations
+                if isinstance(instance.inventory_allocations, dict)
+                else {}
+            )
+            self.sync_returnable_usage_status(
+                metadata,
+                "REJECTED",
+                reason=f"Finance rejected: {reason}",
+            )
+
             # Manager has already approved at this point, so keep the
             # Manager notification as audit history and notify only the creator
             # of the final Finance rejection.
@@ -5189,6 +5913,141 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
     @action(
         detail=True,
         methods=["post"],
+        url_path="raise-returnable-restore-po",
+    )
+    @transaction.atomic
+    def raise_returnable_restore_po(self, request, pk=None):
+        """
+        Procurement action after BOTH Manager and Finance approval.
+
+        This action itself is the Procurement Restore decision, so the new
+        replacement PO does not repeat Manager/Finance approval.
+        """
+        user = getattr(request, "user", None)
+        if not user or not getattr(user, "is_authenticated", False):
+            raise PermissionDenied("Authentication is required.")
+        active_role = self.get_active_role(request)
+        if active_role not in {"procurement", "admin"} and not getattr(user, "is_superuser", False):
+            raise PermissionDenied("Only Procurement can raise the Returnable restore PO.")
+
+        instance = self.get_queryset().select_for_update().get(pk=pk)
+        metadata = instance.inventory_allocations if isinstance(instance.inventory_allocations, dict) else {}
+        if str(metadata.get("workflow") or "").strip().upper() != "RETURNABLE_COMPONENT_QC_V1":
+            raise ValidationError({"detail": "Restore PO is available only for failed Returnable components."})
+        if str(instance.approval_status or "").strip().upper() != "APPROVED":
+            raise ValidationError({"detail": "Finance approval is required before Procurement can restore this component."})
+        if str(metadata.get("reorder_choice") or "").strip().upper() != "YES":
+            raise ValidationError({"detail": "Manager did not select Restore for this failed component."})
+        if metadata.get("restore_po_id"):
+            existing = PurchaseOrder.objects.filter(pk=metadata.get("restore_po_id")).first()
+            return Response({
+                "detail": "Restore PO already exists.",
+                "purchase_order_id": getattr(existing, "pk", None),
+                "po_number": getattr(existing, "po_number", metadata.get("restore_po_number", "")),
+            })
+
+        vendor_name = str(request.data.get("vendor_name") or request.data.get("vendor") or "").strip()
+        if not vendor_name:
+            raise ValidationError({"vendor_name": "Select a vendor before raising the Restore PO."})
+        gstin = str(request.data.get("gstin") or "").strip()
+        location = str(request.data.get("location") or "").strip()
+        expected_delivery_date = request.data.get("expected_delivery_date") or None
+        submitted_items = request.data.get("items") or []
+        if not isinstance(submitted_items, list):
+            submitted_items = []
+        submitted_by_component = {
+            str(item.get("component_id") or item.get("component") or ""): item
+            for item in submitted_items if isinstance(item, dict)
+        }
+
+        failed_items = metadata.get("scrap_items", []) or []
+        if not failed_items:
+            raise ValidationError({"detail": "No failed component quantities are available for Restore."})
+
+        po = PurchaseOrder.objects.create(
+            po_number=self.generate_restore_po_number(),
+            vendor_name=vendor_name,
+            gstin=gstin,
+            location=location,
+            ordered_date=None,
+            expected_delivery_date=expected_delivery_date,
+            remarks=(
+                f"Returnable QC Restore after Manager + Finance approval. "
+                f"Source MR: {metadata.get('source_mr_number') or ''}. "
+                f"Source Failed-QC Outward: {instance.code}."
+            ),
+            status="REPLACEMENT_APPROVED",
+            approval_status="NOT_REQUESTED",
+            source_mr_number=str(metadata.get("source_mr_number") or "").strip() or None,
+            order_type="REPLACEMENT",
+            replacement_round=1,
+            approved_by=self.get_actor_name(user),
+            approved_at=timezone.now(),
+        )
+
+        created_item_count = 0
+        for failed in failed_items:
+            component_id = failed.get("component_id") or failed.get("component")
+            quantity = max(int(failed.get("quantity") or 0), 0)
+            if not component_id or quantity <= 0:
+                continue
+            submitted = submitted_by_component.get(str(component_id), {})
+            unit_price = Decimal(str(submitted.get("unit_price") or 0))
+            gst = Decimal(str(submitted.get("gst_percentage") or submitted.get("gst") or 0))
+            item_expected = submitted.get("expected_delivery_date") or expected_delivery_date
+            PurchaseOrderItem.objects.create(
+                purchase_order=po,
+                component_id=component_id,
+                quantity=quantity,
+                received_quantity=0,
+                unit_price=unit_price,
+                gst_percentage=gst,
+                expected_delivery_date=item_expected,
+            )
+            created_item_count += 1
+
+        if created_item_count == 0:
+            po.delete()
+            raise ValidationError({"detail": "Restore PO could not be created because the failed component data is incomplete."})
+
+        metadata["procurement_restore_ready"] = False
+        metadata["procurement_restore_status"] = "PO_RAISED"
+        metadata["restore_po_id"] = po.pk
+        metadata["restore_po_number"] = po.po_number
+        metadata["restore_po_raised_by"] = self.get_actor_name(user)
+        metadata["restore_po_raised_at"] = timezone.now().isoformat()
+        instance.inventory_allocations = metadata
+        instance.save(update_fields=["inventory_allocations", "updated_at"])
+
+        Notification.objects.filter(
+            category="PROC",
+            receiver="PROCUREMENT",
+            reference_id=str(instance.pk),
+        ).update(status="PO_RAISED", is_read=True)
+
+        # Keep linked Returnable rows auditable while replacement moves through PO/Inward/QC.
+        from componentusage.models import ComponentUsage
+        usage_ids = metadata.get("returnable_usage_ids") or []
+        for usage in ComponentUsage.objects.select_for_update().filter(pk__in=usage_ids):
+            details = usage.inventory_issue_details if isinstance(usage.inventory_issue_details, dict) else {}
+            details.update({
+                "restore_po_id": po.pk,
+                "restore_po_number": po.po_number,
+                "restore_status": "PO_RAISED",
+            })
+            usage.inventory_issue_details = details
+            usage.save(update_fields=["inventory_issue_details"])
+
+        return Response({
+            "detail": "Restore replacement PO raised successfully.",
+            "purchase_order_id": po.pk,
+            "po_number": po.po_number,
+            "status": po.status,
+        }, status=status.HTTP_201_CREATED)
+
+    @action(
+        detail=True,
+        methods=["post"],
         url_path="manager-approve",
     )
     def manager_approve(
@@ -5203,6 +6062,14 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
         Then create the Finance notification and Finance approval email.
         """
         user = self.require_manager(request)
+
+        reorder_choice = str(
+            request.data.get(
+                "reorder_choice",
+                request.data.get("reorderChoice", ""),
+            )
+            or ""
+        ).strip().upper()
 
         with transaction.atomic():
             instance = (
@@ -5245,6 +6112,62 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                 self.get_actor_name(user)
             )
 
+            metadata = (
+                instance.inventory_allocations
+                if isinstance(instance.inventory_allocations, dict)
+                else {}
+            )
+
+            workflow = str(metadata.get("workflow") or "").strip().upper()
+            if workflow in {
+                "ENGINEER_MR_SCRAP_DISPOSITION_V1",
+                "RETURNABLE_DRONE_QC_V1",
+                "RETURNABLE_COMPONENT_QC_V1",
+            }:
+                scrap_mode = str(metadata.get("scrap_mode", "PARTIAL") or "PARTIAL").strip().upper()
+
+                if workflow == "RETURNABLE_COMPONENT_QC_V1":
+                    if reorder_choice not in {"YES", "NO"}:
+                        raise ValidationError({
+                            "reorder_choice": (
+                                "Choose YES to restore/replace the failed component "
+                                "after Finance approval, or NO for final Scrap."
+                            )
+                        })
+                elif workflow == "RETURNABLE_DRONE_QC_V1":
+                    if reorder_choice not in {"YES", "NO"}:
+                        raise ValidationError({
+                            "reorder_choice": (
+                                "Choose YES to rebuild the returned drone or NO to retire it "
+                                "and return only the good components to In Store."
+                            )
+                        })
+                else:
+                    if scrap_mode == "PARTIAL" and reorder_choice not in {"YES", "NO"}:
+                        raise ValidationError({
+                            "reorder_choice": (
+                                "Choose YES to rebuild this Material Request "
+                                "or NO to return reusable components to In Store."
+                            )
+                        })
+                    if scrap_mode == "TOTAL":
+                        reorder_choice = "NO"
+
+                selected_items = metadata.get("selected_items", []) or []
+                metadata["reorder_choice"] = reorder_choice
+                metadata["manager_disposition_decision"] = reorder_choice
+                metadata["manager_decided_by"] = manager_name
+                metadata["manager_decided_at"] = timezone.now().isoformat()
+                metadata["return_items"] = selected_items if reorder_choice == "NO" else []
+                metadata["reorder_items"] = selected_items if reorder_choice == "YES" else []
+                metadata["return_quantity"] = sum(
+                    int(item.get("quantity", 0) or 0) for item in metadata["return_items"]
+                )
+                metadata["reorder_quantity"] = sum(
+                    int(item.get("quantity", 0) or 0) for item in metadata["reorder_items"]
+                )
+                instance.inventory_allocations = metadata
+
             # Manager approval advances the request to Finance.
             instance.approval_status = (
                 "PENDING_FINANCE"
@@ -5259,9 +6182,29 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                     "status",
                     "rejection_reason",
                     "rejected_by",
+                    "inventory_allocations",
                     "updated_at",
                 ]
             )
+
+            if workflow == "RETURNABLE_COMPONENT_QC_V1":
+                disposition_label = (
+                    "RESTORE / REPLACE"
+                    if reorder_choice == "YES"
+                    else "FINAL SCRAP"
+                )
+            elif workflow == "RETURNABLE_DRONE_QC_V1":
+                disposition_label = (
+                    "REBUILD DRONE"
+                    if reorder_choice == "YES"
+                    else "RETIRE DRONE"
+                )
+            else:
+                disposition_label = (
+                    "REBUILD MR"
+                    if reorder_choice == "YES"
+                    else "RETURN TO STORE"
+                )
 
             # Manager's own notification is now completed.
             Notification.objects.filter(
@@ -5274,9 +6217,16 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                 status="MANAGER_APPROVED",
                 is_read=True,
                 message=(
-                    f"Scrap approved by "
-                    f"{manager_name}; pending Finance approval."
+                    f"Scrap approved by {manager_name}; "
+                    f"disposition {disposition_label}; "
+                    "pending Finance approval."
                 ),
+            )
+
+            # Keep Returnable audit rows in the same strict approval stage.
+            self.sync_returnable_usage_status(
+                metadata,
+                "PENDING_FINANCE",
             )
 
             # Finance notification exists only after Manager approval.
@@ -5408,8 +6358,19 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                 ),
             )
 
-            # Manager rejection is final. Remove any impossible stale
-            # Finance-stage notification and notify only the exact creator.
+            # Manager rejection is final. Returnable usage stops here.
+            metadata = (
+                instance.inventory_allocations
+                if isinstance(instance.inventory_allocations, dict)
+                else {}
+            )
+            self.sync_returnable_usage_status(
+                metadata,
+                "REJECTED",
+                reason=f"Manager rejected: {reason}",
+            )
+
+            # Remove any impossible stale Finance-stage notification.
             Notification.objects.filter(
                 category="SCRAP",
                 receiver="FINANCE",

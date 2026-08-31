@@ -1,23 +1,16 @@
 Dear {{ recipient_name }},
 
-{{ message }}
+Your IPMS login verification code is:
 
-Request Details
-------------------------------------------------------------
+{{ code }}
 
-{% for header in table_headers %}{{ header }}{% if not forloop.last %} | {% endif %}{% endfor %}
-{% for value in table_values %}{{ value }}{% if not forloop.last %} | {% endif %}{% endfor %}
+This verification code will expire in {{ expiry_minutes }} minutes.
 
-Status: {{ status }}
-
-Please review the request and take the appropriate action in IPMS.
-
-{{ button_text }}
-
-{{ action_url }}
+If you did not attempt to sign in to IPMS, please contact your IPMS administrator.
 
 Regards,
 IPMS
 Inventory & Procurement Management System
 
-This is an automated notification. Please do not reply to this email.
+This is an automated security message.
+Please do not reply to this email.

@@ -455,11 +455,21 @@ class ProjectInventoryViewSet(
             material_request.request_type or ""
         ).strip().upper()
 
-        manager = (
-            material_request.rd_items
-            if request_type in {"R&D", "RD"}
-            else material_request.bom_items
-        )
+        if request_type in {"R&D", "RD"}:
+            manager = material_request.rd_items
+        elif request_type in {"RETAIL_SALES", "RETURNABLE"}:
+            # Retail Sales / Returnable are created with request_items.
+            manager = getattr(
+                material_request,
+                "request_items",
+                None,
+            )
+            if manager is None:
+                raise ValueError(
+                    "This request type requires the request_items relation."
+                )
+        else:
+            manager = material_request.bom_items
 
         queryset = manager.all().order_by("id")
 

@@ -7,22 +7,41 @@ class ComponentUsage(models.Model):
         ("RETURNED", "Returned"),
         ("PENDING", "Pending"),
     ]
-
     SOURCE_CHOICES = [
         ("INVENTORY", "In-Store Component"),
         ("OTHER", "Other Item"),
     ]
+    PURPOSE_CHOICES = [
+        ("FLIGHT_TEST", "Flight Test"),
+        ("CUSTOMER_DEMO", "Customer Demo"),
+        ("QC_CHECK", "QC Check"),
+        ("EVENT", "Event"),
+        ("MISCELLANEOUS_USAGE", "Miscellaneous Usage"),
+    ]
+    RETURN_CONDITION_CHOICES = [
+        ("", "Not Checked"),
+        ("OK", "OK"),
+        ("NOT_OK", "Not OK"),
+    ]
+    RETURN_APPROVAL_CHOICES = [
+        ("NOT_REQUIRED", "Not Required"),
+        ("PENDING_MANAGER", "Pending Manager"),
+        ("PENDING_FINANCE", "Pending Finance"),
+        ("APPROVED", "Approved"),
+        ("REJECTED", "Rejected"),
+        ("COMPLETED", "Completed"),
+    ]
 
-    employee_name = models.CharField(max_length=100)
-
-    # INVENTORY = linked to Component master and physical In-Store stock.
-    # OTHER = calculator, notebook, charger, battery pack, etc.
-    item_source = models.CharField(
-        max_length=20,
-        choices=SOURCE_CHOICES,
-        default="INVENTORY",
+    material_request = models.ForeignKey(
+        "materialrequest.MaterialRequest",
+        on_delete=models.CASCADE,
+        related_name="returnable_records",
+        null=True,
+        blank=True,
+        db_index=True,
     )
-
+    employee_name = models.CharField(max_length=100)
+    item_source = models.CharField(max_length=20, choices=SOURCE_CHOICES, default="INVENTORY")
     component = models.ForeignKey(
         "components.Component",
         on_delete=models.PROTECT,
@@ -30,62 +49,36 @@ class ComponentUsage(models.Model):
         null=True,
         blank=True,
     )
-
-    # Keep these snapshot/text fields for existing records and for OTHER items.
-    component_name = models.CharField(
-        max_length=150,
-        blank=True,
-        default="",
-    )
-
-    # Existing field is retained, but in the UI it is presented as Category.
-    component_type = models.CharField(
-        max_length=100,
-        blank=True,
-        default="",
-    )
+    component_name = models.CharField(max_length=150, blank=True, default="")
+    component_type = models.CharField(max_length=100, blank=True, default="")
+    purpose = models.CharField(max_length=30, choices=PURPOSE_CHOICES, blank=True, default="", db_index=True)
 
     requested_date = models.DateField()
+    return_due_date = models.DateField(null=True, blank=True)
     issued_date = models.DateField(null=True, blank=True)
     received_date = models.DateField(null=True, blank=True)
-
     quantity = models.PositiveIntegerField(default=1)
-
-    status = models.CharField(
-        max_length=20,
-        choices=STATUS_CHOICES,
-        default="PENDING",
-    )
-
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="PENDING")
     remarks = models.TextField(blank=True, null=True)
 
-    # Exact physical Inventory serials actually issued for this usage record.
-    # Serial selection is OPTIONAL. If the user does not select serials,
-    # the backend chooses FIFO serials and stores the actual issued serials here.
-    issued_serial_numbers = models.JSONField(
-        default=list,
+    return_condition = models.CharField(
+        max_length=10,
+        choices=RETURN_CONDITION_CHOICES,
         blank=True,
+        default="",
+        db_index=True,
+    )
+    return_reason = models.TextField(blank=True, default="")
+    return_approval_status = models.CharField(
+        max_length=30,
+        choices=RETURN_APPROVAL_CHOICES,
+        default="NOT_REQUIRED",
+        db_index=True,
     )
 
-    # Audit trail of the physical Inventory rows used for this issue.
-    # Example:
-    # [
-    #   {
-    #       "inventory_id": 12,
-    #       "inventory_code": "INV00012",
-    #       "quantity": 2,
-    #       "serial_numbers": ["...", "..."]
-    #   }
-    # ]
-    inventory_issue_details = models.JSONField(
-        default=list,
-        blank=True,
-    )
-
-    # True only after physical In-Store stock has actually been deducted.
+    issued_serial_numbers = models.JSONField(default=list, blank=True)
+    inventory_issue_details = models.JSONField(default=list, blank=True)
     inventory_adjusted = models.BooleanField(default=False)
-
-    # True after the same physical stock has been restored on RETURNED.
     inventory_returned = models.BooleanField(default=False)
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -93,13 +86,21 @@ class ComponentUsage(models.Model):
 
     class Meta:
         ordering = ["-created_at", "-id"]
+        indexes = [
+            models.Index(fields=["purpose", "status"], name="cu_purpose_status_idx"),
+            models.Index(fields=["return_condition", "return_approval_status"], name="cu_return_flow_idx"),
+        ]
 
     def __str__(self):
-        return f"{self.employee_name} - {self.component_name}"
+        reference = (
+            getattr(self.material_request, "material_request_id", "")
+            if self.material_request_id
+            else ""
+        )
+        return f"{reference or self.employee_name} - {self.component_name}"
 
     def save(self, *args, **kwargs):
         if self.component_id and self.item_source == "INVENTORY":
-            # Snapshot the master values so the usage history remains readable.
             self.component_name = self.component.name
             self.component_type = self.component.category
 

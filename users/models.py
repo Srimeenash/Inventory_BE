@@ -184,6 +184,10 @@ class User(
             "Manager",
         ),
         (
+            "management",
+            "Management",
+        ),
+        (
             "admin",
             "Admin",
         ),
