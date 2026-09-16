@@ -1,9 +1,11 @@
 from collections import defaultdict
+import re
+import threading
 from decimal import Decimal, ROUND_HALF_UP
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.db import transaction
+from django.db import close_old_connections, transaction
 from django.db.models import Max, Q, Sum
 from django.utils import timezone
 from django.utils.dateparse import parse_date
@@ -12,6 +14,11 @@ from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from inventory_backend.pagination import (
+    OptionalPageNumberPagination,
+    apply_server_query_parameters,
+)
+from inventory_backend.cache_utils import invalidate_cache_version
 from rest_framework_simplejwt.authentication import JWTAuthentication
 
 from inventory.models import (
@@ -22,6 +29,7 @@ from inventory.models import (
 from materialrequest.models import MaterialRequest
 from notifications.email_service import send_ipms_email
 from notifications.models import Notification
+from outward.models import OutwardEntry
 from procurement.models import (
     PurchaseOrder,
     PurchaseOrderApproval,
@@ -33,6 +41,33 @@ from .serializers import InwardEntrySerializer
 
 
 User = get_user_model()
+
+NOTIFICATION_LIST_CACHE_VERSION_KEY = (
+    "ipms:notifications:list:version"
+)
+PURCHASE_ORDER_LIST_CACHE_VERSION_KEY = (
+    "ipms:purchase_orders:list:version"
+)
+
+
+def invalidate_purchase_orders_list_cache():
+    """Refresh cached Purchase Order lists."""
+    try:
+        invalidate_cache_version(
+            PURCHASE_ORDER_LIST_CACHE_VERSION_KEY
+        )
+    except Exception:
+        pass
+
+def invalidate_notifications_list_cache():
+    """Bump the Notification list cache version after direct DB writes."""
+    try:
+        invalidate_cache_version(
+            NOTIFICATION_LIST_CACHE_VERSION_KEY
+        )
+    except Exception:
+        # Notification workflow must not fail only because cache is unavailable.
+        pass
 
 
 class InwardQCSerializer(serializers.Serializer):
@@ -176,6 +211,7 @@ class InwardQCSerializer(serializers.Serializer):
 
 class InwardEntryViewSet(viewsets.ModelViewSet):
     serializer_class = InwardEntrySerializer
+    pagination_class = OptionalPageNumberPagination
 
     # Every Inward request must resolve the logged-in JWT user.
     # request.user comes from the access token and request.auth
@@ -280,6 +316,28 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
 
         return allowed_roles[0] if allowed_roles else ""
 
+    @staticmethod
+    def get_replacement_po_summary(
+        purchase_order,
+    ):
+        if purchase_order is None:
+            return None
+
+        return {
+            "id":
+                purchase_order.pk,
+            "po_number":
+                purchase_order.po_number,
+            "status":
+                purchase_order.status,
+            "approval_status":
+                purchase_order.approval_status,
+            "replacement_round":
+                purchase_order.replacement_round,
+            "source_mr_number":
+                purchase_order.source_mr_number,
+        }
+
     def require_replacement_request_role(self, request):
         role = self.get_request_active_role(request)
 
@@ -344,13 +402,32 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                 .get(pk=inward_entry_id)
             )
 
-            replacement_po = PurchaseOrder.objects.get(
-                pk=replacement_po_id
+            purchase_orders = (
+                PurchaseOrder.objects.in_bulk(
+                    [
+                        replacement_po_id,
+                        source_po_id,
+                    ]
+                )
             )
 
-            source_po = PurchaseOrder.objects.get(
-                pk=source_po_id
+            replacement_po = (
+                purchase_orders.get(
+                    replacement_po_id
+                )
             )
+
+            source_po = (
+                purchase_orders.get(
+                    source_po_id
+                )
+            )
+
+            if (
+                replacement_po is None
+                or source_po is None
+            ):
+                raise PurchaseOrder.DoesNotExist
         except (
             InwardEntry.DoesNotExist,
             PurchaseOrder.DoesNotExist,
@@ -604,7 +681,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
         except MaterialRequest.DoesNotExist:
             return False
 
-        inventory_users = (
+        inventory_users = list(
             User.objects
             .filter(
                 role__iexact="inventory",
@@ -615,7 +692,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             .order_by("id")
         )
 
-        if not inventory_users.exists():
+        if not inventory_users:
             print(
                 "QC INVENTORY EMAIL SKIPPED:",
                 material_request.material_request_id,
@@ -857,8 +934,37 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
 
         return sent_any
 
+    def queue_inventory_qc_ready_email(
+        self,
+        material_request_id,
+        *,
+        workflow_complete=False,
+    ):
+        """Send the QC notification after commit without blocking the QC response."""
+        def send_email():
+            close_old_connections()
+            try:
+                self.send_inventory_qc_ready_email(
+                    material_request_id,
+                    workflow_complete=workflow_complete,
+                )
+            except Exception as error:
+                print(
+                    "QC INVENTORY EMAIL FAILED:",
+                    material_request_id,
+                    error,
+                )
+            finally:
+                close_old_connections()
+
+        threading.Thread(
+            target=send_email,
+            name="qc-inventory-email",
+            daemon=True,
+        ).start()
+
     def get_queryset(self):
-        return (
+        queryset = (
             InwardEntry.objects
             .select_related(
                 "vendor",
@@ -872,6 +978,36 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                 | Q(removed_from_inventory__isnull=True)
             )
             .order_by("-received_date", "-id")
+        )
+
+        return apply_server_query_parameters(
+            queryset,
+            self.request,
+            search_fields=(
+                "code",
+                "vendor__name",
+                "component__component_id",
+                "component__name",
+                "batch_number",
+                "qc_status",
+                "remarks",
+            ),
+            filter_fields={
+                "qc_status": "qc_status__iexact",
+                "vendor": "vendor_id",
+                "component": "component_id",
+                "purchase_order": "purchase_order_id",
+                "removed_from_inventory": "removed_from_inventory",
+            },
+            boolean_fields=("removed_from_inventory",),
+            ordering_fields=(
+                "code",
+                "received_date",
+                "quantity_received",
+                "qc_status",
+                "created_at",
+            ),
+            default_ordering=("-received_date", "-id"),
         )
 
     @staticmethod
@@ -922,6 +1058,374 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             )
             or ""
         ).strip()
+
+    @staticmethod
+    def is_returnable_restore_po(
+        purchase_order,
+    ):
+        if purchase_order is None:
+            return False
+
+        remarks = str(
+            getattr(
+                purchase_order,
+                "remarks",
+                "",
+            )
+            or ""
+        ).upper()
+
+        return (
+            "RETURNABLE_RESTORE"
+            in remarks
+            and "RETURNABLE_RESTORE_OUTWARD:"
+            in remarks
+        )
+
+    @staticmethod
+    def get_returnable_restore_outward_id(
+        purchase_order,
+    ):
+        if purchase_order is None:
+            return None
+
+        remarks = str(
+            getattr(
+                purchase_order,
+                "remarks",
+                "",
+            )
+            or ""
+        )
+
+        match = re.search(
+            r"RETURNABLE_RESTORE_OUTWARD:(\d+)",
+            remarks,
+            flags=re.IGNORECASE,
+        )
+
+        if not match:
+            return None
+
+        try:
+            return int(
+                match.group(1)
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return None
+
+    @classmethod
+    def complete_returnable_restore_after_qc(
+        cls,
+        inward_entry,
+        *,
+        passed_quantity,
+        failed_quantity,
+        inventory_row=None,
+    ):
+        """
+        Restore PO destination is Central In Store, NOT the old Returnable MR.
+
+        When a Restore replacement delivery passes QC:
+            PO/Inward -> QC PASS -> Central In Store
+
+        If part of the Restore delivery fails QC, passed units are still
+        kept in In Store while the failed units remain traceable.
+        """
+        purchase_order = getattr(
+            inward_entry,
+            "purchase_order",
+            None,
+        )
+
+        if not cls.is_returnable_restore_po(
+            purchase_order
+        ):
+            return
+
+        outward_id = (
+            cls.get_returnable_restore_outward_id(
+                purchase_order
+            )
+        )
+
+        if not outward_id:
+            return
+
+        outward = (
+            OutwardEntry.objects
+            .select_for_update()
+            .filter(
+                pk=outward_id
+            )
+            .first()
+        )
+
+        if outward is None:
+            return
+
+        metadata = (
+            outward.inventory_allocations
+            if isinstance(
+                outward.inventory_allocations,
+                dict,
+            )
+            else {}
+        )
+
+        po_ids = [
+            str(value)
+            for value in (
+                metadata.get(
+                    "restore_po_ids"
+                )
+                or []
+            )
+            if value
+            not in (
+                None,
+                "",
+            )
+        ]
+
+        current_po_id = str(
+            getattr(
+                purchase_order,
+                "pk",
+                "",
+            )
+            or ""
+        )
+
+        completed_po_ids = {
+            str(value)
+            for value in (
+                metadata.get(
+                    "restore_completed_po_ids"
+                )
+                or []
+            )
+            if value
+            not in (
+                None,
+                "",
+            )
+        }
+
+        if (
+            int(passed_quantity or 0)
+            > 0
+        ):
+            completed_po_ids.add(
+                current_po_id
+            )
+
+        metadata[
+            "restore_completed_po_ids"
+        ] = sorted(
+            completed_po_ids
+        )
+
+        metadata[
+            "restore_last_inward_id"
+        ] = inward_entry.pk
+
+        metadata[
+            "restore_last_inward_code"
+        ] = inward_entry.code
+
+        metadata[
+            "restore_last_qc_passed_quantity"
+        ] = max(
+            int(
+                passed_quantity
+                or 0
+            ),
+            0,
+        )
+
+        metadata[
+            "restore_last_qc_failed_quantity"
+        ] = max(
+            int(
+                failed_quantity
+                or 0
+            ),
+            0,
+        )
+
+        if inventory_row is not None:
+            metadata[
+                "restore_inventory_ids"
+            ] = list(
+                dict.fromkeys(
+                    [
+                        *(
+                            metadata.get(
+                                "restore_inventory_ids"
+                            )
+                            or []
+                        ),
+                        inventory_row.pk,
+                    ]
+                )
+            )
+
+        all_restore_pos_completed = bool(
+            po_ids
+        ) and all(
+            po_id in completed_po_ids
+            for po_id in po_ids
+        )
+
+        if (
+            all_restore_pos_completed
+            and max(
+                int(
+                    failed_quantity
+                    or 0
+                ),
+                0,
+            )
+            == 0
+        ):
+            metadata[
+                "procurement_restore_status"
+            ] = "COMPLETED_IN_STORE"
+
+            outward.approval_status = (
+                "RESTORE_COMPLETED"
+            )
+
+            outward.status = (
+                "RESTORE_COMPLETED_IN_STORE"
+            )
+
+            usage_status = (
+                "COMPLETED"
+            )
+        else:
+            metadata[
+                "procurement_restore_status"
+            ] = (
+                "PARTIALLY_RESTORED"
+                if int(
+                    passed_quantity
+                    or 0
+                )
+                > 0
+                else "RESTORE_QC_FAILED"
+            )
+
+            outward.status = (
+                metadata[
+                    "procurement_restore_status"
+                ]
+            )
+
+            usage_status = (
+                "NOT_REQUIRED"
+            )
+
+        outward.inventory_allocations = (
+            metadata
+        )
+
+        outward.save(
+            update_fields=[
+                "inventory_allocations",
+                "approval_status",
+                "status",
+                "updated_at",
+            ]
+        )
+
+        # Returned-drone PR/FR child MR is a tracking row under the original
+        # Returnable MR family. Complete it only when every Restore/Reorder PO
+        # has passed Inward QC and the replacement stock is back in In Store.
+        replacement_mr_id = metadata.get("replacement_mr_id")
+        if replacement_mr_id:
+            from materialrequest.models import MaterialRequest
+
+            if metadata.get("procurement_restore_status") == "COMPLETED_IN_STORE":
+                MaterialRequest.objects.filter(pk=replacement_mr_id).update(
+                    status="MR_COMPLETED",
+                    approval_status="MANAGER_APPROVED",
+                    po_raised=True,
+                )
+
+        # Mark linked Returnable audit rows.
+        from componentusage.models import ComponentUsage
+
+        usage_ids = (
+            metadata.get(
+                "returnable_usage_ids"
+            )
+            or []
+        )
+
+        for usage in (
+            ComponentUsage.objects
+            .select_for_update()
+            .filter(
+                pk__in=usage_ids
+            )
+        ):
+            details = (
+                usage.inventory_issue_details
+                if isinstance(
+                    usage.inventory_issue_details,
+                    list,
+                )
+                else []
+            )
+
+            if not details:
+                details = [{}]
+
+            details[0][
+                "restore_status"
+            ] = metadata[
+                "procurement_restore_status"
+            ]
+
+            details[0][
+                "restore_last_inward_id"
+            ] = inward_entry.pk
+
+            if inventory_row is not None:
+                details[0][
+                    "restore_inventory_id"
+                ] = inventory_row.pk
+
+            usage.inventory_issue_details = (
+                details
+            )
+
+            if (
+                metadata[
+                    "procurement_restore_status"
+                ]
+                == "COMPLETED_IN_STORE"
+            ):
+                usage.return_approval_status = (
+                    usage_status
+                )
+                usage.inventory_returned = (
+                    True
+                )
+
+            usage.save(
+                update_fields=[
+                    "inventory_issue_details",
+                    "return_approval_status",
+                    "inventory_returned",
+                ]
+            )
+
 
     @staticmethod
     def normalize_serials(values):
@@ -989,7 +1493,22 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             )
         )
 
-        if source_mr_number:
+        purchase_order = getattr(
+            inward_entry,
+            "purchase_order",
+            None,
+        )
+
+        is_restore_po = (
+            cls.is_returnable_restore_po(
+                purchase_order
+            )
+        )
+
+        if (
+            source_mr_number
+            and not is_restore_po
+        ):
             return None
 
         inventory_code = str(
@@ -1630,9 +2149,37 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                 ),
             )
 
+            project_row = (
+                ProjectInventory.objects
+                .select_for_update()
+                .filter(
+                    material_request=
+                        material_request,
+                    component_id=
+                        component_id,
+                )
+                .first()
+            )
+
+            # ProjectInventory.store_quantity includes BOTH:
+            #   recovered From-Scrap units + Central In-Store allocation.
+            # This avoids asking Procurement to replace units that were
+            # already recovered into a _PR / _FR rebuild MR.
+            non_purchased_ready = min(
+                required_quantity,
+                int(
+                    getattr(
+                        project_row,
+                        "store_quantity",
+                        reserved_store_quantity,
+                    )
+                    or 0
+                ),
+            )
+
             procurement_requirement = max(
                 required_quantity
-                - reserved_store_quantity,
+                - non_purchased_ready,
                 0,
             )
 
@@ -1909,7 +2456,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                 if newly_qc_ready_quantity > 0:
                     transaction.on_commit(
                         lambda mr_id=material_request.id: (
-                            self.send_inventory_qc_ready_email(
+                            self.queue_inventory_qc_ready_email(
                                 mr_id,
                                 workflow_complete=False,
                             )
@@ -1995,7 +2542,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
         if should_send_complete_qc_email:
             transaction.on_commit(
                 lambda mr_id=material_request.id: (
-                    self.send_inventory_qc_ready_email(
+                    self.queue_inventory_qc_ready_email(
                         mr_id,
                         workflow_complete=True,
                     )
@@ -2105,18 +2652,46 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             or ""
         ).strip()
 
-        is_direct_po = (
-            str(
-                getattr(
-                    source_po,
-                    "order_type",
-                    "STANDARD",
-                )
-                or "STANDARD"
-            ).strip().upper()
-            != "REPLACEMENT"
-            and not source_mr_number
-        )
+        # ------------------------------------------------------------
+        # DIRECT vs MR FLOW
+        # ------------------------------------------------------------
+        # A PO belongs to the Direct flow whenever it has no MR link.
+        #
+        # IMPORTANT:
+        # A Direct-origin replacement such as:
+        #     01/26-27-R1
+        # still has order_type="REPLACEMENT", but it is STILL a Direct
+        # flow PO because source_mr_number is empty.
+        #
+        # Therefore do not use order_type to decide Direct vs MR.
+        # ------------------------------------------------------------
+        is_direct_po = not source_mr_number
+
+        current_qc_action = str(
+            inward_entry.qc_failed_action
+            or "NONE"
+        ).strip().upper()
+
+        # Request may already be waiting for Procurement before a PO exists.
+        if (
+            current_qc_action
+            == "REPLACEMENT_REQUESTED"
+            and not inward_entry
+            .replacement_purchase_order_id
+        ):
+            return Response(
+                {
+                    "detail":
+                        "Replacement is already pending Procurement approval.",
+                    "status":
+                        "PENDING_PROCUREMENT",
+                    "inward":
+                        self.get_serializer(
+                            inward_entry
+                        ).data,
+                },
+                status=status.HTTP_200_OK,
+            )
 
         # Idempotency: one failed Inward row cannot create duplicate POs.
         if inward_entry.replacement_purchase_order_id:
@@ -2326,79 +2901,69 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                 failed_quantity
             )
 
-        last_round = (
-            PurchaseOrder.objects
-            .filter(
-                replacement_for=root_po,
-                order_type="REPLACEMENT",
-            )
-            .aggregate(max_round=Max("replacement_round"))
-            .get("max_round")
-            or 0
+        actor = self.get_request_actor_name(
+            request
         )
-        replacement_round = int(last_round) + 1
 
-        replacement_po_number = (
-            f"{root_po.po_number}-R{replacement_round}"
-        )
-        while PurchaseOrder.objects.filter(
-            po_number=replacement_po_number
-        ).exists():
-            replacement_round += 1
-            replacement_po_number = (
-                f"{root_po.po_number}-R{replacement_round}"
+        # Persist the request parameters on the QC-failed rows.
+        # No Replacement PO exists until Procurement approves.
+        updated_failed_rows = []
+
+        for raw_row in (
+            inward_entry.qc_failed_rows
+            or []
+        ):
+            row = (
+                dict(raw_row)
+                if isinstance(
+                    raw_row,
+                    dict,
+                )
+                else {}
             )
 
-        replacement_po = PurchaseOrder.objects.create(
-            po_number=replacement_po_number,
-            vendor_name=source_po.vendor_name,
-            gstin=source_po.gstin,
-            location=source_po.location,
-            ordered_date=None,
-            expected_delivery_date=expected_delivery_date,
-            remarks=(
-                f"QC replacement for {source_po.po_number}; "
-                f"Inward {inward_entry.code}; "
-                f"component {getattr(component, 'component_id', component.id)}."
-            ),
-            finance_remarks=None,
-            status="REPLACEMENT_PENDING_MANAGER",
-            approval_status="REPLACEMENT_PENDING_MANAGER",
-            source_mr_number=(source_mr_number or None),
-            order_type="REPLACEMENT",
-            replacement_for=root_po,
-            replacement_round=replacement_round,
-            replacement_source_inward_id=inward_entry.id,
+            row[
+                "replacement_request_status"
+            ] = "PENDING_PROCUREMENT"
+
+            row[
+                "replacement_expected_delivery_date"
+            ] = (
+                expected_delivery_date
+                .isoformat()
+            )
+
+            row[
+                "replacement_requested_quantity"
+            ] = replacement_quantity
+
+            row[
+                "replacement_requested_by"
+            ] = actor
+
+            row[
+                "replacement_requested_at"
+            ] = timezone.now().isoformat()
+
+            updated_failed_rows.append(
+                row
+            )
+
+        inward_entry.qc_failed_rows = (
+            updated_failed_rows
         )
 
-        PurchaseOrderItem.objects.create(
-            purchase_order=replacement_po,
-            component=component,
-            quantity=replacement_quantity,
-            received_quantity=0,
-            unit_price=source_item.unit_price,
-            gst_percentage=source_item.gst_percentage,
+        inward_entry.qc_failed_action = (
+            "REPLACEMENT_REQUESTED"
         )
 
-        # Replacement PO approval is Procurement-only.
-        # Remove any Manager/Finance PO notification for this replacement.
-        Notification.objects.filter(
-            category="PO",
-            reference_id=str(replacement_po.id),
-            receiver__in=["MANAGER", "FINANCE"],
-        ).delete()
-
-        actor = self.get_request_actor_name(request)
-        PurchaseOrderApproval.objects.create(
-            purchase_order=replacement_po,
-            action="REPLACEMENT_REQUESTED",
-            requested_by=actor,
+        inward_entry.replacement_purchase_order = (
+            None
         )
 
-        inward_entry.qc_failed_action = "REPLACEMENT_REQUESTED"
-        inward_entry.replacement_purchase_order = replacement_po
         inward_entry.save(
             update_fields=[
+                "qc_failed_rows",
                 "qc_failed_action",
                 "replacement_purchase_order",
                 "updated_at",
@@ -2419,7 +2984,9 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             material_request.status = (
                 "AWAITING_REPLACEMENT_APPROVAL"
             )
+
             material_request.po_raised = True
+
             material_request.save(
                 update_fields=[
                     "status",
@@ -2427,44 +2994,947 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                 ]
             )
 
-        # No Manager/Finance notification is created for this step.
-        # Procurement receives EMAIL ONLY and approves from the PO table.
-        transaction.on_commit(
-            lambda: self.send_procurement_replacement_approval_email(
-                inward_entry_id=inward_entry.id,
-                replacement_po_id=replacement_po.id,
-                source_po_id=source_po.id,
-                material_request_id=(
-                    material_request.id
-                    if material_request
-                    else None
+        Notification.objects.update_or_create(
+            category="QC_FAILED",
+            receiver="PROCUREMENT",
+            reference_id=(
+                f"INWARD:{inward_entry.pk}"
+            ),
+            defaults={
+                "requested_by":
+                    actor,
+                "title": (
+                    "QC Failed Replacement Approval - "
+                    f"{source_po.po_number}"
                 ),
-                replacement_quantity=replacement_quantity,
-            )
+                "message": (
+                    f"{getattr(component, 'component_id', component.id)} "
+                    f"failed QC. Replacement quantity: "
+                    f"{replacement_quantity}. "
+                    "Approve to automatically create the replacement PO "
+                    "with the same vendor and source PO terms."
+                ),
+                "status":
+                    "PENDING_PROCUREMENT",
+                "is_read":
+                    False,
+            },
         )
+
+        invalidate_notifications_list_cache()
 
         return Response(
             {
-                "detail": "Replacement PO raised successfully and is pending Procurement approval.",
-                "inward": self.get_serializer(inward_entry).data,
+                "detail": (
+                    "Replacement request sent to Procurement. "
+                    "The Replacement PO will be created only after "
+                    "Procurement approval."
+                ),
+                "status":
+                    "PENDING_PROCUREMENT",
+                "replacement_quantity":
+                    replacement_quantity,
+                "expected_delivery_date":
+                    expected_delivery_date.isoformat(),
+                "source_po_number":
+                    source_po.po_number,
+                "source_mr_number":
+                    source_mr_number,
+                "inward":
+                    self.get_serializer(
+                        inward_entry
+                    ).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="procurement-approve-replacement",
+    )
+    @transaction.atomic
+    def procurement_approve_replacement(
+        self,
+        request,
+        pk=None,
+    ):
+        """
+        Procurement approves a QC-failed Replacement request.
+
+        This is the moment the Replacement PO is created.
+
+        Flow:
+            Inventory -> Replacement
+            -> PENDING_PROCUREMENT
+            -> Procurement Approve
+            -> create PO with SAME vendor / component / failed quantity
+            -> REPLACEMENT_APPROVED
+            -> Procurement can mark the Replacement PO Ordered
+        """
+        role = self.get_request_active_role(
+            request
+        )
+
+        if role not in {
+            "procurement",
+            "admin",
+        }:
+            from rest_framework.exceptions import PermissionDenied
+
+            raise PermissionDenied(
+                "Only Procurement can approve a QC replacement request."
+            )
+
+        try:
+            inward_entry = (
+                InwardEntry.objects
+                .select_for_update()
+                .select_related(
+                    "component",
+                    "purchase_order",
+                    "replacement_purchase_order",
+                )
+                .get(pk=pk)
+            )
+        except InwardEntry.DoesNotExist:
+            return Response(
+                {
+                    "detail":
+                        "Inward entry not found."
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if (
+            inward_entry
+            .replacement_purchase_order_id
+        ):
+            replacement_po = (
+                inward_entry
+                .replacement_purchase_order
+            )
+
+            return Response(
+                {
+                    "detail":
+                        "Replacement PO already exists.",
+                    "replacement_purchase_order":
+                        self.get_replacement_po_summary(
+                            replacement_po
+                        ),
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        if (
+            str(
+                inward_entry
+                .qc_failed_action
+                or ""
+            )
+            .strip()
+            .upper()
+            != "REPLACEMENT_REQUESTED"
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "This QC failure is not waiting for "
+                        "Procurement replacement approval."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        failed_quantity = (
+            self.get_qc_rows_quantity(
+                inward_entry.qc_failed_rows
+            )
+        )
+
+        if failed_quantity <= 0:
+            return Response(
+                {
+                    "detail":
+                        "This Inward entry has no QC-failed quantity."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        source_po = (
+            inward_entry.purchase_order
+        )
+
+        component = (
+            inward_entry.component
+        )
+
+        if (
+            source_po is None
+            or component is None
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "The failed component or source Purchase Order "
+                        "could not be resolved."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        source_mr_number = str(
+            source_po.source_mr_number
+            or ""
+        ).strip()
+
+        source_item = (
+            PurchaseOrderItem.objects
+            .select_for_update()
+            .filter(
+                purchase_order=
+                    source_po,
+                component=
+                    component,
+            )
+            .order_by("id")
+            .first()
+        )
+
+        if source_item is None:
+            return Response(
+                {
+                    "detail": (
+                        "The failed component is not present "
+                        "on the source Purchase Order."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        material_request = None
+
+        if source_mr_number:
+            material_request = (
+                MaterialRequest.objects
+                .select_for_update()
+                .filter(
+                    material_request_id=
+                        source_mr_number
+                )
+                .first()
+            )
+
+        replacement_quantity = (
+            failed_quantity
+        )
+
+        if material_request is not None:
+            request_items = (
+                self.get_material_request_items(
+                    material_request,
+                    lock=True,
+                )
+            )
+
+            component_items = [
+                item
+                for item in request_items
+                if str(
+                    getattr(
+                        item,
+                        "component_id",
+                        "",
+                    )
+                )
+                == str(
+                    component.id
+                )
+            ]
+
+            required_quantity = sum(
+                max(
+                    int(
+                        item.quantity
+                        or 0
+                    ),
+                    0,
+                )
+                for item in component_items
+            )
+
+            reservation = (
+                InventoryReservation.objects
+                .select_for_update()
+                .filter(
+                    material_request=
+                        material_request,
+                    component_id=
+                        component.id,
+                )
+                .first()
+            )
+
+            reserved_store_quantity = min(
+                required_quantity,
+                int(
+                    reservation
+                    .reserved_store_quantity
+                    if reservation
+                    else 0
+                ),
+            )
+
+            project_row = (
+                ProjectInventory.objects
+                .select_for_update()
+                .filter(
+                    material_request=
+                        material_request,
+                    component_id=
+                        component.id,
+                )
+                .first()
+            )
+
+            non_purchased_ready = min(
+                required_quantity,
+                int(
+                    getattr(
+                        project_row,
+                        "store_quantity",
+                        reserved_store_quantity,
+                    )
+                    or 0
+                ),
+            )
+
+            procurement_requirement = max(
+                required_quantity
+                - non_purchased_ready,
+                0,
+            )
+
+            mr_po_ids = list(
+                PurchaseOrder.objects
+                .filter(
+                    source_mr_number=
+                        source_mr_number
+                )
+                .values_list(
+                    "id",
+                    flat=True,
+                )
+            )
+
+            component_inwards = (
+                InwardEntry.objects
+                .select_for_update()
+                .filter(
+                    purchase_order_id__in=
+                        mr_po_ids,
+                    component_id=
+                        component.id,
+                )
+                .filter(
+                    Q(
+                        removed_from_inventory=
+                            False
+                    )
+                    | Q(
+                        removed_from_inventory__isnull=
+                            True
+                    )
+                )
+            )
+
+            passed_quantity = sum(
+                self.get_qc_rows_quantity(
+                    row.qc_passed_rows
+                )
+                for row in component_inwards
+            )
+
+            outstanding_requirement = max(
+                procurement_requirement
+                - passed_quantity,
+                0,
+            )
+
+            replacement_quantity = min(
+                failed_quantity,
+                outstanding_requirement,
+            )
+
+            if replacement_quantity <= 0:
+                return Response(
+                    {
+                        "detail": (
+                            "The MR procurement requirement is already "
+                            "satisfied by QC-passed quantity."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        requested_expected = ""
+
+        for row in (
+            inward_entry.qc_failed_rows
+            or []
+        ):
+            if not isinstance(
+                row,
+                dict,
+            ):
+                continue
+
+            requested_expected = str(
+                row.get(
+                    "replacement_expected_delivery_date"
+                )
+                or ""
+            ).strip()
+
+            if requested_expected:
+                break
+
+        expected_delivery_date = (
+            parse_date(
+                requested_expected
+            )
+            if requested_expected
+            else None
+        )
+
+        root_po = (
+            source_po.replacement_for
+            if (
+                str(
+                    getattr(
+                        source_po,
+                        "order_type",
+                        "STANDARD",
+                    )
+                    or "STANDARD"
+                )
+                .strip()
+                .upper()
+                == "REPLACEMENT"
+                and source_po
+                .replacement_for_id
+            )
+            else source_po
+        )
+
+        last_round = (
+            PurchaseOrder.objects
+            .filter(
+                replacement_for=
+                    root_po,
+                order_type=
+                    "REPLACEMENT",
+            )
+            .aggregate(
+                max_round=Max(
+                    "replacement_round"
+                )
+            )
+            .get(
+                "max_round"
+            )
+            or 0
+        )
+
+        replacement_round = (
+            int(last_round)
+            + 1
+        )
+
+        po_number = (
+            f"{root_po.po_number}"
+            f"-R{replacement_round}"
+        )
+
+        while (
+            PurchaseOrder.objects
+            .filter(
+                po_number=
+                    po_number
+            )
+            .exists()
+        ):
+            replacement_round += 1
+
+            po_number = (
+                f"{root_po.po_number}"
+                f"-R{replacement_round}"
+            )
+
+        actor = self.get_request_actor_name(
+            request
+        )
+
+        replacement_po = (
+            PurchaseOrder.objects
+            .create(
+                po_number=
+                    po_number,
+                vendor_name=
+                    source_po.vendor_name,
+                gstin=
+                    source_po.gstin,
+                location=
+                    source_po.location,
+                ordered_date=
+                    None,
+                expected_delivery_date=
+                    expected_delivery_date,
+                remarks=(
+                    f"QC replacement for {source_po.po_number}; "
+                    f"Inward {inward_entry.code}; "
+                    f"component "
+                    f"{getattr(component, 'component_id', component.id)}."
+                ),
+                finance_remarks=
+                    None,
+                # Current active Replacement flow is Procurement-only.
+                # Once Procurement approves, the PO is ready to be ordered.
+                status=
+                    "REPLACEMENT_APPROVED",
+                approval_status=
+                    "REPLACEMENT_APPROVED",
+                source_mr_number=(
+                    source_mr_number
+                    or None
+                ),
+                order_type=
+                    "REPLACEMENT",
+                replacement_for=
+                    root_po,
+                replacement_round=
+                    replacement_round,
+                replacement_source_inward_id=
+                    inward_entry.id,
+            )
+        )
+
+        PurchaseOrderItem.objects.create(
+            purchase_order=
+                replacement_po,
+            component=
+                component,
+            quantity=
+                replacement_quantity,
+            received_quantity=
+                0,
+            unit_price=
+                source_item.unit_price,
+            gst_percentage=
+                source_item.gst_percentage,
+            expected_delivery_date=
+                expected_delivery_date,
+        )
+
+        PurchaseOrderApproval.objects.create(
+            purchase_order=
+                replacement_po,
+            action=
+                "REPLACEMENT_REQUESTED",
+            requested_by=
+                actor,
+            approved_by=
+                actor,
+        )
+
+        inward_entry.replacement_purchase_order = (
+            replacement_po
+        )
+
+        updated_failed_rows = []
+
+        for raw_row in (
+            inward_entry.qc_failed_rows
+            or []
+        ):
+            row = (
+                dict(raw_row)
+                if isinstance(
+                    raw_row,
+                    dict,
+                )
+                else {}
+            )
+
+            row[
+                "replacement_request_status"
+            ] = "PROCUREMENT_APPROVED"
+
+            row[
+                "replacement_purchase_order_id"
+            ] = replacement_po.pk
+
+            row[
+                "replacement_purchase_order_number"
+            ] = replacement_po.po_number
+
+            row[
+                "replacement_procurement_approved_by"
+            ] = actor
+
+            row[
+                "replacement_procurement_approved_at"
+            ] = timezone.now().isoformat()
+
+            updated_failed_rows.append(
+                row
+            )
+
+        inward_entry.qc_failed_rows = (
+            updated_failed_rows
+        )
+
+        inward_entry.save(
+            update_fields=[
+                "replacement_purchase_order",
+                "qc_failed_rows",
+                "updated_at",
+            ]
+        )
+
+        Notification.objects.filter(
+            category="QC_FAILED",
+            receiver="PROCUREMENT",
+            reference_id=(
+                f"INWARD:{inward_entry.pk}"
+            ),
+        ).update(
+            status=
+                "PROCUREMENT_APPROVED",
+            is_read=True,
+        )
+
+        transaction.on_commit(
+            invalidate_notifications_list_cache
+        )
+        transaction.on_commit(
+            invalidate_purchase_orders_list_cache
+        )
+
+        if material_request is not None:
+            material_request.status = (
+                "REPLACEMENT_APPROVED"
+            )
+
+            material_request.po_raised = True
+
+            material_request.save(
+                update_fields=[
+                    "status",
+                    "po_raised",
+                ]
+            )
+
+        return Response(
+            {
+                "detail": (
+                    "Procurement approved Replacement. "
+                    "Replacement PO is created and ready to be ordered."
+                ),
                 "replacement_purchase_order": {
-                    "id": replacement_po.id,
-                    "po_number": replacement_po.po_number,
-                    "status": replacement_po.status,
-                    "approval_status": replacement_po.approval_status,
-                    "replacement_round": replacement_po.replacement_round,
-                    "quantity": replacement_quantity,
-                    "source_mr_number": replacement_po.source_mr_number,
+                    "id":
+                        replacement_po.pk,
+                    "po_number":
+                        replacement_po.po_number,
+                    "status":
+                        replacement_po.status,
+                    "approval_status":
+                        replacement_po.approval_status,
+                    "replacement_round":
+                        replacement_po.replacement_round,
+                    "quantity":
+                        replacement_quantity,
+                    "source_mr_number":
+                        replacement_po.source_mr_number,
                     "expected_delivery_date": (
-                        replacement_po.expected_delivery_date.isoformat()
-                        if replacement_po.expected_delivery_date
+                        replacement_po
+                        .expected_delivery_date
+                        .isoformat()
+                        if replacement_po
+                        .expected_delivery_date
                         else None
                     ),
                 },
+                "inward":
+                    self.get_serializer(
+                        inward_entry
+                    ).data,
             },
             status=status.HTTP_201_CREATED,
         )
 
+
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="procurement-reject-replacement",
+    )
+    @transaction.atomic
+    def procurement_reject_replacement(
+        self,
+        request,
+        pk=None,
+    ):
+        """
+        Procurement rejects a pending QC-failed Replacement request.
+
+        No Replacement PO is created. The failed QC row remains available
+        for Inventory to raise a new Replacement request later if required.
+        """
+        role = self.get_request_active_role(
+            request
+        )
+
+        if role not in {
+            "procurement",
+            "admin",
+        }:
+            from rest_framework.exceptions import PermissionDenied
+
+            raise PermissionDenied(
+                "Only Procurement can reject a QC replacement request."
+            )
+
+        reason = str(
+            request.data.get("reason")
+            or request.data.get("remarks")
+            or ""
+        ).strip()
+
+        if not reason:
+            return Response(
+                {
+                    "detail":
+                        "Rejection reason is required."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            inward_entry = (
+                InwardEntry.objects
+                .select_for_update()
+                .select_related(
+                    "component",
+                    "purchase_order",
+                    "replacement_purchase_order",
+                )
+                .get(pk=pk)
+            )
+        except InwardEntry.DoesNotExist:
+            return Response(
+                {
+                    "detail":
+                        "Inward entry not found."
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if (
+            inward_entry
+            .replacement_purchase_order_id
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "Replacement PO already exists, so this "
+                        "Replacement request can no longer be rejected."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        current_action = str(
+            inward_entry.qc_failed_action
+            or ""
+        ).strip().upper()
+
+        if current_action != "REPLACEMENT_REQUESTED":
+            # Idempotent response for an already-rejected request.
+            already_rejected = any(
+                str(
+                    row.get(
+                        "replacement_request_status"
+                    )
+                    or ""
+                ).strip().upper()
+                == "PROCUREMENT_REJECTED"
+                for row in (
+                    inward_entry.qc_failed_rows
+                    or []
+                )
+                if isinstance(row, dict)
+            )
+
+            if already_rejected:
+                return Response(
+                    {
+                        "detail":
+                            "Replacement request was already rejected.",
+                        "status":
+                            "PROCUREMENT_REJECTED",
+                    },
+                    status=status.HTTP_200_OK,
+                )
+
+            return Response(
+                {
+                    "detail": (
+                        "This QC failure is not waiting for "
+                        "Procurement replacement approval."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        actor = self.get_request_actor_name(
+            request
+        )
+
+        rejected_at = (
+            timezone.now().isoformat()
+        )
+
+        updated_failed_rows = []
+
+        for raw_row in (
+            inward_entry.qc_failed_rows
+            or []
+        ):
+            row = (
+                dict(raw_row)
+                if isinstance(
+                    raw_row,
+                    dict,
+                )
+                else {}
+            )
+
+            row[
+                "replacement_request_status"
+            ] = "PROCUREMENT_REJECTED"
+
+            row[
+                "replacement_procurement_rejected_by"
+            ] = actor
+
+            row[
+                "replacement_procurement_rejected_at"
+            ] = rejected_at
+
+            row[
+                "replacement_rejection_reason"
+            ] = reason
+
+            updated_failed_rows.append(
+                row
+            )
+
+        inward_entry.qc_failed_rows = (
+            updated_failed_rows
+        )
+
+        # Return the failed QC item to action-required state so Inventory
+        # can raise another Replacement request later if needed.
+        inward_entry.qc_failed_action = (
+            "NONE"
+        )
+
+        inward_entry.save(
+            update_fields=[
+                "qc_failed_rows",
+                "qc_failed_action",
+                "updated_at",
+            ]
+        )
+
+        Notification.objects.filter(
+            category="QC_FAILED",
+            receiver="PROCUREMENT",
+            reference_id=(
+                f"INWARD:{inward_entry.pk}"
+            ),
+        ).update(
+            status=
+                "PROCUREMENT_REJECTED",
+            is_read=True,
+        )
+
+        source_po = (
+            inward_entry.purchase_order
+        )
+
+        source_mr_number = str(
+            getattr(
+                source_po,
+                "source_mr_number",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if source_mr_number:
+            material_request = (
+                MaterialRequest.objects
+                .select_for_update()
+                .filter(
+                    material_request_id=
+                        source_mr_number
+                )
+                .first()
+            )
+
+            if (
+                material_request is not None
+                and str(
+                    material_request.status
+                    or ""
+                ).upper()
+                not in {
+                    "INVENTORY_ISSUED",
+                    "MR_COMPLETED",
+                }
+            ):
+                material_request.status = (
+                    "REPLACEMENT_APPROVAL_REJECTED"
+                )
+
+                material_request.save(
+                    update_fields=[
+                        "status",
+                    ]
+                )
+
+        invalidate_notifications_list_cache()
+
+        return Response(
+            {
+                "detail":
+                    "Procurement rejected the Replacement request.",
+                "status":
+                    "PROCUREMENT_REJECTED",
+                "reason":
+                    reason,
+                "inward":
+                    self.get_serializer(
+                        inward_entry
+                    ).data,
+            },
+            status=status.HTTP_200_OK,
+        )
 
     @action(
         detail=True,
@@ -2472,18 +3942,23 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
         url_path="request-refund",
     )
     @transaction.atomic
-    def request_refund(self, request, pk=None):
+    def request_refund(
+        self,
+        request,
+        pk=None,
+    ):
         """
-        Refund all QC-failed units for one Direct-PO Inward component.
+        Direct standard PO QC Failed -> Refund request.
 
-        The refund is completed immediately:
-        - failed quantity is deducted from the original Direct PO item
-        - received quantity is reduced by the same amount
-        - PO subtotal/GST/total automatically recalculate from the new quantity
-        - failed serial numbers and refund calculation are stored in
-          qc_failed_rows for traceability
+        FINAL APPROVAL FLOW:
+            Inventory clicks Refund
+            -> PENDING_PROCUREMENT
+            -> Procurement approves
+            -> PENDING_FINANCE
+            -> Finance approves
+            -> ONLY THEN quantity/value is deducted from the Direct PO.
 
-        No Manager/Finance/Procurement approval is added for Refund.
+        The source PO is not financially changed before Finance approval.
         """
         self.require_replacement_request_role(
             request
@@ -2497,9 +3972,6 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                     "component",
                     "purchase_order",
                 )
-                .prefetch_related(
-                    "line_items"
-                )
                 .get(pk=pk)
             )
         except InwardEntry.DoesNotExist:
@@ -2508,8 +3980,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                     "detail":
                         "Inward entry not found."
                 },
-                status=
-                    status.HTTP_404_NOT_FOUND,
+                status=status.HTTP_404_NOT_FOUND,
             )
 
         current_action = str(
@@ -2517,23 +3988,11 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             or "NONE"
         ).strip().upper()
 
-        if current_action == "RETURN_REQUESTED":
-            return Response(
-                {
-                    "detail":
-                        "Refund has already been completed for this failed QC entry.",
-                    "inward":
-                        self.get_serializer(
-                            inward_entry
-                        ).data,
-                },
-                status=status.HTTP_200_OK,
-            )
-
         if (
             current_action
             == "REPLACEMENT_REQUESTED"
-            or inward_entry.replacement_purchase_order_id
+            or inward_entry
+            .replacement_purchase_order_id
         ):
             return Response(
                 {
@@ -2542,17 +4001,20 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                         "this failed QC entry. Refund cannot also be applied."
                     )
                 },
-                status=
-                    status.HTTP_400_BAD_REQUEST,
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         failed_rows = [
             dict(row)
             for row in (
-                inward_entry.qc_failed_rows
+                inward_entry
+                .qc_failed_rows
                 or []
             )
-            if isinstance(row, dict)
+            if isinstance(
+                row,
+                dict,
+            )
         ]
 
         failed_quantity = (
@@ -2567,8 +4029,74 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                     "detail":
                         "This Inward entry has no QC-failed quantity."
                 },
-                status=
-                    status.HTTP_400_BAD_REQUEST,
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        existing_refund_statuses = {
+            str(
+                row.get(
+                    "refund_status"
+                )
+                or ""
+            )
+            .strip()
+            .upper()
+            for row in failed_rows
+            if isinstance(
+                row,
+                dict,
+            )
+        }
+
+        if "REFUNDED" in existing_refund_statuses:
+            return Response(
+                {
+                    "detail":
+                        "Refund has already been completed.",
+                    "status":
+                        "REFUNDED",
+                    "inward":
+                        self.get_serializer(
+                            inward_entry
+                        ).data,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        if (
+            "PENDING_PROCUREMENT"
+            in existing_refund_statuses
+        ):
+            return Response(
+                {
+                    "detail":
+                        "Refund is already pending Procurement approval.",
+                    "status":
+                        "PENDING_PROCUREMENT",
+                    "inward":
+                        self.get_serializer(
+                            inward_entry
+                        ).data,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        if (
+            "PENDING_FINANCE"
+            in existing_refund_statuses
+        ):
+            return Response(
+                {
+                    "detail":
+                        "Refund is already pending Finance approval.",
+                    "status":
+                        "PENDING_FINANCE",
+                    "inward":
+                        self.get_serializer(
+                            inward_entry
+                        ).data,
+                },
+                status=status.HTTP_200_OK,
             )
 
         source_po = (
@@ -2583,8 +4111,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                         "to a Purchase Order."
                     )
                 },
-                status=
-                    status.HTTP_400_BAD_REQUEST,
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         source_mr_number = str(
@@ -2592,28 +4119,31 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             or ""
         ).strip()
 
-        source_order_type = str(
-            getattr(
-                source_po,
-                "order_type",
-                "STANDARD",
-            )
-            or "STANDARD"
-        ).strip().upper()
-
-        if (
-            source_mr_number
-            or source_order_type
-            == "REPLACEMENT"
-        ):
+        # ------------------------------------------------------------
+        # REFUND ELIGIBILITY
+        # ------------------------------------------------------------
+        # Direct flow:
+        #     source_mr_number is empty
+        #     -> Refund is allowed
+        #     -> Replacement is allowed
+        #
+        # This intentionally includes Direct-origin Replacement POs
+        # such as 01/26-27-R1, 01/26-27-R2, etc.
+        #
+        # MR flow:
+        #     source_mr_number is present
+        #     -> Refund is NOT allowed
+        #     -> Replacement only
+        # ------------------------------------------------------------
+        if source_mr_number:
             return Response(
                 {
                     "detail": (
-                        "Refund is available only for a Direct standard PO."
+                        "Refund is not available for an MR-linked PO. "
+                        "Use Replacement for MR flow QC failures."
                     )
                 },
-                status=
-                    status.HTTP_400_BAD_REQUEST,
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         component = (
@@ -2626,16 +4156,17 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                     "detail":
                         "The failed component could not be resolved."
                 },
-                status=
-                    status.HTTP_400_BAD_REQUEST,
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         source_item = (
             PurchaseOrderItem.objects
             .select_for_update()
             .filter(
-                purchase_order=source_po,
-                component=component,
+                purchase_order=
+                    source_po,
+                component=
+                    component,
             )
             .order_by("id")
             .first()
@@ -2649,18 +4180,12 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                         "on the Direct PO."
                     )
                 },
-                status=
-                    status.HTTP_400_BAD_REQUEST,
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
-        ordered_quantity_before = max(
-            int(source_item.quantity or 0),
-            0,
-        )
-
-        received_quantity_before = max(
+        ordered_quantity = max(
             int(
-                source_item.received_quantity
+                source_item.quantity
                 or 0
             ),
             0,
@@ -2668,17 +4193,16 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
 
         if (
             failed_quantity
-            > ordered_quantity_before
+            > ordered_quantity
         ):
             return Response(
                 {
                     "detail": (
                         "Failed QC quantity is greater than "
-                        "the remaining Direct PO item quantity."
+                        "the Direct PO item quantity."
                     )
                 },
-                status=
-                    status.HTTP_400_BAD_REQUEST,
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         unit_price = Decimal(
@@ -2697,7 +4221,9 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
 
         refund_subtotal = (
             unit_price
-            * Decimal(failed_quantity)
+            * Decimal(
+                failed_quantity
+            )
         )
 
         refund_gst_amount = (
@@ -2711,7 +4237,9 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             + refund_gst_amount
         )
 
-        money_quantum = Decimal("0.01")
+        money_quantum = Decimal(
+            "0.01"
+        )
 
         refund_subtotal = (
             refund_subtotal.quantize(
@@ -2737,165 +4265,32 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             )
         )
 
-        new_ordered_quantity = max(
-            ordered_quantity_before
-            - failed_quantity,
-            0,
-        )
-
-        new_received_quantity = max(
-            received_quantity_before
-            - failed_quantity,
-            0,
-        )
-
-        # Keep received_quantity within the reduced ordered quantity.
-        new_received_quantity = min(
-            new_received_quantity,
-            new_ordered_quantity,
-        )
-
-        source_item.quantity = (
-            new_ordered_quantity
-        )
-
-        source_item.received_quantity = (
-            new_received_quantity
-        )
-
-        source_item.save(
-            update_fields=[
-                "quantity",
-                "received_quantity",
-            ]
-        )
-
-        # Refresh the source PO item and calculate the NEW authoritative
-        # Direct-PO totals after deducting the QC-failed quantity.
-        source_item.refresh_from_db()
-
-        updated_item_subtotal = (
-            Decimal(source_item.quantity)
-            * (
-                source_item.unit_price
-                or Decimal("0")
+        actor = (
+            self.get_request_actor_name(
+                request
             )
         )
 
-        updated_item_gst_amount = (
-            updated_item_subtotal
-            * Decimal(
-                str(
-                    source_item.gst_percentage
-                    or "0"
-                )
-            )
-            / Decimal("100")
-        )
-
-        updated_item_total = (
-            updated_item_subtotal
-            + updated_item_gst_amount
-        )
-
-        source_po_items = list(
-            PurchaseOrderItem.objects
-            .select_for_update()
-            .filter(
-                purchase_order=source_po
-            )
-            .order_by("id")
-        )
-
-        updated_po_subtotal = sum(
-            (
-                Decimal(item.quantity)
-                * (
-                    item.unit_price
-                    or Decimal("0")
-                )
-                for item in source_po_items
-            ),
-            Decimal("0"),
-        )
-
-        updated_po_gst_amount = sum(
-            (
-                (
-                    Decimal(item.quantity)
-                    * (
-                        item.unit_price
-                        or Decimal("0")
-                    )
-                )
-                * Decimal(
-                    str(
-                        item.gst_percentage
-                        or "0"
-                    )
-                )
-                / Decimal("100")
-                for item in source_po_items
-            ),
-            Decimal("0"),
-        )
-
-        updated_po_total = (
-            updated_po_subtotal
-            + updated_po_gst_amount
-        )
-
-        refunded_at = (
+        requested_at = (
             timezone.now().isoformat()
         )
 
-        serial_numbers = []
-
         for row in failed_rows:
-            serial_number = str(
-                row.get("serialNumber")
-                or row.get("serial_number")
-                or row.get("serial")
-                or ""
-            ).strip()
-
-            if serial_number:
-                serial_numbers.append(
-                    serial_number
-                )
-
-            row_quantity = max(
-                self.get_qc_row_quantity(
-                    row
-                ),
-                0,
-            )
-
-            row_subtotal = (
-                unit_price
-                * Decimal(
-                    row_quantity
-                )
-            )
-
-            row_gst_amount = (
-                row_subtotal
-                * gst_percentage
-                / Decimal("100")
-            )
-
-            row_total = (
-                row_subtotal
-                + row_gst_amount
-            )
-
             row[
                 "refund_status"
-            ] = "REFUNDED"
+            ] = "PENDING_PROCUREMENT"
 
             row[
-                "refunded_at"
-            ] = refunded_at
+                "refund_requested_at"
+            ] = requested_at
+
+            row[
+                "refund_requested_by"
+            ] = actor
+
+            row[
+                "refund_failed_quantity"
+            ] = failed_quantity
 
             row[
                 "refund_unit_price"
@@ -2916,39 +4311,536 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             row[
                 "refund_subtotal"
             ] = str(
-                row_subtotal.quantize(
-                    money_quantum,
-                    rounding=
-                        ROUND_HALF_UP,
-                )
+                refund_subtotal
             )
 
             row[
                 "refund_gst_amount"
             ] = str(
-                row_gst_amount.quantize(
-                    money_quantum,
-                    rounding=
-                        ROUND_HALF_UP,
-                )
+                refund_gst_amount
             )
 
             row[
                 "refund_total"
             ] = str(
-                row_total.quantize(
-                    money_quantum,
-                    rounding=
-                        ROUND_HALF_UP,
-                )
+                refund_total
             )
 
         inward_entry.qc_failed_rows = (
             failed_rows
         )
 
-        # Existing model value is reused for compatibility.
-        # In the frontend it is displayed as "Refund Completed".
+        # Keep NONE until Finance actually completes the refund.
+        inward_entry.qc_failed_action = (
+            "NONE"
+        )
+
+        inward_entry.save(
+            update_fields=[
+                "qc_failed_rows",
+                "qc_failed_action",
+                "updated_at",
+            ]
+        )
+
+        Notification.objects.update_or_create(
+            category="QC_FAILED",
+            receiver="PROCUREMENT",
+            reference_id=(
+                f"INWARD_REFUND:{inward_entry.pk}"
+            ),
+            defaults={
+                "requested_by":
+                    actor,
+                "title": (
+                    "Direct PO QC Refund Approval - "
+                    f"{source_po.po_number}"
+                ),
+                "message": (
+                    f"{getattr(component, 'component_id', component.id)} "
+                    f"failed QC. Refund quantity: {failed_quantity}; "
+                    f"refund amount: {refund_total}. "
+                    "Procurement approval is required before Finance review."
+                ),
+                "status":
+                    "PENDING_PROCUREMENT",
+                "is_read":
+                    False,
+            },
+        )
+
+        return Response(
+            {
+                "detail":
+                    "Refund request sent to Procurement for approval.",
+                "status":
+                    "PENDING_PROCUREMENT",
+                "refund": {
+                    "source_po_id":
+                        source_po.pk,
+                    "source_po_number":
+                        source_po.po_number,
+                    "component_id":
+                        component.pk,
+                    "failed_quantity":
+                        failed_quantity,
+                    "unit_price":
+                        str(unit_price),
+                    "gst_percentage":
+                        str(
+                            gst_percentage
+                        ),
+                    "subtotal":
+                        str(
+                            refund_subtotal
+                        ),
+                    "gst_amount":
+                        str(
+                            refund_gst_amount
+                        ),
+                    "total":
+                        str(
+                            refund_total
+                        ),
+                },
+                "inward":
+                    self.get_serializer(
+                        inward_entry
+                    ).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="procurement-approve-refund",
+    )
+    @transaction.atomic
+    def procurement_approve_refund(
+        self,
+        request,
+        pk=None,
+    ):
+        role = self.get_request_active_role(
+            request
+        )
+
+        if role not in {
+            "procurement",
+            "admin",
+        }:
+            from rest_framework.exceptions import PermissionDenied
+
+            raise PermissionDenied(
+                "Only Procurement can approve a Direct PO Refund request."
+            )
+
+        try:
+            inward_entry = (
+                InwardEntry.objects
+                .select_for_update()
+                .select_related(
+                    "component",
+                    "purchase_order",
+                )
+                .get(pk=pk)
+            )
+        except InwardEntry.DoesNotExist:
+            return Response(
+                {
+                    "detail":
+                        "Inward entry not found."
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        failed_rows = [
+            dict(row)
+            for row in (
+                inward_entry.qc_failed_rows
+                or []
+            )
+            if isinstance(
+                row,
+                dict,
+            )
+        ]
+
+        statuses = {
+            str(
+                row.get(
+                    "refund_status"
+                )
+                or ""
+            )
+            .strip()
+            .upper()
+            for row in failed_rows
+        }
+
+        if (
+            "PENDING_FINANCE"
+            in statuses
+        ):
+            return Response(
+                {
+                    "detail":
+                        "Refund is already pending Finance approval.",
+                    "status":
+                        "PENDING_FINANCE",
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        if (
+            "PENDING_PROCUREMENT"
+            not in statuses
+        ):
+            return Response(
+                {
+                    "detail":
+                        "This Refund is not pending Procurement approval."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        actor = (
+            self.get_request_actor_name(
+                request
+            )
+        )
+
+        approved_at = (
+            timezone.now().isoformat()
+        )
+
+        for row in failed_rows:
+            row[
+                "refund_status"
+            ] = "PENDING_FINANCE"
+
+            row[
+                "refund_procurement_approved_by"
+            ] = actor
+
+            row[
+                "refund_procurement_approved_at"
+            ] = approved_at
+
+        inward_entry.qc_failed_rows = (
+            failed_rows
+        )
+
+        inward_entry.save(
+            update_fields=[
+                "qc_failed_rows",
+                "updated_at",
+            ]
+        )
+
+        Notification.objects.filter(
+            category="QC_FAILED",
+            receiver="PROCUREMENT",
+            reference_id=(
+                f"INWARD_REFUND:{inward_entry.pk}"
+            ),
+        ).update(
+            status=
+                "PROCUREMENT_APPROVED",
+            is_read=True,
+        )
+
+        source_po = (
+            inward_entry.purchase_order
+        )
+
+        Notification.objects.update_or_create(
+            category="QC_FAILED",
+            receiver="FINANCE",
+            reference_id=(
+                f"INWARD_REFUND:{inward_entry.pk}"
+            ),
+            defaults={
+                "requested_by":
+                    actor,
+                "title": (
+                    "Direct PO QC Refund Finance Approval - "
+                    f"{getattr(source_po, 'po_number', '-')}"
+                ),
+                "message": (
+                    "Procurement approved the Direct PO QC Failed refund. "
+                    "Finance approval is required before quantity/value is deducted."
+                ),
+                "status":
+                    "PENDING_FINANCE",
+                "is_read":
+                    False,
+            },
+        )
+        # IMPORTANT:
+        # Refresh notification cache only after transaction succeeds.
+        transaction.on_commit(
+            invalidate_notifications_list_cache
+        )
+        return Response(
+            {
+                "detail":
+                    "Procurement approved Refund. Finance approval is pending.",
+                "status":
+                    "PENDING_FINANCE",
+                "inward":
+                    self.get_serializer(
+                        inward_entry
+                    ).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="finance-approve-refund",
+    )
+    @transaction.atomic
+    def finance_approve_refund(
+        self,
+        request,
+        pk=None,
+    ):
+        role = self.get_request_active_role(
+            request
+        )
+
+        if role not in {
+            "finance",
+            "admin",
+        }:
+            from rest_framework.exceptions import PermissionDenied
+
+            raise PermissionDenied(
+                "Only Finance can approve a Direct PO Refund request."
+            )
+
+        try:
+            inward_entry = (
+                InwardEntry.objects
+                .select_for_update()
+                .select_related(
+                    "component",
+                    "purchase_order",
+                )
+                .get(pk=pk)
+            )
+        except InwardEntry.DoesNotExist:
+            return Response(
+                {
+                    "detail":
+                        "Inward entry not found."
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        failed_rows = [
+            dict(row)
+            for row in (
+                inward_entry.qc_failed_rows
+                or []
+            )
+            if isinstance(
+                row,
+                dict,
+            )
+        ]
+
+        statuses = {
+            str(
+                row.get(
+                    "refund_status"
+                )
+                or ""
+            )
+            .strip()
+            .upper()
+            for row in failed_rows
+        }
+
+        if "REFUNDED" in statuses:
+            return Response(
+                {
+                    "detail":
+                        "Refund is already completed.",
+                    "status":
+                        "REFUNDED",
+                    "inward":
+                        self.get_serializer(
+                            inward_entry
+                        ).data,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        if (
+            "PENDING_FINANCE"
+            not in statuses
+        ):
+            return Response(
+                {
+                    "detail":
+                        "This Refund is not pending Finance approval."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        source_po = (
+            inward_entry.purchase_order
+        )
+
+        component = (
+            inward_entry.component
+        )
+
+        if (
+            source_po is None
+            or component is None
+        ):
+            return Response(
+                {
+                    "detail":
+                        "Source Direct PO/component could not be resolved."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        source_mr_number = str(
+            source_po.source_mr_number
+            or ""
+        ).strip()
+
+        # Finance may approve Refund for any Direct-flow PO,
+        # including Direct-origin Replacement POs (-R1/-R2/...).
+        # MR-linked QC failures remain Replacement-only.
+        if source_mr_number:
+            return Response(
+                {
+                    "detail": (
+                        "Refund is not available for an MR-linked PO. "
+                        "Use Replacement for MR flow QC failures."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        source_item = (
+            PurchaseOrderItem.objects
+            .select_for_update()
+            .filter(
+                purchase_order=
+                    source_po,
+                component=
+                    component,
+            )
+            .order_by("id")
+            .first()
+        )
+
+        if source_item is None:
+            return Response(
+                {
+                    "detail":
+                        "Direct PO item could not be resolved."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        failed_quantity = (
+            self.get_qc_rows_quantity(
+                failed_rows
+            )
+        )
+
+        ordered_before = max(
+            int(
+                source_item.quantity
+                or 0
+            ),
+            0,
+        )
+
+        received_before = max(
+            int(
+                source_item.received_quantity
+                or 0
+            ),
+            0,
+        )
+
+        if (
+            failed_quantity <= 0
+            or failed_quantity
+            > ordered_before
+        ):
+            return Response(
+                {
+                    "detail":
+                        "Refund quantity is invalid for the current Direct PO quantity."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        source_item.quantity = max(
+            ordered_before
+            - failed_quantity,
+            0,
+        )
+
+        source_item.received_quantity = min(
+            max(
+                received_before
+                - failed_quantity,
+                0,
+            ),
+            source_item.quantity,
+        )
+
+        source_item.save(
+            update_fields=[
+                "quantity",
+                "received_quantity",
+            ]
+        )
+
+        actor = (
+            self.get_request_actor_name(
+                request
+            )
+        )
+
+        completed_at = (
+            timezone.now().isoformat()
+        )
+
+        for row in failed_rows:
+            row[
+                "refund_status"
+            ] = "REFUNDED"
+
+            row[
+                "refund_finance_approved_by"
+            ] = actor
+
+            row[
+                "refund_finance_approved_at"
+            ] = completed_at
+
+            row[
+                "refunded_at"
+            ] = completed_at
+
+        inward_entry.qc_failed_rows = (
+            failed_rows
+        )
+
         inward_entry.qc_failed_action = (
             "RETURN_REQUESTED"
         )
@@ -2961,130 +4853,212 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             ]
         )
 
+        Notification.objects.filter(
+            category="QC_FAILED",
+            receiver="FINANCE",
+            reference_id=(
+                f"INWARD_REFUND:{inward_entry.pk}"
+            ),
+        ).update(
+            status=
+                "FINANCE_APPROVED",
+            is_read=True,
+        )
+        transaction.on_commit(
+            invalidate_notifications_list_cache
+        )
+
+        transaction.on_commit(
+            invalidate_purchase_orders_list_cache
+        )
         return Response(
             {
                 "detail":
-                    "Refund completed successfully.",
+                    "Finance approved Refund. Direct PO quantity and value were reduced.",
+                "status":
+                    "REFUNDED",
+                "source_po_id":
+                    source_po.pk,
+                "source_po_number":
+                    source_po.po_number,
+                "new_ordered_quantity":
+                    source_item.quantity,
+                "new_received_quantity":
+                    source_item.received_quantity,
                 "inward":
                     self.get_serializer(
                         inward_entry
                     ).data,
-                "refund": {
-                    "source_po_id":
-                        source_po.id,
-                    "source_po_number":
-                        source_po.po_number,
-                    "component_id":
-                        component.id,
-                    "component_code":
-                        str(
-                            getattr(
-                                component,
-                                "component_id",
-                                "",
-                            )
-                            or ""
-                        ),
-                    "component_name":
-                        str(
-                            getattr(
-                                component,
-                                "name",
-                                "",
-                            )
-                            or ""
-                        ),
-                    "serial_numbers":
-                        serial_numbers,
-                    "failed_quantity":
-                        failed_quantity,
-                    "unit_price":
-                        str(
-                            unit_price.quantize(
-                                money_quantum,
-                                rounding=
-                                    ROUND_HALF_UP,
-                            )
-                        ),
-                    "gst_percentage":
-                        str(
-                            gst_percentage
-                        ),
-                    "refund_subtotal":
-                        str(
-                            refund_subtotal
-                        ),
-                    "refund_gst_amount":
-                        str(
-                            refund_gst_amount
-                        ),
-                    "refund_total":
-                        str(
-                            refund_total
-                        ),
-                    "po_quantity_before":
-                        ordered_quantity_before,
-                    "po_quantity_after":
-                        new_ordered_quantity,
-                    "po_received_quantity_before":
-                        received_quantity_before,
-                    "po_received_quantity_after":
-                        new_received_quantity,
+            },
+            status=status.HTTP_200_OK,
+        )
 
-                    # Updated ORIGINAL Direct PO component values.
-                    "updated_item_quantity":
-                        int(source_item.quantity),
-                    "updated_item_subtotal":
-                        str(
-                            updated_item_subtotal.quantize(
-                                money_quantum,
-                                rounding=
-                                    ROUND_HALF_UP,
-                            )
-                        ),
-                    "updated_item_gst_amount":
-                        str(
-                            updated_item_gst_amount.quantize(
-                                money_quantum,
-                                rounding=
-                                    ROUND_HALF_UP,
-                            )
-                        ),
-                    "updated_item_total":
-                        str(
-                            updated_item_total.quantize(
-                                money_quantum,
-                                rounding=
-                                    ROUND_HALF_UP,
-                            )
-                        ),
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="finance-reject-refund",
+    )
+    @transaction.atomic
+    def finance_reject_refund(
+        self,
+        request,
+        pk=None,
+    ):
+        role = self.get_request_active_role(
+            request
+        )
 
-                    # Updated ORIGINAL Direct PO totals.
-                    "updated_po_subtotal":
-                        str(
-                            updated_po_subtotal.quantize(
-                                money_quantum,
-                                rounding=
-                                    ROUND_HALF_UP,
-                            )
-                        ),
-                    "updated_po_gst_amount":
-                        str(
-                            updated_po_gst_amount.quantize(
-                                money_quantum,
-                                rounding=
-                                    ROUND_HALF_UP,
-                            )
-                        ),
-                    "updated_po_total":
-                        str(
-                            updated_po_total.quantize(
-                                money_quantum,
-                                rounding=
-                                    ROUND_HALF_UP,
-                            )
-                        ),
+        if role not in {
+            "finance",
+            "admin",
+        }:
+            from rest_framework.exceptions import PermissionDenied
+
+            raise PermissionDenied(
+                "Only Finance can reject a Direct PO Refund request."
+            )
+
+        reason = str(
+            request.data.get(
+                "reason"
+            )
+            or request.data.get(
+                "remarks"
+            )
+            or ""
+        ).strip()
+
+        if not reason:
+            return Response(
+                {
+                    "detail":
+                        "Finance rejection reason is required."
                 },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            inward_entry = (
+                InwardEntry.objects
+                .select_for_update()
+                .get(pk=pk)
+            )
+        except InwardEntry.DoesNotExist:
+            return Response(
+                {
+                    "detail":
+                        "Inward entry not found."
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        failed_rows = [
+            dict(row)
+            for row in (
+                inward_entry.qc_failed_rows
+                or []
+            )
+            if isinstance(
+                row,
+                dict,
+            )
+        ]
+
+        statuses = {
+            str(
+                row.get(
+                    "refund_status"
+                )
+                or ""
+            )
+            .strip()
+            .upper()
+            for row in failed_rows
+        }
+
+        if (
+            "PENDING_FINANCE"
+            not in statuses
+        ):
+            return Response(
+                {
+                    "detail":
+                        "This Refund is not pending Finance approval."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        actor = (
+            self.get_request_actor_name(
+                request
+            )
+        )
+
+        rejected_at = (
+            timezone.now().isoformat()
+        )
+
+        for row in failed_rows:
+            row[
+                "refund_status"
+            ] = "FINANCE_REJECTED"
+
+            row[
+                "refund_finance_rejected_by"
+            ] = actor
+
+            row[
+                "refund_finance_rejected_at"
+            ] = rejected_at
+
+            row[
+                "refund_rejection_reason"
+            ] = reason
+
+        inward_entry.qc_failed_rows = (
+            failed_rows
+        )
+
+        inward_entry.qc_failed_action = (
+            "NONE"
+        )
+
+        inward_entry.save(
+            update_fields=[
+                "qc_failed_rows",
+                "qc_failed_action",
+                "updated_at",
+            ]
+        )
+
+        Notification.objects.filter(
+            category="QC_FAILED",
+            receiver="FINANCE",
+            reference_id=(
+                f"INWARD_REFUND:{inward_entry.pk}"
+            ),
+        ).update(
+            status=
+                "FINANCE_REJECTED",
+            is_read=True,
+        )
+
+        transaction.on_commit(
+            invalidate_notifications_list_cache
+        )
+
+        return Response(
+            {
+                "detail":
+                    "Finance rejected the Refund request.",
+                "status":
+                    "FINANCE_REJECTED",
+                "reason":
+                    reason,
+                "inward":
+                    self.get_serializer(
+                        inward_entry
+                    ).data,
             },
             status=status.HTTP_200_OK,
         )
@@ -3819,6 +5793,8 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
         inward_entry.save(
             update_fields=update_fields
         )
+        from inventory.costing import record_inward_costs
+        record_inward_costs(inward_entry)
 
         source_mr_number = (
             self.get_source_mr_number(
@@ -3829,7 +5805,16 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
         material_request = None
         inventory_row = None
 
-        if source_mr_number:
+        is_returnable_restore_po = (
+            self.is_returnable_restore_po(
+                inward_entry.purchase_order
+            )
+        )
+
+        if (
+            source_mr_number
+            and not is_returnable_restore_po
+        ):
             material_request = (
                 self
                 .sync_material_request_qc_progress(
@@ -3850,6 +5835,17 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                     passed_rows=passed_rows,
                 )
             )
+
+            if is_returnable_restore_po:
+                self.complete_returnable_restore_after_qc(
+                    inward_entry,
+                    passed_quantity=
+                        passed_quantity,
+                    failed_quantity=
+                        failed_quantity,
+                    inventory_row=
+                        inventory_row,
+                )
 
         return Response(
             {

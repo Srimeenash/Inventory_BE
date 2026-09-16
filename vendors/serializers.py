@@ -1,8 +1,11 @@
 from rest_framework import serializers
+
 from .models import Vendor, VendorProduct
 
 
-class VendorProductSerializer(serializers.ModelSerializer):
+class VendorProductSerializer(
+    serializers.ModelSerializer
+):
     total = serializers.SerializerMethodField()
 
     class Meta:
@@ -19,12 +22,18 @@ class VendorProductSerializer(serializers.ModelSerializer):
         ]
 
     def get_total(self, obj):
-        subtotal = obj.quantity * obj.price
-        gst_amount = subtotal * obj.gst / 100
+        subtotal = (
+            obj.quantity * obj.price
+        )
+        gst_amount = (
+            subtotal * obj.gst / 100
+        )
         return subtotal + gst_amount
 
 
-class VendorSerializer(serializers.ModelSerializer):
+class VendorSerializer(
+    serializers.ModelSerializer
+):
     products = VendorProductSerializer(
         many=True,
         required=False,
@@ -32,7 +41,6 @@ class VendorSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Vendor
-
         fields = [
             "id",
             "vendor_id",
@@ -43,15 +51,12 @@ class VendorSerializer(serializers.ModelSerializer):
             "email",
             "gst_number",
             "pan_number",
-
             "address",
             "city",
             "state",
             "state_code",
             "pincode",
-
-            "payment_terms",
-            "shipping_terms",
+            "terms_and_conditions",
             "additional_notes",
             "rating",
             "is_active",
@@ -68,9 +73,11 @@ class VendorSerializer(serializers.ModelSerializer):
         ]
 
     def create(self, validated_data):
-        products_data = validated_data.pop(
-            "products",
-            [],
+        products_data = (
+            validated_data.pop(
+                "products",
+                [],
+            )
         )
 
         vendor = Vendor.objects.create(
@@ -80,7 +87,7 @@ class VendorSerializer(serializers.ModelSerializer):
         for product in products_data:
             VendorProduct.objects.create(
                 vendor=vendor,
-                **product
+                **product,
             )
 
         return vendor
@@ -88,15 +95,23 @@ class VendorSerializer(serializers.ModelSerializer):
     def update(
         self,
         instance,
-        validated_data
+        validated_data,
     ):
-        products_data = validated_data.pop(
-            "products",
-            None
+        products_data = (
+            validated_data.pop(
+                "products",
+                None,
+            )
         )
 
-        for attr, value in validated_data.items():
-            setattr(instance, attr, value)
+        for attr, value in (
+            validated_data.items()
+        ):
+            setattr(
+                instance,
+                attr,
+                value,
+            )
 
         instance.save()
 
@@ -106,7 +121,7 @@ class VendorSerializer(serializers.ModelSerializer):
             for product in products_data:
                 VendorProduct.objects.create(
                     vendor=instance,
-                    **product
+                    **product,
                 )
 
         return instance

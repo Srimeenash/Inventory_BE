@@ -11,7 +11,6 @@ from dotenv import load_dotenv
 # ---------------------------------------------------------------------
 # Base Directory
 # ---------------------------------------------------------------------
-
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
@@ -19,7 +18,6 @@ load_dotenv(BASE_DIR / ".env")
 # ---------------------------------------------------------------------
 # Security
 # ---------------------------------------------------------------------
-
 SECRET_KEY = os.environ.get(
     "DJANGO_SECRET_KEY",
     "django-insecure-p@%b#wzwaa^!uu_%*)&)1@+3-#zlzcbig^0)7ba4!v768ihs=a",
@@ -43,14 +41,12 @@ ALLOWED_HOSTS = os.environ.get(
 # ---------------------------------------------------------------------
 # Custom User Model
 # ---------------------------------------------------------------------
-
 AUTH_USER_MODEL = "users.User"
 
 
 # ---------------------------------------------------------------------
 # Installed Applications
 # ---------------------------------------------------------------------
-
 INSTALLED_APPS = [
     "django.contrib.admin",
     "django.contrib.auth",
@@ -58,12 +54,10 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-
     "rest_framework",
     "rest_framework_simplejwt",
     "corsheaders",
     "django_filters",
-
     "dashboard",
     "projects",
     "vendors",
@@ -85,9 +79,72 @@ INSTALLED_APPS = [
 
 
 # ---------------------------------------------------------------------
+# API PERFORMANCE AUDIT
+# ---------------------------------------------------------------------
+# Disabled by default.
+#
+# Enable temporarily with:
+#     API_PERFORMANCE_LOGGING=True
+#
+# Optional:
+#     API_PERFORMANCE_SLOW_QUERY_SECONDS=0.10
+#     API_PERFORMANCE_TOP_DUPLICATES=5
+#     API_PERFORMANCE_TOP_SLOW_QUERIES=5
+#
+# No models, serializers, views, workflow, status or pagination are changed.
+API_PERFORMANCE_LOGGING = (
+    os.environ.get(
+        "API_PERFORMANCE_LOGGING",
+        "False",
+    ).lower()
+    in (
+        "true",
+        "1",
+        "yes",
+        "on",
+    )
+)
+
+try:
+    API_PERFORMANCE_SLOW_QUERY_SECONDS = float(
+        os.environ.get(
+            "API_PERFORMANCE_SLOW_QUERY_SECONDS",
+            "0.10",
+        )
+    )
+except (TypeError, ValueError):
+    API_PERFORMANCE_SLOW_QUERY_SECONDS = 0.10
+
+try:
+    API_PERFORMANCE_TOP_DUPLICATES = max(
+        1,
+        int(
+            os.environ.get(
+                "API_PERFORMANCE_TOP_DUPLICATES",
+                "5",
+            )
+        ),
+    )
+except (TypeError, ValueError):
+    API_PERFORMANCE_TOP_DUPLICATES = 5
+
+try:
+    API_PERFORMANCE_TOP_SLOW_QUERIES = max(
+        1,
+        int(
+            os.environ.get(
+                "API_PERFORMANCE_TOP_SLOW_QUERIES",
+                "5",
+            )
+        ),
+    )
+except (TypeError, ValueError):
+    API_PERFORMANCE_TOP_SLOW_QUERIES = 5
+
+
+# ---------------------------------------------------------------------
 # Middleware
 # ---------------------------------------------------------------------
-
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
@@ -99,18 +156,22 @@ MIDDLEWARE = [
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
+if API_PERFORMANCE_LOGGING:
+    MIDDLEWARE.append(
+        "inventory_backend.performance_middleware."
+        "ApiPerformanceLoggingMiddleware"
+    )
+
 
 # ---------------------------------------------------------------------
 # URLs
 # ---------------------------------------------------------------------
-
 ROOT_URLCONF = "inventory_backend.urls"
 
 
 # ---------------------------------------------------------------------
 # Templates
 # ---------------------------------------------------------------------
-
 TEMPLATES = [
     {
         "BACKEND": (
@@ -138,14 +199,30 @@ TEMPLATES = [
 # ---------------------------------------------------------------------
 # WSGI
 # ---------------------------------------------------------------------
-
 WSGI_APPLICATION = "inventory_backend.wsgi.application"
 
+# ---------------------------------------------------------------------
+# REDIS / MEMURAI CACHE
+# ---------------------------------------------------------------------
 
+REDIS_URL = os.environ.get(
+    "REDIS_URL",
+    "redis://127.0.0.1:6379/1",
+)
+
+CACHES = {
+    "default": {
+        "BACKEND": (
+            "django.core.cache.backends.redis.RedisCache"
+        ),
+        "LOCATION": REDIS_URL,
+        "TIMEOUT": 300,
+        "KEY_PREFIX": "ipms",
+    }
+}
 # ---------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------
-
 DATABASES = {
     "default": {
         "ENGINE": os.environ.get(
@@ -172,6 +249,15 @@ DATABASES = {
             "DATABASE_PORT",
             "3306",
         ),
+        # Reuse database connections between requests in production.
+        # This avoids paying the MySQL connection setup cost for every API.
+        "CONN_MAX_AGE": int(
+            os.environ.get(
+                "DATABASE_CONN_MAX_AGE",
+                "60",
+            )
+        ),
+        "CONN_HEALTH_CHECKS": True,
     }
 }
 
@@ -191,7 +277,6 @@ if (
 # ---------------------------------------------------------------------
 # Password Validation
 # ---------------------------------------------------------------------
-
 AUTH_PASSWORD_VALIDATORS = [
     {
         "NAME": (
@@ -223,7 +308,6 @@ AUTH_PASSWORD_VALIDATORS = [
 # ---------------------------------------------------------------------
 # Internationalization
 # ---------------------------------------------------------------------
-
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "Asia/Kolkata"
 USE_I18N = True
@@ -233,15 +317,25 @@ USE_TZ = True
 # ---------------------------------------------------------------------
 # Static Files
 # ---------------------------------------------------------------------
+# Use an absolute URL prefix so Django templates render:
+#     /static/images/aero360_logo.png
+STATIC_URL = "/static/"
 
-STATIC_URL = "static/"
+# Your source static folder shown in the project is:
+#     <project-root>/static/
+# Therefore Django staticfiles/finders must be told to search it.
+STATICFILES_DIRS = [
+    BASE_DIR / "static",
+]
+
+# collectstatic destination for deployment.
+# Keep this DIFFERENT from the source static folder above.
 STATIC_ROOT = BASE_DIR / "staticfiles"
 
 
 # ---------------------------------------------------------------------
 # Media Files
 # ---------------------------------------------------------------------
-
 MEDIA_URL = "media/"
 MEDIA_ROOT = BASE_DIR / "media"
 
@@ -249,7 +343,6 @@ MEDIA_ROOT = BASE_DIR / "media"
 # ---------------------------------------------------------------------
 # DRF CONFIG
 # ---------------------------------------------------------------------
-
 # Kept compatible with your current project.
 # Protected views explicitly use JWTAuthentication.
 REST_FRAMEWORK = {
@@ -263,16 +356,15 @@ REST_FRAMEWORK = {
         "rest_framework.filters.OrderingFilter",
     ),
     "DEFAULT_PAGINATION_CLASS": (
-        "rest_framework.pagination.PageNumberPagination"
+        "inventory_backend.pagination.OptionalPageNumberPagination"
     ),
-    "PAGE_SIZE": 20,
+    "PAGE_SIZE": 50,
 }
 
 
 # ---------------------------------------------------------------------
 # CORS SETTINGS
 # ---------------------------------------------------------------------
-
 CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOW_CREDENTIALS = True
 
@@ -280,12 +372,8 @@ CORS_ALLOW_CREDENTIALS = True
 # ---------------------------------------------------------------------
 # Default PK
 # ---------------------------------------------------------------------
-
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-# ---------------------------------------------------------------------
-# EMAIL / ZOHO SMTP
-# ---------------------------------------------------------------------
 
 # ---------------------------------------------------------------------
 # EMAIL / ZOHO SMTP
@@ -312,7 +400,11 @@ EMAIL_USE_TLS = (
         "EMAIL_USE_TLS",
         "True",
     ).lower()
-    in ("true", "1", "yes")
+    in (
+        "true",
+        "1",
+        "yes",
+    )
 )
 
 EMAIL_USE_SSL = (
@@ -320,7 +412,11 @@ EMAIL_USE_SSL = (
         "EMAIL_USE_SSL",
         "False",
     ).lower()
-    in ("true", "1", "yes")
+    in (
+        "true",
+        "1",
+        "yes",
+    )
 )
 
 EMAIL_HOST_USER = os.environ.get(
@@ -345,16 +441,15 @@ DEFAULT_FROM_EMAIL = os.environ.get(
     EMAIL_HOST_USER,
 )
 
-
 IPMS_BASE_URL = os.environ.get(
     "IPMS_BASE_URL",
     "http://localhost:5173",
 )
 
+
 # ---------------------------------------------------------------------
 # LOGIN OTP POLICY
 # ---------------------------------------------------------------------
-
 LOGIN_OTP_EXPIRY_MINUTES = int(
     os.environ.get(
         "LOGIN_OTP_EXPIRY_MINUTES",
@@ -375,3 +470,38 @@ LOGIN_OTP_RESEND_COOLDOWN_SECONDS = int(
         "60",
     )
 )
+
+
+# ---------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------
+# Only the dedicated API performance logger is configured here.
+# Existing Django logging remains enabled.
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "api_performance": {
+            "format": (
+                "%(asctime)s "
+                "[%(levelname)s] "
+                "%(message)s"
+            ),
+        },
+    },
+    "handlers": {
+        "api_performance_console": {
+            "class": "logging.StreamHandler",
+            "formatter": "api_performance",
+        },
+    },
+    "loggers": {
+        "api.performance": {
+            "handlers": [
+                "api_performance_console",
+            ],
+            "level": "INFO",
+            "propagate": False,
+        },
+    },
+}

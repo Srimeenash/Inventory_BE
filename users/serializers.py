@@ -969,6 +969,19 @@ class UserSerializer(
         return instance
 
 
+class PublicUserSummarySerializer(
+    serializers.ModelSerializer
+):
+    class Meta:
+        model = User
+        fields = [
+            "employee_name",
+            "role",
+            "designation",
+            "email",
+        ]
+
+
 # ============================================================
 # LOGIN SERIALIZER
 # ============================================================

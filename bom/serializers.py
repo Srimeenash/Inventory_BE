@@ -5,39 +5,49 @@ from notifications.models import Notification
 from .models import BOM, BOMItem
 
 
-class BOMItemSerializer(
-    serializers.ModelSerializer
-):
+class BOMItemSerializer(serializers.ModelSerializer):
     bom = serializers.PrimaryKeyRelatedField(
         queryset=BOM.objects.all(),
         required=False,
     )
 
-    component_name = serializers.CharField(
-        source="component.name",
-        read_only=True,
-    )
-
     component_code = serializers.CharField(
         source="component.component_id",
         read_only=True,
+        default="",
+    )
+
+    component_type = serializers.CharField(
+        source="component.component_type",
+        read_only=True,
+        default="",
     )
 
     class Meta:
         model = BOMItem
-
         fields = [
             "id",
             "bom",
             "component",
-            "component_name",
             "component_code",
+            "component_type",
             "category",
             "specifications",
             "quantity",
+            "unit",
             "vendor",
             "remarks",
         ]
+
+    def validate_quantity(self, value):
+        if int(value or 0) <= 0:
+            raise serializers.ValidationError(
+                "Quantity must be greater than 0."
+            )
+        return value
+
+    def validate_unit(self, value):
+        return str(value or "").strip()
 
 
 class BOMSerializer(serializers.ModelSerializer):
@@ -48,7 +58,6 @@ class BOMSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = BOM
-
         fields = [
             "id",
             "bom_number",
@@ -68,7 +77,6 @@ class BOMSerializer(serializers.ModelSerializer):
             "updated_at",
             "items",
         ]
-
         read_only_fields = [
             "manager_rejected_at",
             "manager_approved_at",
@@ -81,9 +89,6 @@ class BOMSerializer(serializers.ModelSerializer):
             "items",
             [],
         )
-
-        # Every newly created BOM must wait
-        # for manager approval.
         validated_data["status"] = (
             "PENDING_MANAGER"
         )
@@ -94,22 +99,21 @@ class BOMSerializer(serializers.ModelSerializer):
 
         for item_data in items_data:
             item_data.pop("bom", None)
+            item_data["unit"] = str(
+                item_data.get("unit") or ""
+            ).strip()
 
             BOMItem.objects.create(
                 bom=bom,
                 **item_data,
             )
 
-        # Remove an older duplicate notification,
-        # if one exists for the same BOM.
         Notification.objects.filter(
             category="BOM",
             reference_id=str(bom.id),
             receiver="MANAGER",
         ).delete()
 
-        # Automatically send the BOM to the
-        # Manager Notifications page.
         Notification.objects.create(
             category="BOM",
             title=(
@@ -144,7 +148,11 @@ class BOMSerializer(serializers.ModelSerializer):
         for field, value in (
             validated_data.items()
         ):
-            setattr(instance, field, value)
+            setattr(
+                instance,
+                field,
+                value,
+            )
 
         if old_status == "MANAGER_REJECTED":
             instance.status = "MODIFIED"
@@ -153,7 +161,14 @@ class BOMSerializer(serializers.ModelSerializer):
 
         if items_data is not None:
             for item_data in items_data:
-                item_data.pop("bom", None)
+                item_data.pop(
+                    "bom",
+                    None,
+                )
+                item_data["unit"] = str(
+                    item_data.get("unit")
+                    or ""
+                ).strip()
 
                 BOMItem.objects.create(
                     bom=instance,

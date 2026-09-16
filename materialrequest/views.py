@@ -1,14 +1,26 @@
 from collections import defaultdict
+import re
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import transaction
-from django.db.models import Q, Sum
+from django.db.models import Prefetch, Q, Sum
+from django.utils import timezone
 from rest_framework.permissions import IsAuthenticated
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework import status, viewsets
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
+
+from django.core.cache import cache
+from inventory_backend.cache_utils import (
+    build_list_cache_key,
+    get_cache_version,
+    invalidate_cache_version,
+)
+from inventory_backend.pagination import OptionalPageNumberPagination
+
+from componentusage.models import ComponentUsage
 
 from inventory.models import (
     Inventory,
@@ -24,7 +36,7 @@ from procurement.models import (
 )
 from inward.models import InwardEntry
 
-from .models import MaterialRequest
+from .models import BOMItem, MaterialRequest, RDItem, RequestItem
 from .serializers import MaterialRequestSerializer
 
 
@@ -34,6 +46,17 @@ ACTIVE_RESERVATION_STATUSES = {
 }
 
 User = get_user_model()
+
+MATERIAL_REQUEST_LIST_CACHE_TTL_SECONDS = 60
+MATERIAL_REQUEST_LIST_CACHE_VERSION_KEY = "ipms:materialrequests:list:version"
+
+
+def get_material_request_cache_version():
+    return get_cache_version(MATERIAL_REQUEST_LIST_CACHE_VERSION_KEY)
+
+
+def invalidate_material_request_cache():
+    invalidate_cache_version(MATERIAL_REQUEST_LIST_CACHE_VERSION_KEY)
 
 
 class MaterialRequestViewSet(viewsets.ModelViewSet):
@@ -48,25 +71,260 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
 
     Existing stock is reserved but is not physically deducted until the
     Inventory team provides the component.
-    """
 
+    List endpoint supports summary mode, optional pagination, search,
+    filtering, ordering, and hiding completed MRs reused as DRONE sources.
+    """
 
     authentication_classes = [JWTAuthentication]
     permission_classes = [IsAuthenticated]
-    queryset = (
-        MaterialRequest.objects
-        .prefetch_related(
-            "bom_items",
-            "bom_items__component",
-            "rd_items",
-            "rd_items__component",
-        )
-        .all()
-        .order_by("-date", "-id")
-    )
+    queryset = MaterialRequest.objects.all()
 
     serializer_class = MaterialRequestSerializer
-    pagination_class = None
+    pagination_class = OptionalPageNumberPagination
+
+    @staticmethod
+    def _query_flag(value):
+        return str(value or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    @staticmethod
+    def get_next_material_request_id():
+        """
+        Daily MR format:
+            MR-YYMMDD-00001
+            MR-YYMMDD-00002
+
+        Use the smallest unused sequence for today. This means an old
+        timestamp-based ID such as MR-260911-00304 does not force the
+        next MR to become 00305.
+        """
+        date_part = timezone.localdate().strftime("%y%m%d")
+        prefix = f"MR-{date_part}-"
+        pattern = re.compile(
+            rf"^{re.escape(prefix)}(\d{{5}})$",
+            flags=re.IGNORECASE,
+        )
+
+        existing_ids = list(
+            MaterialRequest.objects
+            .select_for_update()
+            .filter(
+                material_request_id__istartswith=prefix
+            )
+            .values_list(
+                "material_request_id",
+                flat=True,
+            )
+        )
+
+        used_sequences = set()
+
+        for request_id in existing_ids:
+            match = pattern.match(
+                str(request_id or "").strip()
+            )
+
+            if not match:
+                continue
+
+            sequence = int(match.group(1))
+
+            if sequence > 0:
+                used_sequences.add(sequence)
+
+        next_sequence = 1
+
+        while next_sequence in used_sequences:
+            next_sequence += 1
+
+        if next_sequence > 99999:
+            raise ValidationError(
+                {
+                    "material_request_id": (
+                        "Daily Material Request sequence "
+                        "has exceeded 99999."
+                    )
+                }
+            )
+
+        return f"{prefix}{next_sequence:05d}"
+
+    def list(self, request, *args, **kwargs):
+        version = get_material_request_cache_version()
+        cache_key = None
+
+        if version:
+            cache_key = build_list_cache_key(
+                "ipms:materialrequests:list",
+                version,
+                request,
+            )
+            try:
+                cached_data = cache.get(cache_key)
+            except Exception:
+                cached_data = None
+            if cached_data is not None:
+                return Response(cached_data)
+
+        response = super().list(request, *args, **kwargs)
+
+        if cache_key and response.status_code == 200:
+            try:
+                cache.set(
+                    cache_key,
+                    response.data,
+                    timeout=MATERIAL_REQUEST_LIST_CACHE_TTL_SECONDS,
+                )
+            except Exception:
+                pass
+
+        return response
+
+    def get_queryset(self):
+        request = self.request
+        is_list_action = getattr(self, "action", "") == "list"
+        summary_mode = (
+            is_list_action
+            and self._query_flag(request.query_params.get("summary"))
+        )
+
+        queryset = MaterialRequest.objects.select_related("requester")
+
+        if not summary_mode:
+            queryset = queryset.prefetch_related(
+                Prefetch(
+                    "bom_items",
+                    queryset=(
+                        BOMItem.objects
+                        .select_related("component")
+                    ),
+                ),
+                Prefetch(
+                    "rd_items",
+                    queryset=(
+                        RDItem.objects
+                        .select_related("component")
+                    ),
+                ),
+                Prefetch(
+                    "request_items",
+                    queryset=(
+                        RequestItem.objects
+                        .select_related("component")
+                    ),
+                ),
+                Prefetch(
+                    "inventory_reservations",
+                    queryset=(
+                        InventoryReservation.objects
+                        .select_related("component")
+                    ),
+                ),
+                Prefetch(
+                    "project_inventory_items",
+                    queryset=(
+                        ProjectInventory.objects
+                        .select_related("component")
+                    ),
+                ),
+            )
+
+        if not is_list_action:
+            return queryset
+
+        if self._query_flag(
+            request.query_params.get("hide_drone_returnable_source")
+        ):
+            drone_source_ids = (
+                ComponentUsage.objects
+                .filter(
+                    material_request_id__isnull=False,
+                    purpose__in=[
+                        "FLIGHT_TEST",
+                        "CUSTOMER_DEMO",
+                        "EVENT",
+                    ],
+                )
+                .exclude(
+                    material_request__request_type__iexact="RETURNABLE"
+                )
+                .values_list("material_request_id", flat=True)
+            )
+            queryset = queryset.exclude(id__in=drone_source_ids)
+
+        search_value = str(
+            request.query_params.get("search", "") or ""
+        ).strip()
+
+        if search_value:
+            queryset = queryset.filter(
+                Q(material_request_id__icontains=search_value)
+                | Q(requester_name__icontains=search_value)
+                | Q(request_type__icontains=search_value)
+                | Q(project__icontains=search_value)
+                | Q(bom__icontains=search_value)
+                | Q(status__icontains=search_value)
+                | Q(approval_status__icontains=search_value)
+                | Q(returnable_purpose__icontains=search_value)
+                | Q(remarks__icontains=search_value)
+            )
+
+        filter_mapping = {
+            "material_request_id": "material_request_id__icontains",
+            "requester_name": "requester_name__icontains",
+            "request_type": "request_type__icontains",
+            "project": "project__icontains",
+            "bom": "bom__icontains",
+            "status": "status__icontains",
+            "approval_status": "approval_status__icontains",
+            "returnable_purpose": "returnable_purpose__icontains",
+        }
+        filter_kwargs = {}
+
+        for frontend_key, django_lookup in filter_mapping.items():
+            value = str(
+                request.query_params.get(
+                    f"filter_{frontend_key}", ""
+                ) or ""
+            ).strip()
+            if value:
+                filter_kwargs[django_lookup] = value
+
+        if filter_kwargs:
+            queryset = queryset.filter(**filter_kwargs)
+
+        ordering_value = str(
+            request.query_params.get("ordering", "") or ""
+        ).strip()
+        allowed_ordering_fields = {
+            "id",
+            "material_request_id",
+            "requester_name",
+            "request_type",
+            "project",
+            "bom",
+            "date",
+            "required_date",
+            "status",
+            "approval_status",
+            "returnable_purpose",
+        }
+
+        if ordering_value:
+            field_name = ordering_value.lstrip("-")
+            if field_name in allowed_ordering_fields:
+                queryset = queryset.order_by(ordering_value, "-id")
+            else:
+                queryset = queryset.order_by("-date", "-id")
+        else:
+            queryset = queryset.order_by("-date", "-id")
+
+        return queryset
 
     @staticmethod
     def is_from_scrap_request(
@@ -140,6 +398,63 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
 
         return list(queryset)
 
+    @staticmethod
+    def normalize_serials(values):
+        if not isinstance(values, list):
+            return []
+
+        result = []
+        seen = set()
+
+        for value in values:
+            serial = str(value or "").strip()
+
+            if serial and serial not in seen:
+                seen.add(serial)
+                result.append(serial)
+
+        return result
+
+    @classmethod
+    def get_from_scrap_serials_from_item(
+        cls,
+        item,
+    ):
+        """
+        Read exact recovered Scrap serials saved on a rebuilt MR item.
+
+        Marker:
+            FROM_SCRAP_SERIALS:C_001|C_002|C_003
+        """
+        remarks = str(
+            getattr(
+                item,
+                "remarks",
+                "",
+            )
+            or ""
+        )
+
+        match = re.search(
+            r"FROM_SCRAP_SERIALS:([^\r\n]*)",
+            remarks,
+            flags=re.IGNORECASE,
+        )
+
+        if not match:
+            return []
+
+        return cls.normalize_serials(
+            [
+                value.strip()
+                for value in re.split(
+                    r"[|,;]",
+                    match.group(1),
+                )
+                if value.strip()
+            ]
+        )
+
     def get_component_groups(self, material_request, *, lock=False):
         """
         Group MR rows by component.
@@ -153,6 +468,7 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
                 "items": [],
                 "required_quantity": 0,
                 "component": None,
+                "recovered_serials": [],
             }
         )
 
@@ -180,6 +496,20 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
                 "component",
                 None,
             )
+
+            recovered_serials = (
+                self.get_from_scrap_serials_from_item(
+                    item
+                )
+            )
+
+            if recovered_serials:
+                group["recovered_serials"] = (
+                    self.normalize_serials(
+                        group["recovered_serials"]
+                        + recovered_serials
+                    )
+                )
 
         return groups
 
@@ -258,9 +588,16 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
 
     def reserve_request_components(self, material_request):
         """
-        Atomically reserve available In-Store stock for every component.
+        Reserve ONLY the quantity still missing after From-Scrap recovery.
 
-        This method must run inside transaction.atomic().
+        Example:
+            Source BOM Requested = 10
+            Recovered From Scrap = 6
+            Missing              = 4
+
+        Only the 4 missing units may use:
+            Central In Store
+            -> remaining shortage to Procurement
         """
         groups = self.get_component_groups(
             material_request,
@@ -279,17 +616,40 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
         shortages = []
         allocations = []
 
-        # A stable component lock order reduces deadlock risk.
         for component_id in sorted(groups):
             group = groups[component_id]
             items = group["items"]
             component = group["component"]
-            required_quantity = int(
-                group["required_quantity"] or 0
+
+            required_quantity = max(
+                int(
+                    group["required_quantity"]
+                    or 0
+                ),
+                0,
             )
 
-            # Lock physical stock rows first. Concurrent approvals for
-            # the same component will wait here.
+            recovered_serials = (
+                self.normalize_serials(
+                    group.get(
+                        "recovered_serials",
+                        [],
+                    )
+                    or []
+                )
+            )
+
+            recovered_quantity = min(
+                len(recovered_serials),
+                required_quantity,
+            )
+
+            missing_required_quantity = max(
+                required_quantity
+                - recovered_quantity,
+                0,
+            )
+
             stock_rows = list(
                 Inventory.objects
                 .select_for_update()
@@ -298,16 +658,22 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
                     issued=False,
                     quantity__gt=0,
                 )
-                .order_by("received_date", "id")
+                .order_by(
+                    "received_date",
+                    "id",
+                )
             )
 
-            # Lock all active reservations for the component before
-            # calculating availability.
             component_reservations = list(
                 InventoryReservation.objects
                 .select_for_update()
-                .filter(component_id=component_id)
-                .order_by("created_at", "id")
+                .filter(
+                    component_id=component_id
+                )
+                .order_by(
+                    "created_at",
+                    "id",
+                )
             )
 
             physical_quantity = (
@@ -319,7 +685,9 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
             reserved_by_other_mrs = (
                 self.get_other_active_reserved_quantity(
                     component_reservations,
-                    material_request_id=material_request.id,
+                    material_request_id=(
+                        material_request.id
+                    ),
                 )
             )
 
@@ -329,13 +697,14 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
                 0,
             )
 
+            # Central In Store is only for the missing quantity.
             reserved_store_quantity = min(
-                required_quantity,
+                missing_required_quantity,
                 available_for_current_mr,
             )
 
             shortage_quantity = max(
-                required_quantity
+                missing_required_quantity
                 - reserved_store_quantity,
                 0,
             )
@@ -343,9 +712,12 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
             reservation = next(
                 (
                     row
-                    for row in component_reservations
-                    if row.material_request_id
-                    == material_request.id
+                    for row
+                    in component_reservations
+                    if (
+                        row.material_request_id
+                        == material_request.id
+                    )
                 ),
                 None,
             )
@@ -353,9 +725,15 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
             if reservation is None:
                 reservation = (
                     InventoryReservation.objects.create(
-                        material_request=material_request,
+                        material_request=(
+                            material_request
+                        ),
                         component_id=component_id,
-                        requested_quantity=required_quantity,
+
+                        # Reservation represents only the missing qty.
+                        requested_quantity=(
+                            missing_required_quantity
+                        ),
                         reserved_store_quantity=(
                             reserved_store_quantity
                         ),
@@ -367,16 +745,17 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
                     )
                 )
             else:
-                issued_store_quantity = min(
+                existing_reserved_issued = min(
                     int(
-                        reservation.issued_store_quantity
+                        reservation
+                        .issued_store_quantity
                         or 0
                     ),
                     reserved_store_quantity,
                 )
 
                 reservation.requested_quantity = (
-                    required_quantity
+                    missing_required_quantity
                 )
                 reservation.reserved_store_quantity = (
                     reserved_store_quantity
@@ -385,7 +764,7 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
                     shortage_quantity
                 )
                 reservation.issued_store_quantity = (
-                    issued_store_quantity
+                    existing_reserved_issued
                 )
 
                 if reservation.status in {
@@ -396,29 +775,18 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
 
                 reservation.save()
 
-            store_distribution = self.distribute_quantity(
-                items,
-                reserved_store_quantity,
-            )
-
-            # Preserve item.inventory_quantity.
-            #
-            # The New Material Request page saves the In-Store quantity
-            # visible when the MR item is created. Manager approval uses
-            # live Inventory and InventoryReservation for routing, but it
-            # must not overwrite that creation-time snapshot.
-            #
-            # Approved Store allocation remains available in
-            # InventoryReservation and ProjectInventory.
-
             project_row, _ = (
                 ProjectInventory.objects
                 .select_for_update()
                 .get_or_create(
-                    material_request=material_request,
+                    material_request=(
+                        material_request
+                    ),
                     component_id=component_id,
                     defaults={
-                        "project": material_request.project,
+                        "project": (
+                            material_request.project
+                        ),
                         "requested_quantity": (
                             required_quantity
                         ),
@@ -426,49 +794,119 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
                 )
             )
 
-            project_row.project = material_request.project
-            project_row.requested_quantity = required_quantity
-            project_row.store_quantity = (
-                reserved_store_quantity
+            project_row.project = (
+                material_request.project
+            )
+            project_row.requested_quantity = (
+                required_quantity
             )
 
-            # Purchased/QC quantities are preserved if this method is
-            # called again after procurement has started.
+            # Ready non-purchased quantity =
+            # recovered Scrap + additional Central In Store.
+            project_row.store_quantity = min(
+                required_quantity,
+                recovered_quantity
+                + reserved_store_quantity,
+            )
+
+            # Recovered Scrap is already physically in the rebuilt MR.
+            existing_issued_serials = (
+                self.normalize_serials(
+                    getattr(
+                        project_row,
+                        "issued_store_serials",
+                        [],
+                    )
+                    or []
+                )
+            )
+
+            project_row.issued_store_serials = (
+                self.normalize_serials(
+                    recovered_serials
+                    + existing_issued_serials
+                )
+            )
+
+            project_row.issued_store_quantity = max(
+                int(
+                    getattr(
+                        project_row,
+                        "issued_store_quantity",
+                        0,
+                    )
+                    or 0
+                ),
+                recovered_quantity,
+            )
+
             project_row.quantity = min(
                 required_quantity,
-                int(project_row.store_quantity or 0)
+                int(
+                    project_row.store_quantity
+                    or 0
+                )
                 + int(
-                    project_row.purchased_quantity or 0
+                    project_row.purchased_quantity
+                    or 0
                 ),
             )
+
             project_row.save()
 
             component_code, component_name = (
-                self.get_component_identity(component)
+                self.get_component_identity(
+                    component
+                )
             )
 
             allocation = {
                 "component_id": component_id,
                 "component_code": component_code,
                 "component_name": component_name,
-                "required_quantity": required_quantity,
-                "physical_quantity": physical_quantity,
+
+                "required_quantity": (
+                    required_quantity
+                ),
+
+                "recovered_quantity": (
+                    recovered_quantity
+                ),
+                "recovered_serials": (
+                    recovered_serials
+                ),
+
+                "missing_required_quantity": (
+                    missing_required_quantity
+                ),
+
+                "physical_quantity": (
+                    physical_quantity
+                ),
                 "reserved_by_other_mrs": (
                     reserved_by_other_mrs
                 ),
                 "available_quantity": (
                     available_for_current_mr
                 ),
+
                 "reserved_store_quantity": (
                     reserved_store_quantity
                 ),
-                "shortage_quantity": shortage_quantity,
+
+                "shortage_quantity": (
+                    shortage_quantity
+                ),
             }
 
-            allocations.append(allocation)
+            allocations.append(
+                allocation
+            )
 
             if shortage_quantity > 0:
-                shortages.append(allocation)
+                shortages.append(
+                    allocation
+                )
 
         return allocations, shortages
 
@@ -1580,11 +2018,34 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
         ]
 
         # ----------------------------------------------------------
-        # Overall MR status remains PROCUREMENT_PENDING while even
-        # one procurement shortage exists. This does NOT prevent the
-        # separate INVENTORY notification from being actionable.
+        # A From-Scrap rebuild is complete only when the FULL source
+        # requirement is fulfilled.
+        #
+        # Recovered serials count as already issued, but missing qty
+        # must still pass through In Store / Procurement.
         # ----------------------------------------------------------
-        if shortages:
+        project_rows = list(
+            ProjectInventory.objects
+            .filter(
+                material_request=(
+                    material_request
+                )
+            )
+            .order_by("id")
+        )
+
+        all_fulfilled = bool(
+            project_rows
+        ) and all(
+            row.is_fulfilled
+            for row in project_rows
+        )
+
+        if all_fulfilled:
+            material_request.status = (
+                "INVENTORY_ISSUED"
+            )
+        elif shortages:
             material_request.status = (
                 "PROCUREMENT_PENDING"
             )
@@ -1607,7 +2068,10 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
         # also required. Inventory must be able to issue the reserved
         # quantity immediately.
         # ----------------------------------------------------------
-        if store_allocations:
+        if (
+            not all_fulfilled
+            and store_allocations
+        ):
             allocation_text = "; ".join(
                 (
                     f"{item['component_code']} "
@@ -1662,13 +2126,20 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
         # Send ONLY the unreserved shortage. Never ask Procurement to
         # purchase the quantity already reserved from In Store.
         # ----------------------------------------------------------
-        if shortages:
+        if (
+            not all_fulfilled
+            and shortages
+        ):
             shortage_text = "; ".join(
                 (
                     f"{item['component_code']} "
                     f"{item['component_name']} - "
                     f"Requested: "
                     f"{item['required_quantity']}, "
+                    f"Recovered From Scrap: "
+                    f"{item.get('recovered_quantity', 0)}, "
+                    f"Still Needed: "
+                    f"{item.get('missing_required_quantity', item['required_quantity'])}, "
                     f"Reserved from In Store: "
                     f"{item['reserved_store_quantity']}, "
                     f"Purchase: "
@@ -1770,6 +2241,7 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
 
     @transaction.atomic
     def perform_create(self, serializer):
+        invalidate_material_request_cache()
         current_user = self.request.user
 
         requester_name = (
@@ -1786,7 +2258,13 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
             or "User"
         )
 
+        # Backend is authoritative for the final daily MR number.
+        material_request_id = (
+            self.get_next_material_request_id()
+        )
+
         material_request = serializer.save(
+            material_request_id=material_request_id,
             requester=current_user,
             requester_name=requester_name,
             status="PENDING_MANAGER",
@@ -1807,6 +2285,7 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
 
     @transaction.atomic
     def perform_update(self, serializer):
+        invalidate_material_request_cache()
         old_instance = self.get_object()
 
         old_approval_status = str(

@@ -1,3 +1,4 @@
+from inventory.cost_serializers import CostDetailsSerializerMixin
 from django.db.models import Sum
 
 from rest_framework import serializers
@@ -24,6 +25,7 @@ class ReservationFieldsMixin:
             "material_request_id",
             None,
         )
+
         component_id = getattr(
             obj,
             "component_id",
@@ -37,6 +39,7 @@ class ReservationFieldsMixin:
             "_inventory_reservation_cache",
             {},
         )
+
         cache_key = (
             int(material_request_id),
             int(component_id),
@@ -51,55 +54,117 @@ class ReservationFieldsMixin:
             None,
         )
 
-        prefetched = []
-
         if material_request is not None:
-            prefetched = list(
-                getattr(
-                    material_request,
-                    "_prefetched_objects_cache",
-                    {},
-                ).get(
-                    "inventory_reservations",
-                    [],
-                )
+            prefetched_cache = getattr(
+                material_request,
+                "_prefetched_objects_cache",
+                {},
             )
 
-        reservation = next(
-            (
-                row
-                for row in prefetched
-                if row.component_id == component_id
-            ),
-            None,
-        )
-
-        if reservation is None:
-            reservation = (
-                InventoryReservation.objects
-                .filter(
-                    material_request_id=(
-                        material_request_id
+            # The MaterialRequest ViewSet prefetches inventory_reservations
+            # for normal/detail responses. An empty prefetched relation means
+            # there is no matching reservation, so do not issue a fallback query.
+            if "inventory_reservations" in prefetched_cache:
+                reservation = next(
+                    (
+                        row
+                        for row in prefetched_cache.get(
+                            "inventory_reservations",
+                            [],
+                        )
+                        if row.component_id
+                        == component_id
                     ),
-                    component_id=component_id,
+                    None,
                 )
-                .first()
+
+                cache[cache_key] = reservation
+                return reservation
+
+        reservation = (
+            InventoryReservation.objects
+            .filter(
+                material_request_id=
+                    material_request_id,
+                component_id=component_id,
             )
+            .first()
+        )
 
         cache[cache_key] = reservation
         return reservation
+
+    def _get_component_inventory_snapshot(
+        self,
+        component_id,
+    ):
+        """
+        Load physical stock plus active reservations once per component
+        for the whole serializer response.
+
+        Older code executed an Inventory aggregate and an
+        InventoryReservation query for every MR + Component pair.
+        """
+        component_id = int(component_id)
+
+        cache = self.context.setdefault(
+            "_component_inventory_snapshot_cache",
+            {},
+        )
+
+        if component_id in cache:
+            return cache[component_id]
+
+        physical_quantity = (
+            Inventory.objects
+            .filter(
+                component_id=component_id,
+                issued=False,
+                quantity__gt=0,
+            )
+            .aggregate(total=Sum("quantity"))
+            .get("total")
+            or 0
+        )
+
+        reservation_rows = list(
+            InventoryReservation.objects
+            .select_related("material_request")
+            .filter(
+                component_id=component_id,
+                status__in=[
+                    "ACTIVE",
+                    "PARTIAL",
+                ],
+            )
+            .order_by(
+                "created_at",
+                "id",
+            )
+        )
+
+        snapshot = {
+            "physical_quantity": max(
+                int(physical_quantity or 0),
+                0,
+            ),
+            "reservations": reservation_rows,
+        }
+
+        cache[component_id] = snapshot
+        return snapshot
 
     def _get_live_inventory_availability(
         self,
         obj,
     ):
         """
-        Calculate the quantity available to this Material Request using
-        the same rule as Manager approval:
-
+        Calculate:
             physical unissued Inventory
             - active remaining reservations of other MRs
             = available quantity for this MR
+
+        Stock/reservation rows are reused from the per-component cache.
         """
         material_request_id = getattr(
             obj,
@@ -133,62 +198,38 @@ class ReservationFieldsMixin:
         if cache_key in cache:
             return cache[cache_key]
 
-        physical_quantity = (
-            Inventory.objects
-            .filter(
-                component_id=component_id,
-                issued=False,
-                quantity__gt=0,
-            )
-            .aggregate(total=Sum("quantity"))
-            .get("total")
-            or 0
+        snapshot = self._get_component_inventory_snapshot(
+            component_id
         )
 
-        reservation_rows = (
-            InventoryReservation.objects
-            .filter(
-                component_id=component_id,
-                status__in=[
-                    "ACTIVE",
-                    "PARTIAL",
-                ],
-            )
-            .exclude(
-                material_request_id=(
-                    material_request_id
-                )
-            )
-            .values(
-                "reserved_store_quantity",
-                "issued_store_quantity",
-            )
-        )
+        reserved_by_other_mrs = 0
 
-        reserved_by_other_mrs = sum(
-            max(
+        for reservation in snapshot["reservations"]:
+            if (
+                reservation.material_request_id
+                == material_request_id
+            ):
+                continue
+
+            reserved_by_other_mrs += max(
                 int(
-                    row[
-                        "reserved_store_quantity"
-                    ]
+                    reservation.reserved_store_quantity
                     or 0
                 )
                 - int(
-                    row[
-                        "issued_store_quantity"
-                    ]
+                    reservation.issued_store_quantity
                     or 0
                 ),
                 0,
             )
-            for row in reservation_rows
-        )
+
+        physical_quantity = snapshot[
+            "physical_quantity"
+        ]
 
         availability = {
-            "physical_quantity": max(
-                int(physical_quantity or 0),
-                0,
-            ),
+            "physical_quantity":
+                physical_quantity,
             "reserved_by_other_mrs": max(
                 int(reserved_by_other_mrs or 0),
                 0,
@@ -234,19 +275,16 @@ class ReservationFieldsMixin:
         obj,
     ):
         """
-        Return the active stock reservations that reduce availability for
-        this MR component.
-
-        This makes the API explain *why* available stock is lower than the
-        physical In-Store quantity, e.g.:
-
-            MR-260807-00001 -> 7 reserved
+        Return active reservations that reduce availability for this
+        MR component, reusing the same per-component snapshot used by
+        the availability fields.
         """
         material_request_id = getattr(
             obj,
             "material_request_id",
             None,
         )
+
         component_id = getattr(
             obj,
             "component_id",
@@ -256,25 +294,32 @@ class ReservationFieldsMixin:
         if not component_id:
             return []
 
-        rows = (
-            InventoryReservation.objects
-            .select_related("material_request")
-            .filter(
-                component_id=component_id,
-                status__in=[
-                    "ACTIVE",
-                    "PARTIAL",
-                ],
-            )
-            .exclude(
-                material_request_id=material_request_id
-            )
-            .order_by("created_at", "id")
+        details_cache = self.context.setdefault(
+            "_reserved_by_other_mr_details_cache",
+            {},
+        )
+
+        cache_key = (
+            int(material_request_id or 0),
+            int(component_id),
+        )
+
+        if cache_key in details_cache:
+            return details_cache[cache_key]
+
+        snapshot = self._get_component_inventory_snapshot(
+            component_id
         )
 
         details = []
 
-        for reservation in rows:
+        for reservation in snapshot["reservations"]:
+            if (
+                reservation.material_request_id
+                == material_request_id
+            ):
+                continue
+
             remaining = max(
                 int(
                     reservation.reserved_store_quantity
@@ -297,11 +342,14 @@ class ReservationFieldsMixin:
                         .material_request
                         .material_request_id
                     ),
-                    "reserved_quantity": remaining,
-                    "status": reservation.status,
+                    "reserved_quantity":
+                        remaining,
+                    "status":
+                        reservation.status,
                 }
             )
 
+        details_cache[cache_key] = details
         return details
 
     def get_reserved_store_quantity(self, obj):
@@ -377,6 +425,12 @@ class BOMItemSerializer(
 
     component_name = serializers.CharField(
         source="component.name",
+        read_only=True,
+        default="",
+    )
+
+    component_type = serializers.CharField(
+        source="component.component_type",
         read_only=True,
         default="",
     )
@@ -462,6 +516,12 @@ class RDItemSerializer(
         default="",
     )
 
+    component_type = serializers.CharField(
+        source="component.component_type",
+        read_only=True,
+        default="",
+    )
+
     available_inventory_quantity = (
         serializers.SerializerMethodField()
     )
@@ -540,6 +600,12 @@ class RequestItemSerializer(
         read_only=True,
         default="",
     )
+
+    component_type = serializers.CharField(
+        source="component.component_type",
+        read_only=True,
+        default="",
+    )
     available_inventory_quantity = serializers.SerializerMethodField()
     physical_inventory_quantity = serializers.SerializerMethodField()
     reserved_by_other_mrs = serializers.SerializerMethodField()
@@ -573,8 +639,18 @@ class RequestItemSerializer(
         )
 
 class MaterialRequestSerializer(
-    serializers.ModelSerializer
+    CostDetailsSerializerMixin, serializers.ModelSerializer
 ):
+    # Fast table mode:
+    # /material-requests/?summary=1
+    #
+    # Nested component rows are intentionally omitted from the list.
+    # Fetch the normal detail endpoint when the user opens one MR.
+    summary_exclude_fields = (
+        "bom_items",
+        "rd_items",
+        "request_items",
+    )
     # Actual logged-in user who created this MR.
     # Backend sets this from request.user.
     requester = serializers.PrimaryKeyRelatedField(
@@ -884,7 +960,7 @@ class MaterialRequestSerializer(
                         item.get("component")
                     )
                 ),
-                unit=item.get("unit", "pc"),
+                unit=str(item.get("unit") or "").strip(),
                 unit_price=item.get(
                     "unit_price",
                     0,
@@ -919,7 +995,7 @@ class MaterialRequestSerializer(
                         item.get("component")
                     )
                 ),
-                unit=item.get("unit", "pc"),
+                unit=str(item.get("unit") or "").strip(),
                 unit_price=item.get(
                     "unit_price",
                     0,
@@ -952,7 +1028,7 @@ class MaterialRequestSerializer(
                         item.get("component")
                     )
                 ),
-                unit=item.get("unit", "pc"),
+                unit=str(item.get("unit") or "").strip(),
                 vendor=item.get("vendor", "N/A"),
                 remarks=item.get("remarks", ""),
             )

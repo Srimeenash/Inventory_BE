@@ -1,8 +1,9 @@
 from datetime import datetime, timedelta
 from uuid import uuid4
 
+from django.core.cache import cache
 from django.db import transaction
-from django.db.models import Sum
+from django.db.models import Q, Sum
 from django.utils import timezone
 
 from rest_framework import status
@@ -12,6 +13,16 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
 
+from inventory_backend.cache_utils import (
+    build_list_cache_key,
+    get_cache_version,
+    invalidate_cache_version,
+)
+from inventory_backend.pagination import (
+    OptionalPageNumberPagination,
+    apply_server_query_parameters,
+)
+
 from components.models import Component
 from notifications.models import Notification
 
@@ -19,12 +30,25 @@ from inventory.models import (
     Inventory,
     InventoryReservation,
     ProjectInventory,
+    DroneInstance,
+    DroneComponentAllocation,
 )
 from materialrequest.models import MaterialRequest
 from outward.models import OutwardEntry
 
 from .models import ComponentUsage
 from .serializers import ComponentUsageSerializer
+
+COMPONENT_USAGE_LIST_CACHE_TTL_SECONDS = 60
+COMPONENT_USAGE_LIST_CACHE_VERSION_KEY = "ipms:componentusage:list:version"
+
+
+def get_component_usage_cache_version():
+    return get_cache_version(COMPONENT_USAGE_LIST_CACHE_VERSION_KEY)
+
+
+def invalidate_component_usage_cache():
+    invalidate_cache_version(COMPONENT_USAGE_LIST_CACHE_VERSION_KEY)
 
 
 class ComponentUsageViewSet(ModelViewSet):
@@ -34,9 +58,116 @@ class ComponentUsageViewSet(ModelViewSet):
         .all()
     )
     serializer_class = ComponentUsageSerializer
-    pagination_class = None
+    pagination_class = OptionalPageNumberPagination
     authentication_classes = [JWTAuthentication]
     permission_classes = [IsAuthenticated]
+
+    def list(self, request, *args, **kwargs):
+        version = get_component_usage_cache_version()
+        cache_key = None
+
+        if version:
+            cache_key = build_list_cache_key(
+                "ipms:componentusage:list",
+                version,
+                request,
+            )
+            try:
+                cached_data = cache.get(cache_key)
+            except Exception:
+                cached_data = None
+            if cached_data is not None:
+                return Response(cached_data)
+
+        response = super().list(request, *args, **kwargs)
+
+        if cache_key and response.status_code == 200:
+            try:
+                cache.set(
+                    cache_key,
+                    response.data,
+                    timeout=COMPONENT_USAGE_LIST_CACHE_TTL_SECONDS,
+                )
+            except Exception:
+                pass
+
+        return response
+
+    def get_queryset(self):
+        queryset = super().get_queryset().order_by(
+            "-created_at",
+            "-id",
+        )
+
+        material_request = str(
+            self.request.query_params.get(
+                "material_request",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if material_request:
+            if material_request.isdigit():
+                queryset = queryset.filter(
+                    material_request_id=int(material_request)
+                )
+            else:
+                queryset = queryset.filter(
+                    material_request__material_request_id=
+                        material_request
+                )
+
+        active_return = str(
+            self.request.query_params.get(
+                "active_return",
+                "",
+            )
+            or ""
+        ).strip().lower()
+
+        if active_return in {"1", "true", "yes", "on"}:
+            queryset = (
+                queryset
+                .filter(
+                    issued_date__isnull=False,
+                    received_date__isnull=True,
+                )
+                .exclude(
+                    return_approval_status__in=[
+                        "REJECTED",
+                        "COMPLETED",
+                    ]
+                )
+            )
+
+        return apply_server_query_parameters(
+            queryset,
+            self.request,
+            search_fields=(
+                "employee_name",
+                "component_name",
+                "component_type",
+                "purpose",
+                "status",
+                "material_request__material_request_id",
+            ),
+            filter_fields={
+                "purpose": "purpose__iexact",
+                "status": "status__iexact",
+                "return_approval_status": "return_approval_status__iexact",
+                "component": "component_id",
+            },
+            ordering_fields=(
+                "employee_name",
+                "purpose",
+                "status",
+                "requested_date",
+                "return_due_date",
+                "created_at",
+            ),
+            default_ordering=("-created_at", "-id"),
+        )
 
     ACTIVE_RESERVATION_STATUSES = {
         "ACTIVE",
@@ -418,6 +549,7 @@ class ComponentUsageViewSet(ModelViewSet):
         return issue_details, ordered_issued
 
     @classmethod
+    @classmethod
     def restore_usage_stock(
         cls,
         usage,
@@ -440,6 +572,8 @@ class ComponentUsageViewSet(ModelViewSet):
                 )
             )
 
+        inventory_ids = []
+
         for detail in issue_details:
             inventory_id = detail.get(
                 "inventory_id"
@@ -453,11 +587,30 @@ class ComponentUsageViewSet(ModelViewSet):
                     )
                 )
 
-            stock_row = (
+            inventory_ids.append(
+                inventory_id
+            )
+
+        # Lock all source Inventory rows in one query instead of
+        # one SELECT ... FOR UPDATE for every issue-detail row.
+        stock_rows = {
+            str(row.pk): row
+            for row in (
                 Inventory.objects
                 .select_for_update()
-                .filter(pk=inventory_id)
-                .first()
+                .filter(
+                    pk__in=inventory_ids
+                )
+            )
+        }
+
+        for detail in issue_details:
+            inventory_id = detail.get(
+                "inventory_id"
+            )
+
+            stock_row = stock_rows.get(
+                str(inventory_id)
             )
 
             if stock_row is None:
@@ -485,13 +638,16 @@ class ComponentUsageViewSet(ModelViewSet):
                 0,
             )
 
-            current_serials = cls.normalize_serials(
-                stock_row.serial_numbers
+            current_serials = (
+                cls.normalize_serials(
+                    stock_row.serial_numbers
+                )
             )
 
             issued_serials = (
                 cls.normalize_serials(
-                    stock_row.issued_serial_numbers
+                    stock_row
+                    .issued_serial_numbers
                 )
             )
 
@@ -499,7 +655,8 @@ class ComponentUsageViewSet(ModelViewSet):
 
             stock_row.serial_numbers = (
                 cls.normalize_serials(
-                    current_serials + serials
+                    current_serials
+                    + serials
                 )
             )
 
@@ -511,7 +668,10 @@ class ComponentUsageViewSet(ModelViewSet):
 
             stock_row.quantity = (
                 max(
-                    int(stock_row.quantity or 0),
+                    int(
+                        stock_row.quantity
+                        or 0
+                    ),
                     0,
                 )
                 + quantity
@@ -519,6 +679,7 @@ class ComponentUsageViewSet(ModelViewSet):
 
             stock_row.issued = False
 
+            # Preserve the existing per-row save behaviour.
             stock_row.save(
                 update_fields=[
                     "quantity",
@@ -926,6 +1087,57 @@ class ComponentUsageViewSet(ModelViewSet):
             .order_by("id")
         )
 
+    @classmethod
+    def _material_request_item_uom(
+        cls,
+        material_request,
+        component_id,
+    ):
+        """Return the exact UOM stored on this MR component row."""
+        if material_request is None or not component_id:
+            return ""
+
+        for item in cls._material_request_items(material_request):
+            if getattr(item, "component_id", None) == component_id:
+                return str(getattr(item, "unit", "") or "").strip()
+
+        return ""
+
+    @staticmethod
+    def _drone_instance_from_reference(material_request, reference, *, lock=False):
+        raw = str(reference or "").strip()
+        if not raw:
+            return None
+        queryset = DroneInstance.objects.filter(
+            material_request=material_request
+        )
+        if lock:
+            queryset = queryset.select_for_update()
+        query = Q(instance_code=raw)
+        if raw.isdigit():
+            query |= Q(pk=int(raw))
+        return queryset.filter(query).first()
+
+    @classmethod
+    def _drone_instance_from_usage(cls, usage, *, lock=False):
+        metadata = cls._usage_metadata(usage) if hasattr(cls, "_usage_metadata") else {}
+        reference = metadata.get("drone_instance_id") or metadata.get("drone_instance_code")
+        return cls._drone_instance_from_reference(
+            usage.material_request,
+            reference,
+            lock=lock,
+        )
+
+    @staticmethod
+    def _set_drone_instance_status(instance, status_value, **metadata):
+        if instance is None:
+            return
+        workflow_metadata = dict(instance.workflow_metadata or {})
+        workflow_metadata.update(metadata)
+        instance.status = status_value
+        instance.workflow_metadata = workflow_metadata
+        instance.save(update_fields=["status", "workflow_metadata", "updated_at"])
+
     @action(
         detail=False,
         methods=["post"],
@@ -1099,6 +1311,150 @@ class ComponentUsageViewSet(ModelViewSet):
             request.data.get("remarks") or ""
         ).strip()
 
+        drone_instance_reference = (
+            request.data.get("drone_instance_id")
+            or request.data.get("drone_instance_code")
+            or request.data.get("droneInstanceId")
+            or request.data.get("droneInstanceCode")
+        )
+
+        if drone_instance_reference:
+            drone_instance = self._drone_instance_from_reference(
+                material_request,
+                drone_instance_reference,
+                lock=True,
+            )
+            if drone_instance is None:
+                return Response(
+                    {"detail": "Drone instance was not found for this Material Request."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            if str(drone_instance.status or "").strip().upper() != "AVAILABLE":
+                return Response(
+                    {
+                        "detail": (
+                            f"{drone_instance.instance_code} is not available. "
+                            f"Current state: {drone_instance.status}."
+                        )
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+            if requested_quantity != 1:
+                return Response(
+                    {
+                        "quantity": (
+                            "A physical Drone Instance always represents one drone. "
+                            "Start the action separately for each _01/_02 instance."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            allocations = list(
+                DroneComponentAllocation.objects
+                .select_related("component")
+                .filter(drone_instance=drone_instance)
+                .order_by("component_id")
+            )
+            if not allocations:
+                return Response(
+                    {"detail": "This Drone Instance has no component allocation."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            movement_id = uuid4().hex
+            created_rows = []
+            for allocation in allocations:
+                component = allocation.component
+                serials = self.normalize_serials(allocation.serial_numbers)
+                component_quantity = max(int(allocation.quantity or 0), len(serials), 0)
+                if component_quantity <= 0:
+                    continue
+                created_rows.append(
+                    ComponentUsage.objects.create(
+                        material_request=material_request,
+                        employee_name=material_request.requester_name or "In Drone",
+                        item_source="INVENTORY",
+                        component=component,
+                        component_name=(
+                            getattr(component, "name", "")
+                            or getattr(component, "component_name", "")
+                            or getattr(component, "component_id", "")
+                            or f"Component {component.pk}"
+                        ),
+                        component_type=getattr(component, "component_type", "") or "",
+                        uom=self._material_request_item_uom(material_request, component.pk),
+                        purpose=purpose,
+                        requested_date=requested_date,
+                        return_due_date=return_due_date,
+                        issued_date=requested_date,
+                        quantity=component_quantity,
+                        status="PENDING",
+                        remarks=remarks,
+                        return_approval_status="PENDING_MANAGER",
+                        issued_serial_numbers=serials,
+                        inventory_issue_details=[
+                            {
+                                "source": "IN_DRONE",
+                                "movement_id": movement_id,
+                                "drone_quantity": 1,
+                                "drone_instance_id": drone_instance.pk,
+                                "drone_instance_code": drone_instance.instance_code,
+                                "quantity": component_quantity,
+                            }
+                        ],
+                        inventory_adjusted=False,
+                        inventory_returned=False,
+                    )
+                )
+
+            if not created_rows:
+                return Response(
+                    {"detail": "This Drone Instance has no issued components."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            self._set_drone_instance_status(
+                drone_instance,
+                "RETURNABLE_PENDING",
+                workflow="RETURNABLE",
+                purpose=purpose,
+                movement_id=movement_id,
+            )
+
+            first_usage = created_rows[0]
+            purpose_label = {
+                "FLIGHT_TEST": "Flight Test",
+                "CUSTOMER_DEMO": "Demo/Trials",
+                "EVENT": "Event",
+            }.get(purpose, purpose.replace("_", " ").title())
+            self.upsert_return_notification(
+                first_usage,
+                receiver="MANAGER",
+                status_value="PENDING_MANAGER",
+                title=(
+                    f"Drone Usage Approval - {drone_instance.instance_code} - {purpose_label}"
+                ),
+                message=(
+                    f"{drone_instance.instance_code} is in In Drone. "
+                    f"Inventory requested {purpose_label}. Manager approval is required."
+                ),
+            )
+            return Response(
+                {
+                    "detail": "Drone instance usage submitted for Manager approval.",
+                    "material_request_id": material_request.material_request_id,
+                    "drone_instance_id": drone_instance.pk,
+                    "drone_instance_code": drone_instance.instance_code,
+                    "purpose": purpose,
+                    "quantity": 1,
+                    "movement_id": movement_id,
+                    "return_due_date": return_due_date,
+                    "rows": self.get_serializer(created_rows, many=True).data,
+                },
+                status=status.HTTP_201_CREATED,
+            )
+
         # Rows still physically unavailable to In Drone.
         active_usage_rows = list(
             ComponentUsage.objects
@@ -1262,11 +1618,22 @@ class ComponentUsageViewSet(ModelViewSet):
                     component=component,
                     component_name=(
                         getattr(component, "name", "")
-                        or ""
+                        or getattr(component, "component_name", "")
+                        or getattr(component, "component_id", "")
+                        or getattr(component, "code", "")
+                        or (
+                            f"Component {getattr(component, 'pk', '')}"
+                            if getattr(component, "pk", None)
+                            else "Component"
+                        )
                     ),
                     component_type=(
-                        getattr(component, "category", "")
+                        getattr(component, "component_type", "")
                         or ""
+                    ),
+                    uom=self._material_request_item_uom(
+                        material_request,
+                        getattr(component, "pk", None),
                     ),
                     purpose=purpose,
                     requested_date=requested_date,
@@ -1332,11 +1699,22 @@ class ComponentUsageViewSet(ModelViewSet):
                         item_source="INVENTORY",
                         component=component,
                         component_name=(
-                            getattr(component, "name", "") or ""
+                            getattr(component, "name", "")
+                            or getattr(component, "component_name", "")
+                            or getattr(component, "component_id", "")
+                            or getattr(component, "code", "")
+                            or (
+                                f"Component {getattr(component, 'pk', '')}"
+                                if getattr(component, "pk", None)
+                                else "Component"
+                            )
                         ),
                         component_type=(
-                            getattr(component, "category", "") or ""
+                            getattr(component, "component_type", "") or ""
                         ),
+                        uom=str(
+                            getattr(item, "unit", "") or ""
+                        ).strip(),
                         purpose=purpose,
                         requested_date=requested_date,
                         return_due_date=return_due_date,
@@ -1530,6 +1908,13 @@ class ComponentUsageViewSet(ModelViewSet):
                 return_approval_status="REJECTED",
             )
 
+            drone_instance = self._drone_instance_from_usage(usage, lock=True)
+            self._set_drone_instance_status(
+                drone_instance,
+                "AVAILABLE",
+                workflow="RETURNABLE_REJECTED",
+            )
+
             if notification is not None:
                 notification.status = "MANAGER_REJECTED"
                 notification.is_read = True
@@ -1559,6 +1944,15 @@ class ComponentUsageViewSet(ModelViewSet):
         rows.update(
             status="ISSUED",
             return_approval_status="NOT_REQUIRED",
+        )
+
+        drone_instance = self._drone_instance_from_usage(usage, lock=True)
+        self._set_drone_instance_status(
+            drone_instance,
+            "RETURNABLE_ACTIVE",
+            workflow="RETURNABLE",
+            purpose=purpose,
+            movement_id=self._movement_id_for_usage(usage),
         )
 
         if notification is not None:
@@ -1787,10 +2181,18 @@ class ComponentUsageViewSet(ModelViewSet):
                     item_source="INVENTORY",
                     component=component,
                     component_name=(
-                        getattr(component, "name", "") or ""
+                        getattr(component, "name", "")
+                        or getattr(component, "component_name", "")
+                        or getattr(component, "component_id", "")
+                        or getattr(component, "code", "")
+                        or (
+                            f"Component {getattr(component, 'pk', '')}"
+                            if getattr(component, "pk", None)
+                            else "Component"
+                        )
                     ),
                     component_type=(
-                        getattr(component, "category", "") or ""
+                        getattr(component, "component_type", "") or ""
                     ),
                     purpose=purpose,
                     requested_date=timezone.localdate(),
@@ -2171,6 +2573,284 @@ class ComponentUsageViewSet(ModelViewSet):
         return list(grouped.values())
 
     @classmethod
+    def _returnable_store_inventory_code(
+        cls,
+        usage,
+    ):
+        return f"RET-CU-{int(usage.pk)}"
+
+    @classmethod
+    def _return_returnable_qc_passed_to_store(
+        cls,
+        rows,
+        normalized_by_usage,
+    ):
+        """
+        FINAL Returnable rule:
+
+        Engineer returns a Returnable component -> Inventory performs QC.
+
+        Every unit marked OK goes immediately back to Central In Store.
+        Units marked NOT_OK do NOT go to Store; they remain in the
+        Failed-QC / Restore workflow.
+
+        The operation is idempotent per ComponentUsage row.
+        """
+        restored = []
+
+        for row in rows:
+            qc_items = normalized_by_usage.get(
+                int(row.pk),
+                [],
+            )
+
+            ok_items = [
+                item
+                for item in qc_items
+                if str(
+                    item.get("condition")
+                    or ""
+                )
+                .strip()
+                .upper()
+                == "OK"
+            ]
+
+            if not ok_items:
+                continue
+
+            ok_serials = cls.normalize_serials(
+                [
+                    item.get(
+                        "serial_number"
+                    )
+                    for item in ok_items
+                    if str(
+                        item.get(
+                            "serial_number"
+                        )
+                        or ""
+                    ).strip()
+                ]
+            )
+
+            ok_quantity = len(ok_items)
+
+            component = getattr(
+                row,
+                "component",
+                None,
+            )
+
+            if component is None:
+                continue
+
+            material_request = getattr(
+                row,
+                "material_request",
+                None,
+            )
+
+            mr_number = str(
+                getattr(
+                    material_request,
+                    "material_request_id",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            inventory_code = (
+                cls._returnable_store_inventory_code(
+                    row
+                )
+            )
+
+            stock_row = (
+                Inventory.objects
+                .select_for_update()
+                .filter(
+                    inventory_code=inventory_code
+                )
+                .first()
+            )
+
+            if stock_row is None:
+                stock_row = (
+                    Inventory.objects.create(
+                        inventory_code=inventory_code,
+                        component=component,
+                        category=(
+                            getattr(
+                                component,
+                                "category",
+                                "",
+                            )
+                            or ""
+                        ),
+                        vendor="RETURNABLE RETURN",
+                        purchase_order=(
+                            f"RETURNABLE:{mr_number}"
+                            if mr_number
+                            else "RETURNABLE"
+                        ),
+                        quantity=(
+                            len(ok_serials)
+                            if ok_serials
+                            else ok_quantity
+                        ),
+                        received_date=timezone.localdate(),
+                        total_price=0,
+                        issued=False,
+                        serial_numbers=ok_serials,
+                        issued_serial_numbers=[],
+                    )
+                )
+            else:
+                current_serials = (
+                    cls.normalize_serials(
+                        stock_row
+                        .serial_numbers
+                    )
+                )
+
+                merged_serials = (
+                    cls.normalize_serials(
+                        current_serials
+                        + ok_serials
+                    )
+                )
+
+                stock_row.component = (
+                    component
+                )
+                stock_row.category = (
+                    getattr(
+                        component,
+                        "category",
+                        "",
+                    )
+                    or ""
+                )
+                stock_row.vendor = (
+                    "RETURNABLE RETURN"
+                )
+                stock_row.purchase_order = (
+                    f"RETURNABLE:{mr_number}"
+                    if mr_number
+                    else "RETURNABLE"
+                )
+
+                stock_row.serial_numbers = (
+                    merged_serials
+                )
+
+                stock_row.quantity = (
+                    len(merged_serials)
+                    if merged_serials
+                    else max(
+                        int(
+                            stock_row.quantity
+                            or 0
+                        ),
+                        ok_quantity,
+                    )
+                )
+
+                stock_row.received_date = (
+                    timezone.localdate()
+                )
+                stock_row.issued = False
+
+                stock_row.save(
+                    update_fields=[
+                        "component",
+                        "category",
+                        "vendor",
+                        "purchase_order",
+                        "serial_numbers",
+                        "quantity",
+                        "received_date",
+                        "issued",
+                    ]
+                )
+
+            metadata = (
+                cls._usage_metadata(
+                    row
+                )
+            )
+
+            previously_returned = (
+                cls.normalize_serials(
+                    metadata.get(
+                        "returned_to_store_serials"
+                    )
+                    or []
+                )
+            )
+
+            cls._set_usage_metadata(
+                row,
+                returned_to_store_serials=(
+                    cls.normalize_serials(
+                        previously_returned
+                        + ok_serials
+                    )
+                ),
+                returned_to_store_quantity=(
+                    len(ok_serials)
+                    if ok_serials
+                    else ok_quantity
+                ),
+                returned_to_store_inventory_id=(
+                    stock_row.pk
+                ),
+                returned_to_store_inventory_code=(
+                    stock_row.inventory_code
+                ),
+            )
+
+            row.inventory_returned = (
+                len(ok_items)
+                >= max(
+                    int(row.quantity or 0),
+                    0,
+                )
+            )
+
+            row.save(
+                update_fields=[
+                    "inventory_issue_details",
+                    "inventory_returned",
+                ]
+            )
+
+            restored.append(
+                {
+                    "usage_id":
+                        row.pk,
+                    "component_id":
+                        row.component_id,
+                    "quantity":
+                        (
+                            len(ok_serials)
+                            if ok_serials
+                            else ok_quantity
+                        ),
+                    "serial_numbers":
+                        ok_serials,
+                    "inventory_id":
+                        stock_row.pk,
+                    "inventory_code":
+                        stock_row.inventory_code,
+                }
+            )
+
+        return restored
+
+
+    @classmethod
     def _find_returnable_qc_scrap(
         cls,
         *,
@@ -2329,7 +3009,14 @@ class ComponentUsageViewSet(ModelViewSet):
 
         metadata = {
             "workflow": workflow,
-            "scrap_mode": "PARTIAL",
+            # Drone: PARTIAL when at least one returned component passed QC,
+            # TOTAL when every returned component failed. Loose-component
+            # Returnable failures do not use PR/FR, so TOTAL is sufficient.
+            "scrap_mode": (
+                "PARTIAL"
+                if drone_mode and good_items
+                else "TOTAL"
+            ),
             "reorder_choice": "PENDING_MANAGER",
             "returnable_movement_id": movement_id,
             "returnable_usage_ids": [int(row.pk) for row in rows],
@@ -2369,7 +3056,11 @@ class ComponentUsageViewSet(ModelViewSet):
             "replacement_mr_number": "",
             "returned_inventory_ids": [],
             "procurement_restore_ready": False,
-            "procurement_restore_status": "WAITING_MANAGER_FINANCE",
+            "procurement_restore_status": (
+                "WAITING_MANAGER_FINANCE"
+                if drone_mode
+                else "ACTION_REQUIRED"
+            ),
         }
 
         single_component_id = None
@@ -2404,6 +3095,9 @@ class ComponentUsageViewSet(ModelViewSet):
             scrap_origin="MR",
             requested_by=actor_name,
             requested_by_user_id=getattr(request.user, "pk", None),
+            # This is a staged Returnable-QC disposition record, not final
+            # Engineer Scrap. It becomes final Scrap only after Manager NO +
+            # Finance approval.
             moved_to_inventory=False,
             moved_at=None,
             remarks=outward_remarks,
@@ -2411,6 +3105,7 @@ class ComponentUsageViewSet(ModelViewSet):
             status="PENDING_MANAGER",
         )
 
+        # Both loose components and drone-component failures go to Manager.
         Notification.objects.update_or_create(
             category="SCRAP",
             receiver="MANAGER",
@@ -2609,6 +3304,15 @@ class ComponentUsageViewSet(ModelViewSet):
                     if item["condition"] == "NOT_OK" and item["remarks"]
                 ]
                 row.return_reason = "; ".join(bad_reasons) or "Returned QC failed."
+
+                # Every failed Returnable unit now goes through the same
+                # Manager YES / NO disposition gate.
+                #
+                # Manager YES -> Procurement -> replacement PO -> Finance.
+                # Manager NO  -> Finance -> final QC-failed Scrap.
+                #
+                # This applies to BOTH loose Returnable components and
+                # assembled-drone Returnable movements.
                 row.return_approval_status = "PENDING_MANAGER"
             else:
                 row.return_condition = "OK"
@@ -2625,6 +3329,16 @@ class ComponentUsageViewSet(ModelViewSet):
             )
 
         first = rows[0]
+
+        drone_instance = self._drone_instance_from_usage(first, lock=True)
+        self._set_drone_instance_status(
+            drone_instance,
+            "QC_FAILED" if any_bad_in_movement else "AVAILABLE",
+            workflow="RETURN_QC",
+            qc_status="FAILED" if any_bad_in_movement else "PASSED",
+            movement_id=self._movement_id_for_usage(first),
+        )
+
         mr_number = (
             getattr(first.material_request, "material_request_id", "")
             or "Returnable"
@@ -2637,6 +3351,16 @@ class ComponentUsageViewSet(ModelViewSet):
         ).update(
             status="QC_CHECKED",
             is_read=True,
+        )
+
+        # FINAL RETURNABLE STOCK RULE:
+        # every OK unit returned by the Engineer goes directly to Central
+        # In Store, even when another unit in the same movement failed QC.
+        returned_to_store = (
+            self._return_returnable_qc_passed_to_store(
+                rows,
+                normalized_by_usage,
+            )
         )
 
         if any_bad_in_movement:
@@ -2659,9 +3383,13 @@ class ComponentUsageViewSet(ModelViewSet):
         return Response(
             {
                 "detail": (
-                    "Return QC failed and was sent to Manager."
+                    (
+                        "Return QC failed. The failed component(s) were sent to Manager for Reorder YES / NO."
+                        if not drone_mode
+                        else "Return QC failed. The failed drone component(s) were sent to Manager for Reorder YES / NO."
+                    )
                     if any_bad_in_movement
-                    else "Return QC passed."
+                    else "Return QC passed and returned components were moved to In Store."
                 ),
                 "qc_status": qc_status,
                 "material_request_id": mr_number,
@@ -2676,6 +3404,7 @@ class ComponentUsageViewSet(ModelViewSet):
                     else ""
                 ),
                 "rows": self.get_serializer(rows, many=True).data,
+                "returned_to_store": returned_to_store,
             },
             status=status.HTTP_200_OK,
         )

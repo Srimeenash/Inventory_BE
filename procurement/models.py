@@ -176,6 +176,14 @@ class PurchaseOrder(models.Model):
     )
     approved_at = models.DateTimeField(blank=True, null=True)
 
+    # Final PO-level adjustment. Positive adds, negative subtracts.
+    round_off = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        blank=True,
+    )
+
     # ---------------------------------------------------------
     # QC replacement audit/link fields.
     # ---------------------------------------------------------
@@ -224,10 +232,17 @@ class PurchaseOrder(models.Model):
         )
 
     @property
-    def grand_total(self):
+    def items_total(self):
         return sum(
             (item.total_cost or Decimal("0"))
             for item in self.items.all()
+        )
+
+    @property
+    def grand_total(self):
+        return (
+            self.items_total
+            + (self.round_off or Decimal("0"))
         )
 
     def __str__(self):
@@ -245,15 +260,51 @@ class PurchaseOrderItem(models.Model):
         on_delete=models.CASCADE,
     )
     quantity = models.PositiveIntegerField()
+
+    # Snapshot values for this PO line.
+    uom = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+    )
+
+    hsn_no = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+    )
+
     received_quantity = models.PositiveIntegerField(
         default=0,
         help_text="Total quantity received through inward entries",
     )
     unit_price = models.DecimalField(max_digits=12, decimal_places=2)
+    # Optional discount AMOUNT for this component line.
+    discount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        blank=True,
+    )
+
     gst_percentage = models.DecimalField(
         max_digits=5,
         decimal_places=2,
         null=True,
+        blank=True,
+    )
+
+    freight_cost = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        blank=True,
+    )
+
+    freight_gst_percentage = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=0,
         blank=True,
     )
 
@@ -275,23 +326,86 @@ class PurchaseOrderItem(models.Model):
 
     @property
     def subtotal(self):
+        """Qty × Unit Price before discount/tax."""
         return Decimal(self.quantity) * (
             self.unit_price or Decimal("0")
         )
 
     @property
+    def taxable_amount(self):
+        """Subtotal after discount."""
+        return max(
+            self.subtotal
+            - (self.discount or Decimal("0")),
+            Decimal("0"),
+        )
+
+    @property
     def gst_amount(self):
-        if self.gst_percentage is None:
-            return None
         return (
-            self.subtotal * self.gst_percentage
+            self.taxable_amount
+            * (self.gst_percentage or Decimal("0"))
+        ) / Decimal("100")
+
+    @property
+    def freight_gst_amount(self):
+        return (
+            (self.freight_cost or Decimal("0"))
+            * (
+                self.freight_gst_percentage
+                or Decimal("0")
+            )
         ) / Decimal("100")
 
     @property
     def total_cost(self):
-        if self.gst_percentage is None:
-            return None
-        return self.subtotal + self.gst_amount
+        return (
+            self.taxable_amount
+            + self.gst_amount
+            + (self.freight_cost or Decimal("0"))
+            + self.freight_gst_amount
+        )
+
+
+class PurchaseOrderPdfVoucher(models.Model):
+    """
+    Immutable audit/sequence record created whenever a Purchase Order PDF is
+    generated.
+
+    Voucher format:
+        <VENDOR_CODE>/<FINANCIAL_YEAR>/<SEQUENCE>
+
+    Example:
+        AER/26_27/0001
+
+    The sequence is shared by the 3-letter vendor code inside one financial
+    year. This prevents duplicate voucher numbers even if two vendor names
+    happen to start with the same three letters.
+    """
+
+    vendor_name = models.CharField(max_length=255)
+    vendor_code = models.CharField(max_length=3, db_index=True)
+    financial_year = models.CharField(max_length=5, db_index=True)
+    sequence = models.PositiveIntegerField()
+    voucher_number = models.CharField(max_length=40, unique=True)
+
+    # Snapshot of exactly what the generated PDF represented.
+    reference_po_numbers = models.JSONField(default=list, blank=True)
+    selected_item_ids = models.JSONField(default=list, blank=True)
+    generated_by = models.CharField(max_length=150, blank=True, default="")
+    generated_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-generated_at", "-id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["vendor_code", "financial_year", "sequence"],
+                name="uniq_po_pdf_voucher_vendor_fy_seq",
+            ),
+        ]
+
+    def __str__(self):
+        return self.voucher_number
 
 
 class PurchaseOrderApproval(models.Model):

@@ -16,11 +16,14 @@ class Component(models.Model):
         unique=True,
     )
 
+    # Legacy storage retained for historical transaction compatibility.
+    # New component creation no longer requires or exposes this field.
     name = models.CharField(
         max_length=255,
+        blank=True,
+        null=True,
     )
 
-    # NEW
     version = models.CharField(
         max_length=100,
         blank=True,
@@ -31,7 +34,12 @@ class Component(models.Model):
         max_length=50,
         choices=CATEGORY_CHOICES,
     )
-
+    # NEW - free-text classification entered by Inventory
+    component_type = models.CharField(
+        max_length=150,
+        blank=True,
+        null=True,
+    )
     specifications = models.TextField(
         blank=True,
         null=True,
@@ -111,7 +119,7 @@ class Component(models.Model):
         if self.version:
             return (
                 f"{self.component_id} - "
-                f"{self.name} - {self.version}"
+                f"{self.name or self.version} - {self.version}"
             )
 
-        return f"{self.component_id} - {self.name}"
+        return f"{self.component_id} - {self.name or ''}".rstrip(" -")

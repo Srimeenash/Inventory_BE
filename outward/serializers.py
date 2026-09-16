@@ -1,3 +1,4 @@
+from inventory.cost_serializers import CostDetailsSerializerMixin
 from uuid import uuid4
 
 from django.utils import timezone
@@ -6,7 +7,12 @@ from rest_framework import serializers
 from .models import OutwardEntry
 
 
-class OutwardEntrySerializer(serializers.ModelSerializer):
+class OutwardEntrySerializer(CostDetailsSerializerMixin, serializers.ModelSerializer):
+    summary_exclude_fields = (
+        "serial_numbers",
+        "inventory_allocations",
+        "returned_serial_numbers",
+    )
     typeOfOutward = serializers.ChoiceField(
         choices=OutwardEntry.OUTWARD_TYPE_CHOICES,
         source="outward_type",

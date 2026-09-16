@@ -1,5 +1,7 @@
-from django.db import transaction
-from django.db.models import F, Q, Sum
+import re
+from urllib.parse import unquote, urlparse
+from django.db import IntegrityError, transaction
+from django.db.models import F, Prefetch, Q, Sum
 from django.utils import timezone
 
 from rest_framework import status, viewsets
@@ -13,9 +15,11 @@ from inventory.models import InventoryReservation
 from components.models import Component
 from materialrequest.models import MaterialRequest
 from notifications.models import Notification
+from outward.models import OutwardEntry
 from notifications.email_service import send_ipms_email
 from users.models import User
 from django.conf import settings
+from django.core.cache import cache
 from decimal import Decimal
 from io import BytesIO
 
@@ -26,10 +30,20 @@ from num2words import num2words
 from xhtml2pdf import pisa
 
 from vendors.models import Vendor
+from inventory_backend.cache_utils import (
+    build_list_cache_key,
+    get_cache_version,
+    invalidate_cache_version,
+)
+from inventory_backend.pagination import (
+    OptionalPageNumberPagination,
+    apply_server_query_parameters,
+)
 from .models import (
     PurchaseOrder,
     PurchaseOrderApproval,
     PurchaseOrderItem,
+    PurchaseOrderPdfVoucher,
     PurchaseRequest,
 )
 from .serializers import (
@@ -37,6 +51,34 @@ from .serializers import (
     PurchaseRequestSerializer,
 )
 from pathlib import Path
+
+
+PURCHASE_REQUEST_LIST_CACHE_TTL_SECONDS = 60
+PURCHASE_REQUEST_LIST_CACHE_VERSION_KEY = "ipms:purchase_requests:list:version"
+PURCHASE_ORDER_LIST_CACHE_TTL_SECONDS = 60
+PURCHASE_ORDER_LIST_CACHE_VERSION_KEY = "ipms:purchase_orders:list:version"
+NOTIFICATION_LIST_CACHE_VERSION_KEY = "ipms:notifications:list:version"
+
+
+def get_purchase_request_cache_version():
+    return get_cache_version(PURCHASE_REQUEST_LIST_CACHE_VERSION_KEY)
+
+
+def invalidate_purchase_request_cache():
+    invalidate_cache_version(PURCHASE_REQUEST_LIST_CACHE_VERSION_KEY)
+
+
+def get_purchase_order_cache_version():
+    return get_cache_version(PURCHASE_ORDER_LIST_CACHE_VERSION_KEY)
+
+
+def invalidate_purchase_order_cache():
+    invalidate_cache_version(PURCHASE_ORDER_LIST_CACHE_VERSION_KEY)
+
+
+def invalidate_po_notification_cache():
+    """Refresh Manager/Finance notification lists immediately."""
+    invalidate_cache_version(NOTIFICATION_LIST_CACHE_VERSION_KEY)
 
 
 def pdf_link_callback(uri, rel):
@@ -61,6 +103,73 @@ def pdf_link_callback(uri, rel):
             "No suitable Unicode font was found in C:\\Windows\\Fonts"
         )
 
+    # ----------------------------------------------------------
+    # Resolve Django static files for xhtml2pdf.
+    #
+    # Example:
+    #   /static/images/aero360_logo.png
+    #       ->
+    #   C:\\...\\project\\static\\images\\aero360_logo.png
+    # ----------------------------------------------------------
+    static_url = str(
+        getattr(settings, "STATIC_URL", "/static/")
+        or "/static/"
+    )
+
+    # Normalize both "/static/..." and "static/..." forms.
+    normalized_uri = unquote(str(uri or "")).replace("\\", "/")
+    normalized_static_url = static_url.replace("\\", "/")
+
+    if not normalized_static_url.startswith("/"):
+        normalized_static_url = "/" + normalized_static_url
+
+    if not normalized_static_url.endswith("/"):
+        normalized_static_url += "/"
+
+    parsed_uri = urlparse(normalized_uri)
+    if parsed_uri.scheme == "file":
+        file_path = Path(parsed_uri.path)
+        if file_path.exists():
+            return str(file_path.resolve())
+
+    direct_path = Path(normalized_uri)
+    if direct_path.exists():
+        return str(direct_path.resolve())
+
+    candidate_uri = parsed_uri.path or normalized_uri
+    if candidate_uri.startswith("static/"):
+        candidate_uri = "/" + candidate_uri
+
+    if candidate_uri.startswith(normalized_static_url):
+        relative_path = candidate_uri[
+            len(normalized_static_url):
+        ].lstrip("/")
+
+        # First use Django's staticfiles finders.
+        static_path = finders.find(relative_path)
+        if static_path:
+            return str(static_path)
+
+        # Robust fallback for this project's source static folder:
+        #     BASE_DIR/static/images/aero360_logo.png
+        direct_static_path = (
+            Path(settings.BASE_DIR)
+            / "static"
+            / Path(relative_path)
+        )
+
+        if direct_static_path.exists():
+            return str(direct_static_path.resolve())
+
+    # xhtml2pdf may pass the path without Django's STATIC_URL prefix.
+    relative_static_path = (
+        Path(settings.BASE_DIR)
+        / "static"
+        / candidate_uri.lstrip("/")
+    )
+    if relative_static_path.exists():
+        return str(relative_static_path.resolve())
+
     return uri
 class PurchaseRequestViewSet(viewsets.ModelViewSet):
     queryset = (
@@ -70,25 +179,321 @@ class PurchaseRequestViewSet(viewsets.ModelViewSet):
     )
     serializer_class = PurchaseRequestSerializer
     permission_classes = [AllowAny]
+    pagination_class = OptionalPageNumberPagination
+
+    def list(self, request, *args, **kwargs):
+        version = get_purchase_request_cache_version()
+        cache_key = None
+
+        if version:
+            cache_key = build_list_cache_key(
+                "ipms:purchase_requests:list",
+                version,
+                request,
+            )
+            try:
+                cached_data = cache.get(cache_key)
+            except Exception:
+                cached_data = None
+            if cached_data is not None:
+                return Response(cached_data)
+
+        response = super().list(request, *args, **kwargs)
+
+        if cache_key and response.status_code == 200:
+            try:
+                cache.set(
+                    cache_key,
+                    response.data,
+                    timeout=PURCHASE_REQUEST_LIST_CACHE_TTL_SECONDS,
+                )
+            except Exception:
+                pass
+
+        return response
+
+    def get_queryset(self):
+        return apply_server_query_parameters(
+            super().get_queryset(),
+            self.request,
+            search_fields=(
+                "pr_number",
+                "requested_by",
+                "department",
+                "remarks",
+                "status",
+            ),
+            filter_fields={
+                "status": "status__iexact",
+                "department": "department__icontains",
+            },
+            ordering_fields=("pr_number", "created_at", "status"),
+            default_ordering=("-created_at", "-id"),
+        )
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        invalidate_purchase_request_cache()
+        return super().perform_create(serializer)
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        invalidate_purchase_request_cache()
+        return super().perform_update(serializer)
 
 
 class PurchaseOrderViewSet(viewsets.ModelViewSet):
     queryset = (
         PurchaseOrder.objects
         .prefetch_related(
-            "items",
-            "items__component",
+            Prefetch(
+                "items",
+                queryset=(
+                    PurchaseOrderItem.objects
+                    .select_related("component")
+                ),
+            ),
         )
         .all()
         .order_by("-created_at")
     )
 
     serializer_class = PurchaseOrderSerializer
+    pagination_class = OptionalPageNumberPagination
 
     # Parse JWT when the caller sends one, but preserve the
     # existing AllowAny behavior for routes that still rely on it.
     authentication_classes = [JWTAuthentication]
     permission_classes = [AllowAny]
+
+    def list(self, request, *args, **kwargs):
+        version = get_purchase_order_cache_version()
+        cache_key = None
+
+        if version:
+            cache_key = build_list_cache_key(
+                "ipms:purchase_orders:list",
+                version,
+                request,
+            )
+            try:
+                cached_data = cache.get(cache_key)
+            except Exception:
+                cached_data = None
+            if cached_data is not None:
+                return Response(cached_data)
+
+        response = super().list(request, *args, **kwargs)
+
+        if cache_key and response.status_code == 200:
+            try:
+                cache.set(
+                    cache_key,
+                    response.data,
+                    timeout=PURCHASE_ORDER_LIST_CACHE_TTL_SECONDS,
+                )
+            except Exception:
+                pass
+
+        return response
+
+    def get_queryset(self):
+        return apply_server_query_parameters(
+            super().get_queryset(),
+            self.request,
+            search_fields=(
+                "po_number",
+                "vendor_name",
+                "gstin",
+                "location",
+                "status",
+                "approval_status",
+                "source_mr_number",
+                "remarks",
+            ),
+            filter_fields={
+                "status": "status__iexact",
+                "approval_status": "approval_status__iexact",
+                "vendor_name": "vendor_name__icontains",
+                "source_mr_number": "source_mr_number__icontains",
+            },
+            ordering_fields=(
+                "po_number",
+                "vendor_name",
+                "ordered_date",
+                "expected_delivery_date",
+                "created_at",
+                "status",
+            ),
+            default_ordering=("-created_at", "-id"),
+        )
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="next-number",
+    )
+    def next_number(self, request):
+        current_date = timezone.localdate()
+        start_year = (
+            current_date.year
+            if current_date.month >= 4
+            else current_date.year - 1
+        )
+        financial_year = (
+            f"{str(start_year)[-2:]}-"
+            f"{str(start_year + 1)[-2:]}"
+        )
+
+        highest_sequence = 0
+        for value in PurchaseOrder.objects.values_list(
+            "po_number",
+            flat=True,
+        ):
+            match = re.match(
+                r"^(\d+)/(\d{2}-\d{2})$",
+                str(value or "").strip(),
+            )
+
+            if not match or match.group(2) != financial_year:
+                continue
+
+            highest_sequence = max(
+                highest_sequence,
+                int(match.group(1)),
+            )
+
+        return Response(
+            {
+                "po_number": (
+                    f"{highest_sequence + 1:02d}/"
+                    f"{financial_year}"
+                )
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="last-unit-price",
+    )
+    def last_unit_price(self, request):
+        """
+        Return the most recent valid PO unit price and its vendor for one component.
+
+        Used by Create PO:
+        selecting a component from a later PO automatically suggests
+        the last purchase price in Unit Price only.
+
+        Other values such as GST, Discount, Freight Cost, Freight GST,
+        UOM and Round-Off are NOT copied from the previous PO.
+        """
+        component_id = request.query_params.get(
+            "component_id"
+        )
+
+        if not component_id:
+            return Response(
+                {
+                    "detail": (
+                        "component_id query parameter "
+                        "is required."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            component_id = int(component_id)
+        except (TypeError, ValueError):
+            return Response(
+                {
+                    "detail": (
+                        "component_id must be a valid "
+                        "Component database ID."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        component = (
+            Component.objects
+            .filter(pk=component_id)
+            .first()
+        )
+
+        if component is None:
+            return Response(
+                {"detail": "Component not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        rejected_po_statuses = {
+            "REJECTED",
+            "FINANCE_REJECTED",
+            "REPLACEMENT_MANAGER_REJECTED",
+            "REPLACEMENT_FINANCE_REJECTED",
+        }
+
+        last_item = (
+            PurchaseOrderItem.objects
+            .select_related(
+                "purchase_order",
+                "component",
+            )
+            .filter(component_id=component_id)
+            .exclude(
+                purchase_order__status__in=(
+                    rejected_po_statuses
+                )
+            )
+            .order_by(
+                "-purchase_order__created_at",
+                "-id",
+            )
+            .first()
+        )
+
+        if last_item is None:
+            return Response(
+                {
+                    "component_id": component_id,
+                    "component_code": (
+                        component.component_id
+                    ),
+                    "unit_price": None,
+                    "vendor_name": "",
+                    "po_number": "",
+                    "has_previous_purchase": False,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        return Response(
+            {
+                "component_id": component_id,
+                "component_code": (
+                    component.component_id
+                ),
+                "unit_price": str(
+                    last_item.unit_price
+                ),
+                "po_number": (
+                    last_item
+                    .purchase_order
+                    .po_number
+                ),
+                "vendor_name": (
+                    last_item.purchase_order.vendor_name or ""
+                ),
+                "purchase_order_id": (
+                    last_item.purchase_order_id
+                ),
+                "has_previous_purchase": True,
+            },
+            status=status.HTTP_200_OK,
+        )
 
     # ==========================================================
     # QC REPLACEMENT APPROVAL HELPERS
@@ -219,6 +624,149 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             or getattr(user, "username", "")
             or "User"
         ).strip()[:100]
+
+    @staticmethod
+    def get_returnable_restore_outward_id(
+        purchase_order,
+    ):
+        """
+        Returnable Restore replacement POs carry:
+
+            RETURNABLE_RESTORE_OUTWARD:<outward_id>
+
+        in PO remarks.
+        """
+        if purchase_order is None:
+            return None
+
+        remarks = str(
+            getattr(
+                purchase_order,
+                "remarks",
+                "",
+            )
+            or ""
+        )
+
+        match = re.search(
+            r"RETURNABLE_RESTORE_OUTWARD:(\d+)",
+            remarks,
+            flags=re.IGNORECASE,
+        )
+
+        if not match:
+            return None
+
+        try:
+            return int(
+                match.group(1)
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return None
+
+    @classmethod
+    def sync_returnable_restore_outward_status(
+        cls,
+        purchase_order,
+        restore_status,
+    ):
+        """
+        Keep Outward -> Failed QC Restore status synchronized with the
+        replacement PO lifecycle.
+
+        This is UI/audit synchronization only. Physical stock movement is
+        handled by Inward QC:
+            Restore delivery QC PASS -> Central In Store.
+        """
+        outward_id = (
+            cls.get_returnable_restore_outward_id(
+                purchase_order
+            )
+        )
+
+        if not outward_id:
+            return None
+
+        outward = (
+            OutwardEntry.objects
+            .select_for_update()
+            .filter(
+                pk=outward_id
+            )
+            .first()
+        )
+
+        if outward is None:
+            return None
+
+        metadata = (
+            outward.inventory_allocations
+            if isinstance(
+                outward.inventory_allocations,
+                dict,
+            )
+            else {}
+        )
+
+        metadata[
+            "procurement_restore_status"
+        ] = str(
+            restore_status
+            or ""
+        ).strip().upper()
+
+        metadata[
+            "restore_last_po_id"
+        ] = purchase_order.pk
+
+        metadata[
+            "restore_last_po_number"
+        ] = purchase_order.po_number
+
+        metadata[
+            "restore_last_po_status"
+        ] = purchase_order.status
+
+        outward.inventory_allocations = (
+            metadata
+        )
+
+        status_map = {
+            "FINANCE_APPROVED":
+                "RESTORE_FINANCE_APPROVED",
+            "FINANCE_REJECTED":
+                "RESTORE_FINANCE_REJECTED",
+            "ORDERED":
+                "RESTORE_ORDERED",
+        }
+
+        mapped_status = status_map.get(
+            str(
+                restore_status
+                or ""
+            )
+            .strip()
+            .upper()
+        )
+
+        if mapped_status:
+            outward.status = (
+                mapped_status
+            )
+
+        outward.save(
+            update_fields=[
+                "inventory_allocations",
+                "status",
+                "updated_at",
+            ]
+        )
+
+        return outward
+
 
     def save_replacement_notification(
         self,
@@ -372,7 +920,15 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             purchase_order = (
                 PurchaseOrder.objects
                 .select_for_update()
-                .prefetch_related("items", "items__component")
+                .prefetch_related(
+                    Prefetch(
+                        "items",
+                        queryset=(
+                            PurchaseOrderItem.objects
+                            .select_related("component")
+                        ),
+                    ),
+                )
                 .get(pk=pk)
             )
         except PurchaseOrder.DoesNotExist:
@@ -553,6 +1109,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 pk=notification.pk
             ).delete()
 
+            invalidate_po_notification_cache()
             return notification
 
         create_kwargs = {
@@ -578,9 +1135,11 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 "requested_by"
             ] = requested_by
 
-        return Notification.objects.create(
+        notification = Notification.objects.create(
             **create_kwargs
         )
+        invalidate_po_notification_cache()
+        return notification
 
 
     # ==========================================================
@@ -698,6 +1257,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 pk=notification.pk
             ).delete()
 
+            invalidate_po_notification_cache()
             return notification
 
         create_kwargs = {
@@ -717,9 +1277,11 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 "requested_by"
             ] = requested_by
 
-        return Notification.objects.create(
+        notification = Notification.objects.create(
             **create_kwargs
         )
+        invalidate_po_notification_cache()
+        return notification
 
     def send_direct_po_manager_approval_email(
         self,
@@ -733,8 +1295,13 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             purchase_order = (
                 PurchaseOrder.objects
                 .prefetch_related(
-                    "items",
-                    "items__component",
+                    Prefetch(
+                        "items",
+                        queryset=(
+                            PurchaseOrderItem.objects
+                            .select_related("component")
+                        ),
+                    ),
                 )
                 .get(pk=purchase_order_id)
             )
@@ -938,8 +1505,13 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             purchase_order = (
                 PurchaseOrder.objects
                 .prefetch_related(
-                    "items",
-                    "items__component",
+                    Prefetch(
+                        "items",
+                        queryset=(
+                            PurchaseOrderItem.objects
+                            .select_related("component")
+                        ),
+                    ),
                 )
                 .get(pk=purchase_order_id)
             )
@@ -1178,8 +1750,13 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             purchase_order = (
                 PurchaseOrder.objects
                 .prefetch_related(
-                    "items",
-                    "items__component",
+                    Prefetch(
+                        "items",
+                        queryset=(
+                            PurchaseOrderItem.objects
+                            .select_related("component")
+                        ),
+                    ),
                 )
                 .get(pk=purchase_order_id)
             )
@@ -1599,8 +2176,13 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             purchase_order = (
                 PurchaseOrder.objects
                 .prefetch_related(
-                    "items",
-                    "items__component",
+                    Prefetch(
+                        "items",
+                        queryset=(
+                            PurchaseOrderItem.objects
+                            .select_related("component")
+                        ),
+                    ),
                 )
                 .get(
                     pk=purchase_order_id
@@ -1862,315 +2444,486 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
 
 
     # ==========================================================
-    # PURCHASE ORDER PDF
+    # PURCHASE ORDER PDF / VENDOR VOUCHER NUMBER
     # ==========================================================
 
-    @action(
-        detail=True,
-        methods=["get"],
-        url_path="pdf",
-    )
-    def download_pdf(self, request, pk=None):
+    @staticmethod
+    def _pdf_money_decimal(value):
         try:
-            purchase_order = (
-                PurchaseOrder.objects
-                .prefetch_related(
-                    "items",
-                    "items__component",
+            return Decimal(
+                str(
+                    value
+                    if value not in (None, "")
+                    else "0"
                 )
-                .get(pk=pk)
             )
+        except (
+            TypeError,
+            ValueError,
+            ArithmeticError,
+        ):
+            return Decimal("0.00")
 
-        except PurchaseOrder.DoesNotExist:
+    @staticmethod
+    def _pdf_vendor_code(vendor_name):
+        """
+        AERO / Aero360 -> AER
+
+        Only alphabetic characters are used. Very short names are padded with
+        X so the generated format always has a stable 3-character prefix.
+        """
+        letters = re.sub(
+            r"[^A-Za-z]",
+            "",
+            str(vendor_name or ""),
+        ).upper()
+
+        if not letters:
+            return "VEN"
+
+        return letters[:3].ljust(3, "X")
+
+    @staticmethod
+    def _pdf_financial_year_code(date_value=None):
+        """
+        Indian financial year (April -> March), using underscore format.
+
+        Example:
+            10-Sep-2026 -> 26_27
+            10-Feb-2027 -> 26_27
+        """
+        current_date = date_value or timezone.localdate()
+        start_year = (
+            current_date.year
+            if current_date.month >= 4
+            else current_date.year - 1
+        )
+        end_year = start_year + 1
+
+        return (
+            f"{start_year % 100:02d}_"
+            f"{end_year % 100:02d}"
+        )
+
+    def _create_pdf_voucher_record(
+        self,
+        *,
+        vendor_name,
+        reference_po_numbers,
+        selected_item_ids,
+    ):
+        """
+        Atomically allocate the next vendor/FY PDF voucher number.
+
+        A unique DB constraint protects against two users generating the same
+        sequence at the same time. In the rare race where both requests see
+        the same previous sequence, the losing request retries.
+        """
+        clean_vendor_name = str(
+            vendor_name or "Vendor"
+        ).strip() or "Vendor"
+
+        vendor_code = self._pdf_vendor_code(
+            clean_vendor_name
+        )
+        financial_year = (
+            self._pdf_financial_year_code()
+        )
+
+        references = []
+        for value in reference_po_numbers or []:
+            value = str(value or "").strip()
+            if value and value not in references:
+                references.append(value)
+
+        item_ids = []
+        for value in selected_item_ids or []:
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                continue
+            if value not in item_ids:
+                item_ids.append(value)
+
+        generated_by = str(
+            self.get_authenticated_po_sender_name()
+            or ""
+        ).strip()[:150]
+
+        for attempt in range(5):
+            try:
+                with transaction.atomic():
+                    latest = (
+                        PurchaseOrderPdfVoucher.objects
+                        .select_for_update()
+                        .filter(
+                            vendor_code=vendor_code,
+                            financial_year=financial_year,
+                        )
+                        .order_by(
+                            "-sequence",
+                            "-id",
+                        )
+                        .first()
+                    )
+
+                    next_sequence = (
+                        int(latest.sequence)
+                        if latest
+                        else 0
+                    ) + 1
+
+                    voucher_number = (
+                        f"{vendor_code}/"
+                        f"{financial_year}/"
+                        f"{next_sequence:04d}"
+                    )
+
+                    return (
+                        PurchaseOrderPdfVoucher.objects
+                        .create(
+                            vendor_name=clean_vendor_name,
+                            vendor_code=vendor_code,
+                            financial_year=financial_year,
+                            sequence=next_sequence,
+                            voucher_number=voucher_number,
+                            reference_po_numbers=references,
+                            selected_item_ids=item_ids,
+                            generated_by=generated_by,
+                        )
+                    )
+
+            except IntegrityError:
+                if attempt == 4:
+                    raise
+
+        raise RuntimeError(
+            "Unable to allocate Purchase Order PDF voucher number."
+        )
+
+    @staticmethod
+    def _pdf_vendor_context(vendor, vendor_name, fallback_po=None):
+        return {
+            "name": (
+                vendor.name
+                if vendor
+                else vendor_name
+            ),
+            "address": (
+                getattr(vendor, "address", "")
+                if vendor
+                else ""
+            ),
+            "city": (
+                getattr(vendor, "city", "")
+                if vendor
+                else ""
+            ),
+            "pincode": (
+                getattr(vendor, "pincode", "")
+                if vendor
+                else ""
+            ),
+            "gstin": (
+                getattr(vendor, "gst_number", "")
+                if vendor
+                else getattr(fallback_po, "gstin", "")
+            ),
+            "state": (
+                getattr(vendor, "state", "")
+                if vendor
+                else ""
+            ),
+            "state_code": (
+                getattr(vendor, "state_code", "")
+                if vendor
+                else ""
+            ),
+            "terms_and_conditions": (
+                getattr(
+                    vendor,
+                    "terms_and_conditions",
+                    "",
+                )
+                if vendor
+                else ""
+            ) or "",
+        }
+
+    def _build_purchase_order_pdf_response(
+        self,
+        *,
+        selected_items,
+        reference_purchase_orders,
+        vendor_name,
+        round_off,
+        is_partial_selection,
+    ):
+        """
+        Render one PDF from one or many same-vendor Purchase Orders.
+
+        The existing PurchaseOrder.po_number is never changed. A separate
+        vendor voucher number is allocated only for the generated PDF.
+        """
+        if not selected_items:
             return Response(
-                {
-                    "detail":
-                        "Purchase Order not found."
-                },
-                status=status.HTTP_404_NOT_FOUND,
+                {"detail": "No Purchase Order line items found."},
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # ------------------------------------------------------
-        # Find Vendor
-        # ------------------------------------------------------
-
-        vendor = (
-            Vendor.objects
-            .filter(
-                name__iexact=purchase_order.vendor_name
+        if not reference_purchase_orders:
+            return Response(
+                {"detail": "No source Purchase Order found."},
+                status=status.HTTP_400_BAD_REQUEST,
             )
-            .first()
-        )
 
-        # ------------------------------------------------------
-        # Purchase Order Date
-        # ------------------------------------------------------
-
-        po_date = (
-            purchase_order.ordered_date
-            or (
-                purchase_order.created_at.date()
-                if purchase_order.created_at
-                else None
-            )
-        )
-
-        # ------------------------------------------------------
-        # Items / totals
-        #
-        # Optional line-item selection from the PO detail page:
-        #
-        #   /pdf/?item_ids=12,15
-        #
-        # If item_ids is omitted, keep the old behaviour and include
-        # every PO line item.
-        # ------------------------------------------------------
-
-        requested_item_ids_raw = str(
-            request.query_params.get(
-                "item_ids",
-                "",
-            )
+        representative_po = reference_purchase_orders[0]
+        clean_vendor_name = str(
+            vendor_name
+            or representative_po.vendor_name
             or ""
         ).strip()
 
-        selected_items_queryset = (
-            purchase_order.items
-            .select_related("component")
-            .all()
+        vendor = (
+            Vendor.objects
+            .filter(name__iexact=clean_vendor_name)
+            .first()
         )
 
-        if requested_item_ids_raw:
-            requested_item_ids = []
+        reference_numbers = []
+        for po in reference_purchase_orders:
+            po_number = str(
+                getattr(po, "po_number", "")
+                or ""
+            ).strip()
+            if po_number and po_number not in reference_numbers:
+                reference_numbers.append(po_number)
 
-            for value in (
-                requested_item_ids_raw
-                .split(",")
-            ):
-                value = str(value or "").strip()
-
-                if not value:
-                    continue
-
-                if not value.isdigit():
-                    return Response(
-                        {
-                            "detail": (
-                                "Invalid Purchase Order "
-                                "line-item selection."
-                            )
-                        },
-                        status=
-                            status.HTTP_400_BAD_REQUEST,
-                    )
-
-                requested_item_ids.append(
-                    int(value)
-                )
-
-            requested_item_ids = list(
-                dict.fromkeys(
-                    requested_item_ids
-                )
-            )
-
-            if not requested_item_ids:
-                return Response(
-                    {
-                        "detail": (
-                            "Select at least one Purchase "
-                            "Order line item."
-                        )
-                    },
-                    status=
-                        status.HTTP_400_BAD_REQUEST,
-                )
-
-            selected_items_queryset = (
-                selected_items_queryset
-                .filter(
-                    id__in=
-                        requested_item_ids
-                )
-            )
-
-            selected_ids_found = set(
-                selected_items_queryset
-                .values_list(
-                    "id",
-                    flat=True,
-                )
-            )
-
-            if selected_ids_found != set(
-                requested_item_ids
-            ):
-                return Response(
-                    {
-                        "detail": (
-                            "One or more selected line "
-                            "items do not belong to this "
-                            "Purchase Order."
-                        )
-                    },
-                    status=
-                        status.HTTP_400_BAD_REQUEST,
-                )
-
-        selected_items = list(
-            selected_items_queryset
-            .order_by("id")
+        voucher_record = self._create_pdf_voucher_record(
+            vendor_name=clean_vendor_name,
+            reference_po_numbers=reference_numbers,
+            selected_item_ids=[
+                item.id
+                for item in selected_items
+            ],
         )
 
-        if not selected_items:
-            return Response(
-                {
-                    "detail":
-                        "No Purchase Order line items found."
-                },
-                status=
-                    status.HTTP_400_BAD_REQUEST,
-            )
+        generated_date = timezone.localdate()
+        money_decimal = self._pdf_money_decimal
 
         pdf_items = []
-
         subtotal = Decimal("0.00")
+        discount_total = Decimal("0.00")
+        taxable_total = Decimal("0.00")
         gst_total = Decimal("0.00")
+        gst_rates = set()
+        freight_total = Decimal("0.00")
+        freight_gst_total = Decimal("0.00")
+        items_total = Decimal("0.00")
         total_quantity = 0
 
         for index, item in enumerate(
             selected_items,
             start=1,
         ):
-            component = item.component
-
-            quantity = int(
-                item.quantity or 0
+            component = getattr(
+                item,
+                "component",
+                None,
+            )
+            source_po = getattr(
+                item,
+                "purchase_order",
+                None,
             )
 
-            unit_price = (
-                item.unit_price
-                or Decimal("0.00")
+            quantity = max(
+                int(
+                    getattr(item, "quantity", 0)
+                    or 0
+                ),
+                0,
+            )
+
+            unit_price = money_decimal(
+                getattr(item, "unit_price", 0)
+            )
+            discount = max(
+                money_decimal(
+                    getattr(item, "discount", 0)
+                ),
+                Decimal("0.00"),
+            )
+            gst_percentage = max(
+                money_decimal(
+                    getattr(item, "gst_percentage", 0)
+                ),
+                Decimal("0.00"),
+            )
+
+            if gst_percentage > Decimal("0.00"):
+                gst_rates.add(gst_percentage)
+
+            freight_cost = max(
+                money_decimal(
+                    getattr(item, "freight_cost", 0)
+                ),
+                Decimal("0.00"),
+            )
+            freight_gst_percentage = max(
+                money_decimal(
+                    getattr(
+                        item,
+                        "freight_gst_percentage",
+                        0,
+                    )
+                ),
+                Decimal("0.00"),
             )
 
             line_subtotal = (
-                Decimal(quantity) *
-                unit_price
+                Decimal(quantity) * unit_price
             )
-
-            gst_percentage = (
-                item.gst_percentage
-                or Decimal("0.00")
+            line_taxable_amount = max(
+                line_subtotal - discount,
+                Decimal("0.00"),
             )
-
             gst_amount = (
-                line_subtotal *
-                gst_percentage /
-                Decimal("100")
+                line_taxable_amount
+                * gst_percentage
+                / Decimal("100")
+            )
+            freight_gst_amount = (
+                freight_cost
+                * freight_gst_percentage
+                / Decimal("100")
+            )
+            line_total = (
+                line_taxable_amount
+                + gst_amount
+                + freight_cost
+                + freight_gst_amount
             )
 
             subtotal += line_subtotal
+            discount_total += discount
+            taxable_total += line_taxable_amount
             gst_total += gst_amount
+            freight_total += freight_cost
+            freight_gst_total += freight_gst_amount
+            items_total += line_total
             total_quantity += quantity
 
-            pdf_items.append({
-                "sl_no": index,
+            item_uom = str(
+                getattr(item, "uom", "")
+                or ""
+            ).strip()
+            item_hsn = str(
+                getattr(item, "hsn_no", "")
+                or ""
+            ).strip()
+            component_hsn = str(
+                getattr(
+                    component,
+                    "hsn_numbers",
+                    "",
+                )
+                or ""
+            ).strip()
 
-                "name":
-                    component.name
-                    if component
-                    else "Component",
-
-                "component_id":
-                    component.component_id
-                    if component
-                    else "",
-
-                "part_number":
-                    component.part_numbers
-                    if component
-                    else "",
-
-                "specification":
-                    component.specifications
-                    if component
-                    else "",
-
-                "hsn":
-                    component.hsn_numbers
-                    if component
-                    else "",
-
-"uom": "Nos",
-
-                "due_date":
-                    (
-                        item.expected_delivery_date
-                        or purchase_order.expected_delivery_date
+            pdf_items.append(
+                {
+                    "sl_no": index,
+                    "name": (
+                        getattr(component, "name", "")
+                        if component
+                        else "Component"
+                    ) or "Component",
+                    "component_id": (
+                        getattr(
+                            component,
+                            "component_id",
+                            "",
+                        )
+                        if component
+                        else ""
                     ),
+                    "part_number": (
+                        getattr(
+                            component,
+                            "part_numbers",
+                            "",
+                        )
+                        if component
+                        else ""
+                    ),
+                    "specification": (
+                        getattr(
+                            component,
+                            "specifications",
+                            "",
+                        )
+                        if component
+                        else ""
+                    ),
+                    "hsn": item_hsn or component_hsn,
+                    "uom": item_uom or "Nos",
+                    "due_date": (
+                        getattr(
+                            item,
+                            "expected_delivery_date",
+                            None,
+                        )
+                        or getattr(
+                            source_po,
+                            "expected_delivery_date",
+                            None,
+                        )
+                    ),
+                    "quantity": quantity,
+                    "unit_price": unit_price,
+                    "subtotal": line_subtotal,
+                    "discount": discount,
+                    "taxable_amount": line_taxable_amount,
+                    "gst_percentage": gst_percentage,
+                    "gst_amount": gst_amount,
+                    "freight_cost": freight_cost,
+                    "freight_gst_percentage": (
+                        freight_gst_percentage
+                    ),
+                    "freight_gst_amount": (
+                        freight_gst_amount
+                    ),
+                    "line_total": line_total,
+                    "total_cost": line_total,
+                    "amount": line_total,
 
-                "quantity":
-                    quantity,
+                    # IMPORTANT: every consolidated-PDF row keeps the
+                    # original Purchase Order it came from.
+                    "source_po_number": str(
+                        getattr(
+                            source_po,
+                            "po_number",
+                            "",
+                        )
+                        or ""
+                    ).strip(),
+                }
+            )
 
-                "unit_price":
-                    unit_price,
+        round_off = money_decimal(round_off)
+        grand_total = items_total + round_off
 
-                "gst_percentage":
-                    gst_percentage,
-
-                "subtotal":
-                    line_subtotal,
-            })
-
-        grand_total = (
-            subtotal +
-            gst_total
+        rounded_grand_total = grand_total.quantize(
+            Decimal("0.01")
         )
-
-        # ------------------------------------------------------
-        # GST split
-        #
-        # Dronix is Tamil Nadu - State code 33.
-        #
-        # Tamil Nadu vendor:
-        # CGST + SGST
-        #
-        # Outside Tamil Nadu:
-        # IGST
-        # ------------------------------------------------------
-
-        # ------------------------------------------------------
-        # GST FROM PURCHASE ORDER ONLY
-        # ------------------------------------------------------
-
-        gst_rates = []
-
-        for po_item in selected_items:
-            rate = Decimal(
-                str(po_item.gst_percentage or 0)
-            )
-
-            if rate not in gst_rates:
-                gst_rates.append(rate)
-
-        # Do not display GST percentage in PDF.
-        gst_label = "Input CGST"
-
-
-        # ------------------------------------------------------
-        # Amount in words
-        # ------------------------------------------------------
-
-        rupees = int(grand_total)
-
+        rupees = int(rounded_grand_total)
         paise = int(
-            round(
-                (
-                    grand_total -
-                    Decimal(rupees)
-                ) *
-                100
+            (
+                rounded_grand_total
+                - Decimal(rupees)
             )
+            * 100
         )
 
         amount_in_words = (
@@ -2178,8 +2931,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             + num2words(
                 rupees,
                 lang="en_IN",
-            )
-            .title()
+            ).title()
         )
 
         if paise:
@@ -2188,167 +2940,182 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 + num2words(
                     paise,
                     lang="en_IN",
-                )
-                .title()
+                ).title()
                 + " Paise"
             )
 
         amount_in_words += " Only"
 
-        # ------------------------------------------------------
-        # Other Reference
-        # ------------------------------------------------------
+        company_context = {
+            "name": "Dronix Technologies Private Limited",
+            "address_line_1": "No.133, AC Complex, Ground Floor",
+            "address_line_2": "Gandhi Road, Alapakkam, Perungalathur",
+            "city": "Chennai",
+            "gstin": "33AAGCD1081K1ZS",
+            "state": "Tamil Nadu",
+            "state_code": "33",
+            "email": "finance@aero360.co.in",
+        }
 
-        other_reference = (
-            f"CFRE / DRONIX "
-            f"{purchase_order.po_number} / R0"
+        vendor_context = self._pdf_vendor_context(
+            vendor,
+            clean_vendor_name,
+            representative_po,
         )
 
         # ------------------------------------------------------
-        # Context
+        # GST STATE VALIDATION
         # ------------------------------------------------------
+        # Dronix is in Tamil Nadu (State Code 33).
+        # Supplier in Tamil Nadu -> CGST + SGST.
+        # Supplier in another state -> IGST.
+        company_state_code = str(
+            company_context.get("state_code") or ""
+        ).strip()
+
+        vendor_state_code = str(
+            vendor_context.get("state_code") or ""
+        ).strip()
+
+        company_state_name = " ".join(
+            str(
+                company_context.get("state") or ""
+            ).strip().lower().split()
+        )
+
+        vendor_state_name = " ".join(
+            str(
+                vendor_context.get("state") or ""
+            ).strip().lower().split()
+        )
+
+        usable_vendor_state_code = (
+            vendor_state_code
+            if vendor_state_code.upper()
+            not in {"", "-", "NONE", "NULL"}
+            else ""
+        )
+
+        if usable_vendor_state_code:
+            is_intra_state = (
+                usable_vendor_state_code
+                == company_state_code
+            )
+        else:
+            is_intra_state = bool(
+                vendor_state_name
+                and vendor_state_name
+                == company_state_name
+            )
+
+        # Show a percentage only when all selected lines use one GST rate.
+        # Example: 18% -> CGST 9% + SGST 9%, or IGST 18%.
+        common_gst_rate = (
+            next(iter(gst_rates))
+            if len(gst_rates) == 1
+            else None
+        )
+
+        if is_intra_state:
+            cgst_total = (
+                gst_total / Decimal("2")
+            ).quantize(Decimal("0.01"))
+
+            # Keep exact tax total after rounding.
+            sgst_total = (
+                gst_total - cgst_total
+            ).quantize(Decimal("0.01"))
+
+            igst_total = Decimal("0.00")
+
+            if common_gst_rate is not None:
+                cgst_rate_display = (
+                    common_gst_rate / Decimal("2")
+                )
+                sgst_rate_display = (
+                    common_gst_rate / Decimal("2")
+                )
+            else:
+                cgst_rate_display = None
+                sgst_rate_display = None
+
+            igst_rate_display = None
+            gst_tax_type = "CGST_SGST"
+        else:
+            cgst_total = Decimal("0.00")
+            sgst_total = Decimal("0.00")
+            igst_total = gst_total.quantize(
+                Decimal("0.01")
+            )
+
+            cgst_rate_display = None
+            sgst_rate_display = None
+            igst_rate_display = common_gst_rate
+            gst_tax_type = "IGST"
+
+        # Retained only for backward compatibility.
+        # The PDF template intentionally leaves Other References blank.
+        other_reference = (
+            f"CFRE / DRONIX "
+            f"{voucher_record.voucher_number} / R0"
+        )
 
         context = {
-            # Fixed Dronix company details
-            "company": {
-                "name":
-                    "Dronix Technologies Private Limited",
+            "company": company_context,
+            "vendor": vendor_context,
+            "purchase_order": representative_po,
 
-                "address_line_1":
-                    "No.133, AC Complex, Ground Floor",
+            # Existing PO ID remains available for backward compatibility.
+            "po_number": representative_po.po_number,
 
-                "address_line_2":
-                    "Gandhi Road, Alapakkam, Perungalathur",
+            # New PDF-specific values.
+            "voucher_number": voucher_record.voucher_number,
+            "reference_numbers": reference_numbers,
+            "reference_number": " / ".join(reference_numbers),
+            "pdf_generated_date": generated_date,
 
-                "city":
-                    "Chennai",
+            # Date box now means PDF generation date, per requirement.
+            "po_date": generated_date,
+            "other_reference": other_reference,
+            "items": pdf_items,
+            "subtotal": subtotal,
+            "discount_total": discount_total,
+            "taxable_total": taxable_total,
+            "gst_total": gst_total,
 
-                "gstin":
-                    "33AAGCD1081K1ZS",
+            # State-based GST rendering values.
+            "is_intra_state": is_intra_state,
+            "gst_tax_type": gst_tax_type,
+            "cgst_total": cgst_total,
+            "sgst_total": sgst_total,
+            "igst_total": igst_total,
+            "cgst_rate_display": cgst_rate_display,
+            "sgst_rate_display": sgst_rate_display,
+            "igst_rate_display": igst_rate_display,
 
-                "state":
-                    "Tamil Nadu",
-
-                "state_code":
-                    "33",
-
-                "email":
-                    "finance@aero360.co.in",
-            },
-
-            # Vendor / Supplier details
-            "vendor": {
-                "name":
-                    (
-                        vendor.name
-                        if vendor
-                        else purchase_order.vendor_name
-                    ),
-
-                "address":
-                    (
-                        vendor.address
-                        if vendor
-                        else ""
-                    ),
-
-                "city":
-                    (
-                        getattr(
-                            vendor,
-                            "city",
-                            "",
-                        )
-                        if vendor
-                        else ""
-                    ),
-
-                "pincode":
-                    (
-                        getattr(
-                            vendor,
-                            "pincode",
-                            "",
-                        )
-                        if vendor
-                        else ""
-                    ),
-
-                "gstin":
-                    (
-                        vendor.gst_number
-                        if vendor
-                        else purchase_order.gstin
-                    ),
-
-                "state":
-                    (
-                        getattr(
-                            vendor,
-                            "state",
-                            "",
-                        )
-                        if vendor
-                        else ""
-                    ),
-"state_code": (
-    getattr(
-        vendor,
-        "state_code",
-        "",
-    )
-    if vendor
-    else ""
-),
-            },
-
-            "purchase_order":
-                purchase_order,
-
-            "po_number":
-                purchase_order.po_number,
-
-            "reference_number":
-                purchase_order.po_number,
-
-            "po_date":
-                po_date,
-
-            "other_reference":
-                other_reference,
-
-            "items":
-                pdf_items,
-
-            "subtotal":
-                subtotal,
-
-            "gst_total":
-                gst_total,
-
-            "gst_label":
-                gst_label,
-
-            "grand_total":
-                grand_total,
-
-            "total_quantity":
-                total_quantity,
-
-            "amount_in_words":
-                amount_in_words,
+            "gst_label": (
+                "CGST + SGST"
+                if is_intra_state
+                else "IGST"
+            ),
+            "freight_total": freight_total,
+            "freight_gst_total": freight_gst_total,
+            "items_total": items_total,
+            "round_off": round_off,
+            "po_round_off": round_off,
+            "grand_total": grand_total,
+            "total_quantity": total_quantity,
+            "amount_in_words": amount_in_words,
+            "is_partial_selection": is_partial_selection,
+            "is_consolidated_pdf": (
+                len(reference_numbers) > 1
+            ),
         }
-
-        # ------------------------------------------------------
-        # Render HTML
-        # ------------------------------------------------------
 
         template = get_template(
             "procurement/purchase_order_pdf.html"
         )
-
         html = template.render(context)
-
         result = BytesIO()
 
         pdf_status = pisa.CreatePDF(
@@ -2361,19 +3128,15 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         if pdf_status.err:
             return Response(
                 {
-                    "detail":
+                    "detail": (
                         "Unable to generate Purchase Order PDF."
+                    )
                 },
-                status=
-                    status.HTTP_500_INTERNAL_SERVER_ERROR,
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-        # ------------------------------------------------------
-        # Download response
-        # ------------------------------------------------------
-
-        safe_po_number = (
-            str(purchase_order.po_number)
+        safe_voucher_number = (
+            str(voucher_record.voucher_number)
             .replace("/", "-")
             .replace("\\", "-")
         )
@@ -2382,15 +3145,409 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             result.getvalue(),
             content_type="application/pdf",
         )
-
-        response[
-            "Content-Disposition"
-        ] = (
-            f'attachment; '
-            f'filename="PO_{safe_po_number}.pdf"'
+        response["Content-Disposition"] = (
+            f'attachment; filename="PO_{safe_voucher_number}.pdf"'
+        )
+        response["X-PO-Voucher-Number"] = (
+            voucher_record.voucher_number
+        )
+        response["Access-Control-Expose-Headers"] = (
+            "Content-Disposition, X-PO-Voucher-Number"
         )
 
         return response
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="pdf",
+    )
+    def download_pdf(self, request, pk=None):
+        """
+        Generate a PDF from one Purchase Order.
+
+        Voucher example:
+            AER/26_27/0001
+
+        Reference No. & Date contains the existing PO number and the PDF
+        generation date. The existing PurchaseOrder.po_number is unchanged.
+        """
+        try:
+            purchase_order = (
+                PurchaseOrder.objects
+                .prefetch_related(
+                    Prefetch(
+                        "items",
+                        queryset=(
+                            PurchaseOrderItem.objects
+                            .select_related(
+                                "component",
+                                "purchase_order",
+                            )
+                        ),
+                    ),
+                )
+                .get(pk=pk)
+            )
+        except PurchaseOrder.DoesNotExist:
+            return Response(
+                {"detail": "Purchase Order not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        all_items = list(
+            purchase_order.items.all()
+        )
+        all_item_ids = [
+            int(item.id)
+            for item in all_items
+        ]
+
+        requested_item_ids_raw = str(
+            request.query_params.get(
+                "item_ids",
+                "",
+            )
+            or ""
+        ).strip()
+
+        requested_item_ids = []
+
+        if requested_item_ids_raw:
+            for value in requested_item_ids_raw.split(","):
+                value = str(value or "").strip()
+
+                if not value:
+                    continue
+
+                if not value.isdigit():
+                    return Response(
+                        {
+                            "detail": (
+                                "Invalid Purchase Order line-item "
+                                "selection."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                item_id = int(value)
+                if item_id not in requested_item_ids:
+                    requested_item_ids.append(item_id)
+
+            if not requested_item_ids:
+                return Response(
+                    {
+                        "detail": (
+                            "Select at least one Purchase Order "
+                            "line item."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            all_item_id_set = set(all_item_ids)
+            if not set(requested_item_ids).issubset(
+                all_item_id_set
+            ):
+                return Response(
+                    {
+                        "detail": (
+                            "One or more selected line items do not "
+                            "belong to this Purchase Order."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            requested_item_id_set = set(
+                requested_item_ids
+            )
+            selected_items = [
+                item
+                for item in all_items
+                if int(item.id) in requested_item_id_set
+            ]
+        else:
+            selected_items = all_items
+
+        if not selected_items:
+            return Response(
+                {"detail": "No Purchase Order line items found."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        selected_id_set = {
+            int(item.id)
+            for item in selected_items
+        }
+        is_partial_selection = (
+            selected_id_set != set(all_item_ids)
+        )
+
+        round_off = (
+            Decimal("0.00")
+            if is_partial_selection
+            else self._pdf_money_decimal(
+                purchase_order.round_off
+            )
+        )
+
+        return self._build_purchase_order_pdf_response(
+            selected_items=selected_items,
+            reference_purchase_orders=[purchase_order],
+            vendor_name=purchase_order.vendor_name,
+            round_off=round_off,
+            is_partial_selection=is_partial_selection,
+        )
+
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="vendor-pdf",
+    )
+    def vendor_pdf(self, request):
+        """
+        Generate ONE consolidated PDF for selected components from multiple
+        Purchase Orders belonging to the SAME vendor.
+
+        Expected body:
+            {
+                "vendor_name": "Aero360",
+                "selections": [
+                    {"po_id": 34, "item_ids": [101, 102]},
+                    {"po_id": 36, "item_ids": [110]}
+                ]
+            }
+
+        The PDF receives one new vendor voucher number such as
+        AER/26_27/0001. Every selected BOM row keeps its own source PO number.
+        """
+        vendor_name = str(
+            request.data.get("vendor_name")
+            or ""
+        ).strip()
+        selections = request.data.get(
+            "selections",
+            [],
+        )
+
+        if not isinstance(selections, list):
+            return Response(
+                {
+                    "detail": (
+                        "selections must be a list of PO/item selections."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Merge duplicate entries for the same PO while preserving order.
+        selection_map = {}
+
+        for entry in selections:
+            if not isinstance(entry, dict):
+                continue
+
+            raw_po_id = entry.get("po_id")
+            raw_item_ids = entry.get("item_ids", [])
+
+            try:
+                po_id = int(raw_po_id)
+            except (TypeError, ValueError):
+                return Response(
+                    {"detail": "Invalid Purchase Order ID."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if not isinstance(raw_item_ids, list):
+                return Response(
+                    {
+                        "detail": (
+                            "item_ids must be a list for each "
+                            "Purchase Order."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            selected_ids = selection_map.setdefault(
+                po_id,
+                [],
+            )
+
+            for raw_item_id in raw_item_ids:
+                try:
+                    item_id = int(raw_item_id)
+                except (TypeError, ValueError):
+                    return Response(
+                        {
+                            "detail": (
+                                "Invalid Purchase Order line-item ID."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                if item_id not in selected_ids:
+                    selected_ids.append(item_id)
+
+        selection_map = {
+            po_id: item_ids
+            for po_id, item_ids in selection_map.items()
+            if item_ids
+        }
+
+        if not selection_map:
+            return Response(
+                {
+                    "detail": (
+                        "Select at least one component before "
+                        "generating the PDF."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        po_ids = list(selection_map.keys())
+        purchase_orders = list(
+            PurchaseOrder.objects
+            .filter(pk__in=po_ids)
+            .prefetch_related(
+                Prefetch(
+                    "items",
+                    queryset=(
+                        PurchaseOrderItem.objects
+                        .select_related(
+                            "component",
+                            "purchase_order",
+                        )
+                    ),
+                ),
+            )
+        )
+        po_by_id = {
+            int(po.id): po
+            for po in purchase_orders
+        }
+
+        if set(po_by_id.keys()) != set(po_ids):
+            return Response(
+                {
+                    "detail": (
+                        "One or more selected Purchase Orders "
+                        "could not be found."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # If the client did not send a vendor name, safely derive it from the
+        # first source PO. All source POs are then validated against it.
+        if not vendor_name:
+            first_po = po_by_id[po_ids[0]]
+            vendor_name = str(
+                first_po.vendor_name or ""
+            ).strip()
+
+        vendor_key = vendor_name.casefold()
+
+        selected_items = []
+        reference_purchase_orders = []
+        total_round_off = Decimal("0.00")
+        is_partial_selection = False
+        seen_item_ids = set()
+
+        for po_id in po_ids:
+            purchase_order = po_by_id[po_id]
+
+            if str(
+                purchase_order.vendor_name or ""
+            ).strip().casefold() != vendor_key:
+                return Response(
+                    {
+                        "detail": (
+                            "All Purchase Orders in one generated PDF "
+                            "must belong to the same vendor."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            all_items = list(
+                purchase_order.items.all()
+            )
+            all_item_by_id = {
+                int(item.id): item
+                for item in all_items
+            }
+
+            requested_ids = selection_map[po_id]
+            requested_id_set = set(requested_ids)
+
+            if not requested_id_set.issubset(
+                set(all_item_by_id.keys())
+            ):
+                return Response(
+                    {
+                        "detail": (
+                            f"One or more selected items do not "
+                            f"belong to PO {purchase_order.po_number}."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            selected_for_po = [
+                all_item_by_id[item_id]
+                for item_id in requested_ids
+                if item_id in all_item_by_id
+            ]
+
+            if not selected_for_po:
+                continue
+
+            reference_purchase_orders.append(
+                purchase_order
+            )
+
+            all_ids = set(all_item_by_id.keys())
+            if requested_id_set == all_ids:
+                total_round_off += (
+                    self._pdf_money_decimal(
+                        purchase_order.round_off
+                    )
+                )
+            else:
+                # A PO-level round-off is not applied to a partial selection.
+                is_partial_selection = True
+
+            for item in selected_for_po:
+                if int(item.id) in seen_item_ids:
+                    continue
+                seen_item_ids.add(int(item.id))
+                selected_items.append(item)
+
+        if not selected_items:
+            return Response(
+                {
+                    "detail": (
+                        "No valid Purchase Order components were selected."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return self._build_purchase_order_pdf_response(
+            selected_items=selected_items,
+            reference_purchase_orders=(
+                reference_purchase_orders
+            ),
+            vendor_name=vendor_name,
+            round_off=total_round_off,
+            is_partial_selection=is_partial_selection,
+        )
+
     # ==========================================================
     # MATERIAL REQUEST / PO WORKFLOW HELPERS
     # ==========================================================
@@ -3268,6 +4425,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             Existing Procurement replacement workflow remains unchanged.
         """
         purchase_order = serializer.save()
+        invalidate_purchase_order_cache()
 
         if purchase_order.source_mr_number:
             material_request = (
@@ -3396,6 +4554,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         ).upper()
 
         purchase_order = serializer.save()
+        invalidate_purchase_order_cache()
 
         new_status = str(
             purchase_order.status
@@ -3622,6 +4781,8 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 )
             )
 
+        invalidate_po_notification_cache()
+
         if purchase_order.source_mr_number:
             self.sync_material_request_po_progress(
                 purchase_order.source_mr_number
@@ -3638,8 +4799,17 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         source_mr_number = (
             instance.source_mr_number
         )
+        purchase_order_id = str(instance.id)
 
         instance.delete()
+
+        Notification.objects.filter(
+            category="PO",
+            reference_id=purchase_order_id,
+        ).delete()
+
+        invalidate_po_notification_cache()
+        invalidate_purchase_order_cache()
 
         if source_mr_number:
             self.sync_material_request_po_progress(
@@ -3680,8 +4850,13 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 PurchaseOrder.objects
                 .select_for_update()
                 .prefetch_related(
-                    "items",
-                    "items__component",
+                    Prefetch(
+                        "items",
+                        queryset=(
+                            PurchaseOrderItem.objects
+                            .select_related("component")
+                        ),
+                    ),
                 )
                 .get(pk=pk)
             )
@@ -3783,6 +4958,8 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             is_read=True,
         )
 
+        invalidate_po_notification_cache()
+
         # Finance notification is created ONLY AFTER Manager approval.
         self.save_finance_notification_with_sender(
             purchase_order,
@@ -3798,6 +4975,9 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 )
             )
         )
+
+        invalidate_po_notification_cache()
+        invalidate_purchase_order_cache()
 
         return Response(
             self.get_serializer(
@@ -3846,8 +5026,13 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 PurchaseOrder.objects
                 .select_for_update()
                 .prefetch_related(
-                    "items",
-                    "items__component",
+                    Prefetch(
+                        "items",
+                        queryset=(
+                            PurchaseOrderItem.objects
+                            .select_related("component")
+                        ),
+                    ),
                 )
                 .get(pk=pk)
             )
@@ -3931,6 +5116,9 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 purchase_order.id
             ),
         ).delete()
+
+        invalidate_po_notification_cache()
+        invalidate_purchase_order_cache()
 
         return Response(
             self.get_serializer(
@@ -4228,6 +5416,11 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             is_read=True,
         )
 
+        self.sync_returnable_restore_outward_status(
+            purchase_order,
+            "FINANCE_APPROVED",
+        )
+
         self.sync_replacement_mr_status(purchase_order)
         return Response(self.get_serializer(purchase_order).data)
 
@@ -4293,6 +5486,11 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             is_read=True,
         )
 
+        self.sync_returnable_restore_outward_status(
+            purchase_order,
+            "FINANCE_REJECTED",
+        )
+
         self.sync_replacement_mr_status(purchase_order)
         return Response(self.get_serializer(purchase_order).data)
 
@@ -4304,17 +5502,45 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
     @transaction.atomic
     def replacement_mark_ordered(self, request, pk=None):
         self.require_active_role(request, "procurement", "admin")
-        purchase_order, error_response = self.get_replacement_po_or_error(pk)
+
+        purchase_order, error_response = (
+            self.get_replacement_po_or_error(pk)
+        )
         if error_response:
             return error_response
 
-        if str(purchase_order.status or "").upper() != "REPLACEMENT_APPROVED":
+        current_status = str(
+            purchase_order.status or ""
+        ).strip().upper()
+
+        # Idempotent handling: if a previous click already changed the DB but
+        # the browser still showed stale REPLACEMENT_APPROVED data, return the
+        # current PO instead of failing with HTTP 400.
+        if current_status in {
+            "REPLACEMENT_ORDERED",
+            "REPLACEMENT_PARTIALLY_RECEIVED",
+            "REPLACEMENT_RECEIVED",
+        }:
+            transaction.on_commit(invalidate_purchase_order_cache)
+            transaction.on_commit(invalidate_po_notification_cache)
             return Response(
-                {"detail": "The Replacement PO must be approved before it can be ordered."},
+                self.get_serializer(purchase_order).data,
+                status=status.HTTP_200_OK,
+            )
+
+        if current_status != "REPLACEMENT_APPROVED":
+            return Response(
+                {
+                    "detail": (
+                        "The Replacement PO must be approved "
+                        "before it can be ordered."
+                    )
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         actor = self.get_request_actor_name(request)
+
         purchase_order.status = "REPLACEMENT_ORDERED"
         purchase_order.save(update_fields=["status"])
 
@@ -4325,9 +5551,21 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             approved_by=actor,
         )
 
+        self.sync_returnable_restore_outward_status(
+            purchase_order,
+            "ORDERED",
+        )
         self.sync_replacement_mr_status(purchase_order)
-        return Response(self.get_serializer(purchase_order).data)
 
+        transaction.on_commit(invalidate_purchase_order_cache)
+        transaction.on_commit(invalidate_po_notification_cache)
+
+        purchase_order.refresh_from_db()
+
+        return Response(
+            self.get_serializer(purchase_order).data,
+            status=status.HTTP_200_OK,
+        )
 
     # ==========================================================
     # PURCHASE ORDER RECEIPT
@@ -4364,8 +5602,13 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 PurchaseOrder.objects
                 .select_for_update()
                 .prefetch_related(
-                    "items",
-                    "items__component",
+                    Prefetch(
+                        "items",
+                        queryset=(
+                            PurchaseOrderItem.objects
+                            .select_related("component")
+                        ),
+                    ),
                 )
                 .get(pk=pk)
             )
@@ -4620,6 +5863,15 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             update_fields=["status"]
         )
 
+        # IMPORTANT:
+        # Purchase Order list responses are version-cached.
+        # The receive endpoint changes PO status directly (ORDERED ->
+        # PARTIALLY_DELIVERED / DELIVERED), so invalidate the list cache
+        # immediately. Otherwise the PO table can continue showing
+        # "Mark Delivery" even though the Inward record exists and the
+        # database PO status is already DELIVERED.
+        invalidate_purchase_order_cache()
+
         # Recalculate every component and every PO in
         # the linked Material Request.
         if purchase_order.source_mr_number:
@@ -4630,8 +5882,13 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         purchase_order = (
             PurchaseOrder.objects
             .prefetch_related(
-                "items",
-                "items__component",
+                Prefetch(
+                    "items",
+                    queryset=(
+                        PurchaseOrderItem.objects
+                        .select_related("component")
+                    ),
+                ),
             )
             .get(pk=purchase_order.pk)
         )

@@ -32,12 +32,7 @@ class Vendor(models.Model):
         null=True
     )
 
-    payment_terms = models.TextField(
-        blank=True,
-        null=True,
-    )
-
-    shipping_terms = models.TextField(
+    terms_and_conditions = models.TextField(
         blank=True,
         null=True,
     )

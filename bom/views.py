@@ -1,6 +1,9 @@
+import threading
+
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import transaction
+from django.db.models import Prefetch
 from django.utils import timezone
 
 from notifications.email_service import send_ipms_email
@@ -10,6 +13,16 @@ from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
+from django.core.cache import cache
+from inventory_backend.cache_utils import (
+    build_list_cache_key,
+    get_cache_version,
+    invalidate_cache_version,
+)
+from inventory_backend.pagination import (
+    OptionalPageNumberPagination,
+    apply_server_query_parameters,
+)
 
 from .models import BOM, BOMItem
 from .serializers import (
@@ -19,6 +32,37 @@ from .serializers import (
 
 
 User = get_user_model()
+
+BOM_LIST_CACHE_TTL_SECONDS = 60
+BOM_LIST_CACHE_VERSION_KEY = "ipms:bom:list:version"
+BOM_ITEM_LIST_CACHE_TTL_SECONDS = 60
+BOM_ITEM_LIST_CACHE_VERSION_KEY = "ipms:bom_items:list:version"
+
+
+def enqueue_bom_email(callback, *args, **kwargs):
+    """Send workflow email after commit without blocking the API response."""
+    threading.Thread(
+        target=callback,
+        args=args,
+        kwargs=kwargs,
+        daemon=True,
+    ).start()
+
+
+def get_bom_cache_version():
+    return get_cache_version(BOM_LIST_CACHE_VERSION_KEY)
+
+
+def invalidate_bom_cache():
+    invalidate_cache_version(BOM_LIST_CACHE_VERSION_KEY)
+
+
+def get_bom_item_cache_version():
+    return get_cache_version(BOM_ITEM_LIST_CACHE_VERSION_KEY)
+
+
+def invalidate_bom_item_cache():
+    invalidate_cache_version(BOM_ITEM_LIST_CACHE_VERSION_KEY)
 
 
 def get_actor_name(request, payload_field):
@@ -75,15 +119,20 @@ def send_manager_bom_review_email(
         bom = (
             BOM.objects
             .prefetch_related(
-                "items",
-                "items__component",
+                Prefetch(
+                    "items",
+                    queryset=(
+                        BOMItem.objects
+                        .select_related("component")
+                    ),
+                ),
             )
             .get(pk=bom_id)
         )
     except BOM.DoesNotExist:
         return False
 
-    managers = (
+    managers = list(
         User.objects
         .filter(
             role__iexact="manager",
@@ -94,7 +143,7 @@ def send_manager_bom_review_email(
         .order_by("id")
     )
 
-    if not managers.exists():
+    if not managers:
         print(
             "BOM MANAGER EMAIL SKIPPED:",
             bom.bom_number,
@@ -171,7 +220,7 @@ def send_manager_bom_review_email(
             (
                 f"{component_code} - "
                 f"{component_name} "
-                f"(Qty: {int(item.quantity or 0)})"
+                f"(Qty: {int(item.quantity or 0)} {str(getattr(item, 'unit', '') or '').strip()})"
             ).strip()
         )
 
@@ -432,7 +481,8 @@ def mark_bom_as_modified(
         transaction.on_commit(
             lambda bom_id=bom.id,
             actor=actor_name: (
-                send_manager_bom_review_email(
+                enqueue_bom_email(
+                    send_manager_bom_review_email,
                     bom_id,
                     event_type="modified",
                     actor_name=actor,
@@ -554,8 +604,13 @@ def send_bom_creator_result_email(
         bom = (
             BOM.objects
             .prefetch_related(
-                "items",
-                "items__component",
+                Prefetch(
+                    "items",
+                    queryset=(
+                        BOMItem.objects
+                        .select_related("component")
+                    ),
+                ),
             )
             .get(pk=bom_id)
         )
@@ -698,6 +753,7 @@ def send_bom_creator_result_email(
 
 class BOMViewSet(viewsets.ModelViewSet):
     serializer_class = BOMSerializer
+    pagination_class = OptionalPageNumberPagination
 
     @transaction.atomic
     def perform_create(self, serializer):
@@ -760,7 +816,8 @@ class BOMViewSet(viewsets.ModelViewSet):
         transaction.on_commit(
             lambda bom_id=bom.id,
             actor=actor_name: (
-                send_manager_bom_review_email(
+                enqueue_bom_email(
+                    send_manager_bom_review_email,
                     bom_id,
                     event_type="created",
                     actor_name=actor,
@@ -803,16 +860,68 @@ class BOMViewSet(viewsets.ModelViewSet):
                 actor_name=actor_name,
             )
 
-    def get_queryset(self):
-        queryset = (
-            BOM.objects
-            .prefetch_related(
-                "items",
-                "items__component",
+    def list(self, request, *args, **kwargs):
+        version = get_bom_cache_version()
+        cache_key = None
+
+        if version:
+            cache_key = build_list_cache_key(
+                "ipms:bom:list",
+                version,
+                request,
             )
-            .all()
-            .order_by("-created_at")
+            try:
+                cached_data = cache.get(cache_key)
+            except Exception:
+                cached_data = None
+            if cached_data is not None:
+                return Response(cached_data)
+
+        response = super().list(request, *args, **kwargs)
+
+        if cache_key and response.status_code == 200:
+            try:
+                cache.set(
+                    cache_key,
+                    response.data,
+                    timeout=BOM_LIST_CACHE_TTL_SECONDS,
+                )
+            except Exception:
+                pass
+
+        return response
+
+    def get_queryset(self):
+        queryset = BOM.objects.all().order_by(
+            "-created_at",
+            "-id",
         )
+
+        is_list_action = getattr(self, "action", "") == "list"
+        summary_value = str(
+            self.request.query_params.get(
+                "summary",
+                "",
+            )
+            or ""
+        ).strip().lower()
+        summary_mode = summary_value in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+        if not (is_list_action and summary_mode):
+            queryset = queryset.prefetch_related(
+                Prefetch(
+                    "items",
+                    queryset=(
+                        BOMItem.objects
+                        .select_related("component")
+                    ),
+                ),
+            )
 
         bom_number = (
             self.request.query_params.get(
@@ -825,7 +934,36 @@ class BOMViewSet(viewsets.ModelViewSet):
                 bom_number=bom_number
             )
 
-        return queryset
+        return apply_server_query_parameters(
+            queryset,
+            self.request,
+            search_fields=(
+                "bom_number",
+                "bom_name",
+                "product_name",
+                "version",
+                "created_by",
+                "description",
+                "status",
+            ),
+            filter_fields={
+                "bom_number": "bom_number__icontains",
+                "status": "status__iexact",
+                "created_by": "created_by__icontains",
+                "is_active": "is_active",
+            },
+            boolean_fields=("is_active",),
+            ordering_fields=(
+                "bom_number",
+                "bom_name",
+                "product_name",
+                "version",
+                "status",
+                "created_at",
+                "updated_at",
+            ),
+            default_ordering=("-created_at", "-id"),
+        )
 
     @action(
         detail=True,
@@ -898,7 +1036,8 @@ class BOMViewSet(viewsets.ModelViewSet):
         transaction.on_commit(
             lambda bom_id=bom.id,
             manager_name=approved_by: (
-                send_bom_creator_result_email(
+                enqueue_bom_email(
+                    send_bom_creator_result_email,
                     bom_id,
                     outcome="approved",
                     action_by=manager_name,
@@ -1001,7 +1140,8 @@ class BOMViewSet(viewsets.ModelViewSet):
             lambda bom_id=bom.id,
             manager_name=rejected_by,
             reason=remarks: (
-                send_bom_creator_result_email(
+                enqueue_bom_email(
+                    send_bom_creator_result_email,
                     bom_id,
                     outcome="rejected",
                     action_by=manager_name,
@@ -1029,6 +1169,38 @@ class BOMItemViewSet(viewsets.ModelViewSet):
     )
 
     serializer_class = BOMItemSerializer
+    pagination_class = OptionalPageNumberPagination
+
+    def list(self, request, *args, **kwargs):
+        version = get_bom_item_cache_version()
+        cache_key = None
+
+        if version:
+            cache_key = build_list_cache_key(
+                "ipms:bom_items:list",
+                version,
+                request,
+            )
+            try:
+                cached_data = cache.get(cache_key)
+            except Exception:
+                cached_data = None
+            if cached_data is not None:
+                return Response(cached_data)
+
+        response = super().list(request, *args, **kwargs)
+
+        if cache_key and response.status_code == 200:
+            try:
+                cache.set(
+                    cache_key,
+                    response.data,
+                    timeout=BOM_ITEM_LIST_CACHE_TTL_SECONDS,
+                )
+            except Exception:
+                pass
+
+        return response
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -1044,7 +1216,28 @@ class BOMItemViewSet(viewsets.ModelViewSet):
                 bom_id=bom_id
             )
 
-        return queryset
+        return apply_server_query_parameters(
+            queryset,
+            self.request,
+            search_fields=(
+                "component_code",
+                "category",
+                "specifications",
+                "unit",
+                "vendor",
+                "remarks",
+                "component__component_id",
+                "component__name",
+            ),
+            filter_fields={
+                "bom": "bom_id",
+                "component": "component_id",
+                "category": "category__icontains",
+                "vendor": "vendor__icontains",
+            },
+            ordering_fields=("component_code", "quantity", "category"),
+            default_ordering=("id",),
+        )
 
     def ensure_bom_is_editable(self, bom):
         current_status = str(
@@ -1069,6 +1262,7 @@ class BOMItemViewSet(viewsets.ModelViewSet):
 
     @transaction.atomic
     def perform_create(self, serializer):
+        invalidate_bom_item_cache()
         bom = serializer.validated_data.get(
             "bom"
         )
@@ -1092,6 +1286,7 @@ class BOMItemViewSet(viewsets.ModelViewSet):
 
     @transaction.atomic
     def perform_update(self, serializer):
+        invalidate_bom_item_cache()
         current_item = self.get_object()
 
         self.ensure_bom_is_editable(
@@ -1110,6 +1305,7 @@ class BOMItemViewSet(viewsets.ModelViewSet):
 
     @transaction.atomic
     def perform_destroy(self, instance):
+        invalidate_bom_item_cache()
         bom = instance.bom
 
         self.ensure_bom_is_editable(bom)

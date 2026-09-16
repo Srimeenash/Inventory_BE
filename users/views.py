@@ -13,6 +13,7 @@ from rest_framework import (
     permissions,
     status,
 )
+from rest_framework.authentication import SessionAuthentication
 from rest_framework.parsers import (
     FormParser,
     JSONParser,
@@ -39,6 +40,7 @@ from .serializers import (
     EmailTokenSerializer,
     LoginOTPResendSerializer,
     LoginOTPVerifySerializer,
+    PublicUserSummarySerializer,
     UserSerializer,
 )
 
@@ -1031,7 +1033,8 @@ class SwitchRoleView(APIView):
 
 class UserListCreateView(APIView):
     authentication_classes = [
-        JWTAuthentication
+        JWTAuthentication,
+        SessionAuthentication,
     ]
 
     permission_classes = [

@@ -1,17 +1,141 @@
+from django.core.cache import cache
 from django.db.models import Q
 
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 
+
+from inventory_backend.cache_utils import (
+    build_list_cache_key,
+    get_cache_version,
+    invalidate_cache_version,
+)
 from .models import Notification
 from .serializers import NotificationSerializer
+
+NOTIFICATION_LIST_CACHE_TTL_SECONDS = 60
+NOTIFICATION_LIST_CACHE_VERSION_KEY = "ipms:notifications:list:version"
+
+
+def get_notification_cache_version():
+    return get_cache_version(NOTIFICATION_LIST_CACHE_VERSION_KEY)
+
+
+def invalidate_notification_cache():
+    invalidate_cache_version(NOTIFICATION_LIST_CACHE_VERSION_KEY)
+
+
+class NotificationPagination(PageNumberPagination):
+    """
+    Fast, backward-compatible pagination for Notification API.
+
+    Legacy behavior:
+      /notifications/
+        -> unpaginated, preserving older callers.
+
+    Fast paginated behavior:
+      /notifications/?page=1&page_size=50
+      /notifications/?paginate=1&page=1&page_size=50
+        -> standard DRF response:
+           count / next / previous / results
+
+    page_size is capped so one request cannot accidentally download
+    thousands of notifications.
+    """
+
+    page_size = 50
+    page_size_query_param = "page_size"
+    max_page_size = 200
+
+    TRUE_VALUES = {"1", "true", "yes", "on"}
+    FALSE_VALUES = {"0", "false", "no", "off"}
+
+    def paginate_queryset(self, queryset, request, view=None):
+        params = request.query_params
+
+        paginate_value = str(
+            params.get("paginate", "")
+        ).strip().lower()
+
+        if paginate_value in self.FALSE_VALUES:
+            return None
+
+        has_page_parameters = (
+            "page" in params
+            or "page_size" in params
+        )
+
+        explicitly_enabled = (
+            paginate_value in self.TRUE_VALUES
+        )
+
+        # Preserve the old unpaginated response when the caller did
+        # not explicitly request pagination.
+        if (
+            not explicitly_enabled
+            and not has_page_parameters
+        ):
+            return None
+
+        return super().paginate_queryset(
+            queryset,
+            request,
+            view=view,
+        )
 
 
 class NotificationViewSet(viewsets.ModelViewSet):
     serializer_class = NotificationSerializer
-    pagination_class = None
+    pagination_class = NotificationPagination
+
+    def list(self, request, *args, **kwargs):
+        version = get_notification_cache_version()
+        cache_key = None
+
+        if version:
+            cache_key = build_list_cache_key(
+                "ipms:notifications:list",
+                version,
+                request,
+            )
+            try:
+                cached_data = cache.get(cache_key)
+            except Exception:
+                cached_data = None
+            if cached_data is not None:
+                return Response(cached_data)
+
+        response = super().list(request, *args, **kwargs)
+
+        if cache_key and response.status_code == 200:
+            try:
+                cache.set(
+                    cache_key,
+                    response.data,
+                    timeout=NOTIFICATION_LIST_CACHE_TTL_SECONDS,
+                )
+            except Exception:
+                pass
+
+        return response
+
+    def perform_update(self, serializer):
+        """
+        Keep versioned Notification list cache fresh after PATCH/PUT.
+        """
+        invalidate_notification_cache()
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        """
+        DELETE /notifications/<id>/ must disappear immediately from
+        Procurement/Manager/Finance notification tables.
+        """
+        invalidate_notification_cache()
+        instance.delete()
 
     @staticmethod
     def get_user_display_name(user):
@@ -64,6 +188,7 @@ class NotificationViewSet(viewsets.ModelViewSet):
         return str(value or "").strip().upper()
 
     def perform_create(self, serializer):
+        invalidate_notification_cache()
         """
         Keep normal notification creation compatible with the current app,
         while preventing old frontend code from creating a Manager Scrap
@@ -352,6 +477,7 @@ class NotificationViewSet(viewsets.ModelViewSet):
                 "is_read",
             ]
         )
+        invalidate_notification_cache()
 
         serializer = self.get_serializer(
             notification
@@ -382,6 +508,7 @@ class NotificationViewSet(viewsets.ModelViewSet):
                 "is_read",
             ]
         )
+        invalidate_notification_cache()
 
         serializer = self.get_serializer(
             notification

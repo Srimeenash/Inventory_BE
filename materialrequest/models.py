@@ -2,7 +2,6 @@ from datetime import datetime
 
 from django.conf import settings
 from django.db import models
-
 from components.models import Component
 
 
@@ -29,7 +28,12 @@ class MaterialRequest(models.Model):
         ("MISCELLANEOUS_USAGE", "Miscellaneous Usage"),
     ]
 
-    material_request_id = models.CharField(max_length=50, unique=True, blank=True, null=True)
+    material_request_id = models.CharField(
+        max_length=50,
+        unique=True,
+        blank=True,
+        null=True,
+    )
     requester_name = models.CharField(max_length=100)
     requester = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -39,12 +43,9 @@ class MaterialRequest(models.Model):
         related_name="material_requests",
     )
     date = models.DateField()
-
-    # Project is required by validation only for BOM and R&D.
     project = models.CharField(max_length=100, blank=True, default="")
     bom = models.CharField(max_length=100, blank=True, null=True)
     customized_bom = models.BooleanField(default=False)
-
     request_type = models.CharField(
         max_length=20,
         choices=REQUEST_TYPE_CHOICES,
@@ -58,8 +59,6 @@ class MaterialRequest(models.Model):
         default="",
         db_index=True,
     )
-
-    # Kept for compatibility with existing BOM/summary screens.
     required_quantity = models.PositiveIntegerField(default=1)
     required_date = models.DateField()
     remarks = models.TextField(blank=True, null=True)
@@ -108,11 +107,24 @@ class MaterialRequest(models.Model):
         ],
         default="PENDING",
     )
-    rejection_reason = models.TextField(blank=True, null=True, help_text="Reason for rejection")
-    rejected_by = models.CharField(max_length=100, blank=True, null=True, help_text="Role or user who rejected")
+
+    rejection_reason = models.TextField(
+        blank=True,
+        null=True,
+        help_text="Reason for rejection",
+    )
+    rejected_by = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+        help_text="Role or user who rejected",
+    )
     po_raised = models.BooleanField(
         default=False,
-        help_text="Marks whether procurement has raised a purchase order for this request",
+        help_text=(
+            "Marks whether procurement has raised a purchase "
+            "order for this request"
+        ),
     )
 
     def save(self, *args, **kwargs):
@@ -120,23 +132,48 @@ class MaterialRequest(models.Model):
             base_id = generate_material_request_id()
             candidate = base_id
             suffix = 1
-            while MaterialRequest.objects.filter(material_request_id=candidate).exists():
+
+            while MaterialRequest.objects.filter(
+                material_request_id=candidate
+            ).exists():
                 candidate = f"{base_id}-{suffix}"
                 suffix += 1
+
             self.material_request_id = candidate
+
         super().save(*args, **kwargs)
 
     def __str__(self):
-        return self.material_request_id or f"{self.project or self.request_type} - {self.requester_name}"
+        return (
+            self.material_request_id
+            or f"{self.project or self.request_type} - {self.requester_name}"
+        )
 
 
 class BOMItem(models.Model):
-    material_request = models.ForeignKey(MaterialRequest, related_name="bom_items", on_delete=models.CASCADE)
-    component = models.ForeignKey(Component, on_delete=models.CASCADE, null=True, blank=True, related_name="material_request_bom_items")
+    material_request = models.ForeignKey(
+        MaterialRequest,
+        related_name="bom_items",
+        on_delete=models.CASCADE,
+    )
+    component = models.ForeignKey(
+        Component,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="material_request_bom_items",
+    )
     category = models.CharField(max_length=100, blank=True, null=True)
     specification = models.TextField(blank=True, null=True)
     quantity = models.PositiveIntegerField(default=1)
-    unit = models.CharField(max_length=20, default="pc")
+
+    # Exact BOM/MR UOM snapshot.
+    unit = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+    )
+
     unit_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     tax = models.DecimalField(max_digits=5, decimal_places=2, default=0)
@@ -150,17 +187,30 @@ class BOMItem(models.Model):
     remarks = models.TextField(blank=True, null=True)
 
     def __str__(self):
-        return f"{self.component} ({self.quantity})"
+        return f"{self.component} ({self.quantity} {self.unit})"
 
 
 class RDItem(models.Model):
-    material_request = models.ForeignKey(MaterialRequest, related_name="rd_items", on_delete=models.CASCADE)
-    component = models.ForeignKey("components.Component", on_delete=models.CASCADE, null=True, blank=True)
+    material_request = models.ForeignKey(
+        MaterialRequest,
+        related_name="rd_items",
+        on_delete=models.CASCADE,
+    )
+    component = models.ForeignKey(
+        "components.Component",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+    )
     category = models.CharField(max_length=100, blank=True, null=True)
     specifications = models.TextField(blank=True, null=True)
     quantity = models.PositiveIntegerField(default=1)
     unit_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    unit = models.CharField(max_length=20, default="pc")
+    unit = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+    )
     price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     tax = models.DecimalField(max_digits=5, decimal_places=2, default=0)
     total_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
@@ -174,7 +224,11 @@ class RDItem(models.Model):
     remarks = models.TextField(blank=True, null=True)
 
     def __str__(self):
-        return str(self.component) if self.component else f"R&D Item - {self.material_request.material_request_id}"
+        return (
+            str(self.component)
+            if self.component
+            else f"R&D Item - {self.material_request.material_request_id}"
+        )
 
 
 class RequestItem(models.Model):
@@ -195,7 +249,11 @@ class RequestItem(models.Model):
     category = models.CharField(max_length=100, blank=True, null=True)
     specifications = models.TextField(blank=True, null=True)
     quantity = models.PositiveIntegerField(default=1)
-    unit = models.CharField(max_length=20, default="pc")
+    unit = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+    )
     inventory_quantity = models.PositiveIntegerField(default=0)
     po_raised_quantity = models.PositiveIntegerField(default=0)
     delivered_quantity = models.PositiveIntegerField(default=0)
@@ -206,4 +264,4 @@ class RequestItem(models.Model):
     remarks = models.TextField(blank=True, null=True)
 
     def __str__(self):
-        return f"{self.component or 'Component'} ({self.quantity})"
+        return f"{self.component or 'Component'} ({self.quantity} {self.unit})"

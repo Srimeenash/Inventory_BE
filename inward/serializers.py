@@ -1,3 +1,5 @@
+from django.db import transaction
+from inventory.cost_serializers import CostDetailsSerializerMixin
 from decimal import (
     Decimal,
     InvalidOperation,
@@ -330,9 +332,11 @@ class InwardLineItemSerializer(
         return data
 
 
-class InwardEntrySerializer(
-    serializers.ModelSerializer
-):
+class InwardEntrySerializer(CostDetailsSerializerMixin, serializers.ModelSerializer):
+    summary_exclude_fields = (
+        "qc_passed_rows",
+        "qc_failed_rows",
+    )
     component = FlexibleComponentRelatedField(
         queryset=Component.objects.all()
     )
@@ -547,6 +551,7 @@ class InwardEntrySerializer(
             or ""
         ).strip()
 
+    @transaction.atomic
     def create(self, validated_data):
         line_items_data = validated_data.pop(
             "line_items",
@@ -572,11 +577,16 @@ class InwardEntrySerializer(
 
         return inward_entry
 
+    @transaction.atomic
     def update(
         self,
         instance,
         validated_data,
     ):
+        if instance.cost_allocations.exists():
+            for field in ("component", "vendor", "purchase_order", "quantity_received"):
+                if field in validated_data and validated_data[field] != getattr(instance, field):
+                    raise serializers.ValidationError({field: "This receipt already has serial purchase costs. Its source and quantity cannot be changed."})
         line_items_data = validated_data.pop(
             "line_items",
             None,

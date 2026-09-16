@@ -28,6 +28,76 @@ class Inventory(models.Model):
         null=True,
     )
 
+    # Snapshot fields captured when stock is added.
+    # These keep the Inventory row self-contained even if the Component
+    # master is edited later. Missing values are copied from Component.
+    specifications = models.TextField(
+        blank=True,
+        null=True,
+    )
+
+    component_type = models.CharField(
+        max_length=150,
+        blank=True,
+        null=True,
+    )
+
+    uom = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+    )
+
+    unit_price = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=0,
+    )
+
+    # Manual Add Stock costing snapshot.
+    discount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=0,
+    )
+
+    gst_percentage = models.DecimalField(
+        max_digits=7,
+        decimal_places=2,
+        default=0,
+    )
+
+    gst_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=0,
+    )
+
+    freight_cost = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=0,
+    )
+
+    freight_gst_percentage = models.DecimalField(
+        max_digits=7,
+        decimal_places=2,
+        default=0,
+    )
+
+    freight_gst_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=0,
+    )
+
+    # Can be positive or negative.
+    round_off = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=0,
+    )
+
     vendor = models.CharField(
         max_length=255,
         blank=True,
@@ -42,7 +112,10 @@ class Inventory(models.Model):
 
     quantity = models.PositiveIntegerField(default=1)
 
-    received_date = models.DateField()
+    received_date = models.DateField(
+        blank=True,
+        null=True,
+    )
 
     total_price = models.DecimalField(
         max_digits=12,
@@ -82,6 +155,21 @@ class Inventory(models.Model):
                 name="inv_comp_issued_idx",
             ),
         ]
+
+    @property
+    def basic_amount(self):
+        return (
+            self.unit_price
+            * self.quantity
+        )
+
+    @property
+    def taxable_amount(self):
+        return max(
+            self.basic_amount
+            - self.discount,
+            0,
+        )
 
     def __str__(self):
         return self.inventory_code or f"Inventory-{self.pk}"
@@ -505,3 +593,135 @@ class ProjectInventory(models.Model):
             f"{self.material_request.material_request_id}"
             f" - {self.component}"
         )
+
+class SerialCostAllocation(models.Model):
+    """Immutable purchase-cost snapshot, independent of a serial's location."""
+    source_key = models.CharField(max_length=100, unique=True)
+    component = models.ForeignKey('components.Component', on_delete=models.PROTECT)
+    source_inward = models.ForeignKey('inward.InwardEntry', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='cost_allocations')
+    source_inventory = models.ForeignKey('inventory.Inventory', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='cost_allocations')
+    quantity = models.PositiveIntegerField()
+    source_details = models.JSONField(default=dict)
+    # Index is fixed for the lifetime of this receipt, including partial QC.
+    units = models.JSONField(default=list)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
+class SerialPurchaseCost(models.Model):
+    allocation = models.ForeignKey(SerialCostAllocation, on_delete=models.PROTECT,
+        related_name='serial_costs')
+    component = models.ForeignKey('components.Component', on_delete=models.PROTECT)
+    serial_number = models.CharField(max_length=255)
+    unit_index = models.PositiveIntegerField()
+    allocated_cost = models.DecimalField(max_digits=18, decimal_places=2)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['component', 'serial_number'], name='unique_component_serial_cost'),
+            models.UniqueConstraint(fields=['allocation', 'unit_index'], name='unique_cost_allocation_slot'),
+        ]
+
+
+
+class DroneInstance(models.Model):
+    """One physical drone assembled under a Material Request."""
+
+    STATUS_CHOICES = [
+        ("AVAILABLE", "Available"),
+        ("SALE_PENDING", "Sale Pending"),
+        ("SOLD", "Sold"),
+        ("RETURNABLE_PENDING", "Returnable Pending"),
+        ("RETURNABLE_ACTIVE", "Returnable Active"),
+        ("RETURN_QC_PENDING", "Return QC Pending"),
+        ("QC_FAILED", "QC Failed"),
+        ("SCRAP_PENDING", "Scrap Pending"),
+        ("SCRAPPED", "Scrapped"),
+        ("SCRAPPED_REORDERED", "Scrapped - Reordered"),
+    ]
+
+    material_request = models.ForeignKey(
+        "materialrequest.MaterialRequest",
+        on_delete=models.PROTECT,
+        related_name="drone_instances",
+    )
+    sequence = models.PositiveIntegerField()
+    instance_code = models.CharField(max_length=100, unique=True, db_index=True)
+    status = models.CharField(
+        max_length=30,
+        choices=STATUS_CHOICES,
+        default="AVAILABLE",
+        db_index=True,
+    )
+    replacement_material_request = models.ForeignKey(
+        "materialrequest.MaterialRequest",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="replacement_for_drone_instances",
+    )
+    workflow_metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["material_request_id", "sequence"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["material_request", "sequence"],
+                name="uniq_drone_instance_mr_seq",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["material_request", "status"],
+                name="drone_mr_status_idx",
+            ),
+        ]
+
+    @property
+    def suffix(self):
+        return f"_{int(self.sequence):02d}"
+
+    def __str__(self):
+        return self.instance_code
+
+
+class DroneComponentAllocation(models.Model):
+    """Exact component quantities/serials permanently assigned to one drone."""
+
+    drone_instance = models.ForeignKey(
+        DroneInstance,
+        on_delete=models.CASCADE,
+        related_name="component_allocations",
+    )
+    component = models.ForeignKey(
+        "components.Component",
+        on_delete=models.PROTECT,
+        related_name="drone_component_allocations",
+    )
+    quantity = models.PositiveIntegerField(default=0)
+    serial_numbers = models.JSONField(default=list, blank=True)
+    source_details = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["drone_instance_id", "component_id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["drone_instance", "component"],
+                name="uniq_drone_instance_component",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["drone_instance", "component"],
+                name="drone_inst_comp_idx",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.drone_instance.instance_code} - {self.component}"

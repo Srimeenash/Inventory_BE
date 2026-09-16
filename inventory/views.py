@@ -1,13 +1,26 @@
 from collections import defaultdict
+import re
+import threading
 
-from django.db import transaction
+from django.db import close_old_connections, transaction
 from django.conf import settings
+from django.core.cache import cache
 from django.utils import timezone
-from django.db.models import Q
+from django.db.models import Prefetch, Q
 
-from rest_framework import status, viewsets
+from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
+
+from inventory_backend.cache_utils import (
+    build_list_cache_key,
+    get_cache_version,
+    invalidate_cache_version,
+)
+from inventory_backend.pagination import (
+    OptionalPageNumberPagination,
+    apply_server_query_parameters,
+)
 
 from inward.models import InwardEntry
 from materialrequest.models import MaterialRequest
@@ -19,11 +32,35 @@ from .models import (
     Inventory,
     InventoryReservation,
     ProjectInventory,
+    DroneInstance,
 )
 from .serializers import (
     InventorySerializer,
     ProjectInventorySerializer,
+    DroneInstanceSerializer,
 )
+from .drone_instances import ensure_drone_instances, refresh_drone_instance_statuses
+
+INVENTORY_LIST_CACHE_TTL_SECONDS = 60
+INVENTORY_LIST_CACHE_VERSION_KEY = "ipms:inventory:list:version"
+PROJECT_INVENTORY_LIST_CACHE_TTL_SECONDS = 60
+PROJECT_INVENTORY_LIST_CACHE_VERSION_KEY = "ipms:project_inventory:list:version"
+
+
+def get_inventory_cache_version():
+    return get_cache_version(INVENTORY_LIST_CACHE_VERSION_KEY)
+
+
+def invalidate_inventory_cache():
+    invalidate_cache_version(INVENTORY_LIST_CACHE_VERSION_KEY)
+
+
+def get_project_inventory_cache_version():
+    return get_cache_version(PROJECT_INVENTORY_LIST_CACHE_VERSION_KEY)
+
+
+def invalidate_project_inventory_cache():
+    invalidate_cache_version(PROJECT_INVENTORY_LIST_CACHE_VERSION_KEY)
 
 
 class InventoryViewSet(viewsets.ModelViewSet):
@@ -39,7 +76,78 @@ class InventoryViewSet(viewsets.ModelViewSet):
     )
 
     serializer_class = InventorySerializer
-    pagination_class = None
+    pagination_class = OptionalPageNumberPagination
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+
+        if getattr(self, "action", "") == "list":
+            context["skip_cost_details"] = True
+
+        return context
+
+    def list(self, request, *args, **kwargs):
+        version = get_inventory_cache_version()
+        cache_key = None
+
+        if version:
+            cache_key = build_list_cache_key(
+                "ipms:inventory:list",
+                version,
+                request,
+            )
+            try:
+                cached_data = cache.get(cache_key)
+            except Exception:
+                cached_data = None
+            if cached_data is not None:
+                return Response(cached_data)
+
+        response = super().list(request, *args, **kwargs)
+
+        if cache_key and response.status_code == 200:
+            try:
+                cache.set(
+                    cache_key,
+                    response.data,
+                    timeout=INVENTORY_LIST_CACHE_TTL_SECONDS,
+                )
+            except Exception:
+                pass
+
+        return response
+
+    def get_queryset(self):
+        return apply_server_query_parameters(
+            super().get_queryset(),
+            self.request,
+            search_fields=(
+                "inventory_code",
+                "component__component_id",
+                "component__name",
+                "category",
+                "component_type",
+                "vendor",
+                "purchase_order",
+            ),
+            filter_fields={
+                "inventory_code": "inventory_code__icontains",
+                "category": "category__icontains",
+                "component_type": "component_type__icontains",
+                "vendor": "vendor__icontains",
+                "purchase_order": "purchase_order__icontains",
+                "issued": "issued",
+            },
+            boolean_fields=("issued",),
+            ordering_fields=(
+                "inventory_code",
+                "quantity",
+                "unit_price",
+                "received_date",
+                "created_at",
+            ),
+            default_ordering=("-created_at", "-id"),
+        )
 
     @action(
         detail=False,
@@ -72,7 +180,8 @@ class InventoryViewSet(viewsets.ModelViewSet):
 
 
 class ProjectInventoryViewSet(
-    viewsets.ReadOnlyModelViewSet
+    mixins.DestroyModelMixin,
+    viewsets.ReadOnlyModelViewSet,
 ):
     """
     Project Inventory API.
@@ -90,14 +199,200 @@ class ProjectInventoryViewSet(
         ProjectInventory.objects
         .select_related(
             "material_request",
+            "material_request__requester",
             "component",
+        )
+        # ProjectInventorySerializer reads reservation data from the
+        # related Material Request. Fetch reservations and their Component
+        # in one related query instead of an extra component query.
+        .prefetch_related(
+            Prefetch(
+                "material_request__inventory_reservations",
+                queryset=(
+                    InventoryReservation.objects
+                    .select_related("component")
+                ),
+            ),
         )
         .all()
         .order_by("-updated_at")
     )
 
     serializer_class = ProjectInventorySerializer
-    pagination_class = None
+
+    # Preserve the existing plain-array response for now so current React
+    # pages do not break. Pagination can be added after the duplicate frontend
+    # requests are removed and all consumers are confirmed to handle `results`.
+    pagination_class = OptionalPageNumberPagination
+
+    def list(self, request, *args, **kwargs):
+        version = get_project_inventory_cache_version()
+        cache_key = None
+
+        if version:
+            cache_key = build_list_cache_key(
+                "ipms:project_inventory:list",
+                version,
+                request,
+            )
+            try:
+                cached_data = cache.get(cache_key)
+            except Exception:
+                cached_data = None
+            if cached_data is not None:
+                return Response(cached_data)
+
+        response = super().list(request, *args, **kwargs)
+
+        if cache_key and response.status_code == 200:
+            try:
+                cache.set(
+                    cache_key,
+                    response.data,
+                    timeout=PROJECT_INVENTORY_LIST_CACHE_TTL_SECONDS,
+                )
+            except Exception:
+                pass
+
+        return response
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+
+        source_mr_number = str(
+            self.request.query_params.get(
+                "source_mr_number",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if source_mr_number:
+            queryset = queryset.filter(
+                material_request__material_request_id=
+                    source_mr_number
+            )
+
+        return apply_server_query_parameters(
+            queryset,
+            self.request,
+            search_fields=(
+                "material_request__material_request_id",
+                "component__component_id",
+                "component__name",
+                "source",
+            ),
+            filter_fields={
+                "source": "source__iexact",
+                "component": "component_id",
+                "material_request": "material_request_id",
+            },
+            ordering_fields=(
+                "quantity",
+                "provided_quantity",
+                "updated_at",
+                "created_at",
+            ),
+            default_ordering=("-updated_at", "-id"),
+        )
+
+    def get_serializer_context(self):
+        """
+        Normal Project Inventory requests must stay lightweight.
+
+        Backward-compatible opt-in:
+            ?include_store_serials=1
+
+        New UI code should prefer the per-row /serial-options/ endpoint.
+        """
+        context = super().get_serializer_context()
+
+        raw_value = str(
+            self.request.query_params.get(
+                "include_store_serials",
+                "",
+            )
+            or ""
+        ).strip().lower()
+
+        context["include_store_serials"] = raw_value in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+        return context
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="serial-options",
+    )
+    def serial_options(self, request, pk=None):
+        """
+        Return serial-selection data only for ONE ProjectInventory row.
+
+        This avoids sending every free In-Store serial number on every row
+        of the normal Project Inventory list response.
+        """
+        project_row = self.get_object()
+
+        serializer_context = {
+            **self.get_serializer_context(),
+            "include_store_serials": True,
+        }
+
+        serializer = self.get_serializer(
+            project_row,
+            context=serializer_context,
+        )
+        data = serializer.data
+
+        return Response(
+            {
+                "id": data.get("id"),
+                "material_request": data.get("material_request"),
+                "material_request_number": data.get(
+                    "material_request_number"
+                ),
+                "component": data.get("component"),
+                "component_code": data.get("component_code"),
+                "component_name": data.get("component_name"),
+                "available_store_serials": data.get(
+                    "available_store_serials",
+                    [],
+                ),
+                "available_purchased_serials": data.get(
+                    "available_purchased_serials",
+                    [],
+                ),
+                "purchased_serial_numbers": data.get(
+                    "purchased_serial_numbers",
+                    [],
+                ),
+                "issued_store_serials": data.get(
+                    "issued_store_serials",
+                    [],
+                ),
+                "issued_purchased_serials": data.get(
+                    "issued_purchased_serials",
+                    [],
+                ),
+                "remaining_store_quantity": data.get(
+                    "remaining_store_quantity",
+                    0,
+                ),
+                "remaining_purchased_quantity": data.get(
+                    "remaining_purchased_quantity",
+                    0,
+                ),
+                "remaining_quantity": data.get(
+                    "remaining_quantity",
+                    0,
+                ),
+            }
+        )
 
 
     # ==========================================================
@@ -347,6 +642,35 @@ class ProjectInventoryViewSet(
             },
         )
 
+    def queue_requester_all_components_issued_email(
+        self,
+        material_request_id,
+        *,
+        issued_by_name="Inventory Team",
+    ):
+        """Send the completion email after commit without blocking Issue."""
+        def send_email():
+            close_old_connections()
+            try:
+                self.send_requester_all_components_issued_email(
+                    material_request_id,
+                    issued_by_name=issued_by_name,
+                )
+            except Exception as error:
+                print(
+                    "INVENTORY COMPLETION EMAIL FAILED:",
+                    material_request_id,
+                    error,
+                )
+            finally:
+                close_old_connections()
+
+        threading.Thread(
+            target=send_email,
+            name="inventory-completion-email",
+            daemon=True,
+        ).start()
+
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -489,6 +813,7 @@ class ProjectInventoryViewSet(
             lambda: {
                 "items": [],
                 "required_quantity": 0,
+                "recovered_serials": [],
             }
         )
 
@@ -511,6 +836,20 @@ class ProjectInventoryViewSet(
                 int(item.quantity or 0),
                 0,
             )
+
+            recovered_serials = (
+                cls.get_from_scrap_serials_from_item(
+                    item
+                )
+            )
+
+            if recovered_serials:
+                group["recovered_serials"] = (
+                    cls.normalize_serials(
+                        group["recovered_serials"]
+                        + recovered_serials
+                    )
+                )
 
         return groups
 
@@ -571,6 +910,40 @@ class ProjectInventoryViewSet(
                 seen.add(serial)
                 result.append(serial)
         return result
+
+    @classmethod
+    def get_from_scrap_serials_from_item(
+        cls,
+        item,
+    ):
+        remarks = str(
+            getattr(
+                item,
+                "remarks",
+                "",
+            )
+            or ""
+        )
+
+        match = re.search(
+            r"FROM_SCRAP_SERIALS:([^\r\n]*)",
+            remarks,
+            flags=re.IGNORECASE,
+        )
+
+        if not match:
+            return []
+
+        return cls.normalize_serials(
+            [
+                value.strip()
+                for value in re.split(
+                    r"[|,;]",
+                    match.group(1),
+                )
+                if value.strip()
+            ]
+        )
 
     @classmethod
     def get_inward_passed_serials(cls, inward_entry):
@@ -810,8 +1183,33 @@ class ProjectInventoryViewSet(
         for component_id in sorted(groups):
             group = groups[component_id]
             items = group["items"]
-            required_quantity = int(
-                group["required_quantity"] or 0
+            required_quantity = max(
+                int(
+                    group["required_quantity"]
+                    or 0
+                ),
+                0,
+            )
+
+            recovered_serials = (
+                cls.normalize_serials(
+                    group.get(
+                        "recovered_serials",
+                        [],
+                    )
+                    or []
+                )
+            )
+
+            recovered_quantity = min(
+                len(recovered_serials),
+                required_quantity,
+            )
+
+            missing_required_quantity = max(
+                required_quantity
+                - recovered_quantity,
+                0,
             )
 
             reservation, _ = (
@@ -822,18 +1220,24 @@ class ProjectInventoryViewSet(
                     component_id=component_id,
                     defaults={
                         "requested_quantity": (
-                            required_quantity
+                            missing_required_quantity
                         ),
                         "reserved_store_quantity": 0,
                         "procurement_shortage_quantity": (
-                            required_quantity
+                            missing_required_quantity
                         ),
                     },
                 )
             )
 
             reservation.requested_quantity = (
-                required_quantity
+                missing_required_quantity
+            )
+            reservation.save(
+                update_fields=[
+                    "requested_quantity",
+                    "updated_at",
+                ]
             )
 
             component_purchase_orders = [
@@ -889,16 +1293,24 @@ class ProjectInventoryViewSet(
                         purchased_serial_seen.add(serial)
                         purchased_serial_numbers.append(serial)
 
-            store_quantity = min(
-                required_quantity,
+            additional_store_quantity = min(
+                missing_required_quantity,
                 int(
                     reservation.reserved_store_quantity
                     or 0
                 ),
             )
 
+            store_quantity = min(
+                required_quantity,
+                recovered_quantity
+                + additional_store_quantity,
+            )
+
             purchased_required = max(
-                required_quantity - store_quantity,
+                required_quantity
+                - recovered_quantity
+                - additional_store_quantity,
                 0,
             )
 
@@ -930,7 +1342,29 @@ class ProjectInventoryViewSet(
             project_row.requested_quantity = (
                 required_quantity
             )
-            project_row.store_quantity = store_quantity
+            project_row.store_quantity = (
+                store_quantity
+            )
+
+            project_row.issued_store_serials = (
+                cls.normalize_serials(
+                    recovered_serials
+                    + cls.normalize_serials(
+                        project_row
+                        .issued_store_serials
+                    )
+                )
+            )
+
+            project_row.issued_store_quantity = max(
+                int(
+                    project_row
+                    .issued_store_quantity
+                    or 0
+                ),
+                recovered_quantity,
+            )
+
             project_row.purchased_quantity = (
                 purchased_quantity
             )
@@ -969,7 +1403,7 @@ class ProjectInventoryViewSet(
             store_distribution = (
                 cls.distribute_quantity(
                     items,
-                    store_quantity,
+                    additional_store_quantity,
                 )
             )
 
@@ -1343,6 +1777,94 @@ class ProjectInventoryViewSet(
 
     @action(
         detail=False,
+        methods=["get"],
+        url_path="drone-instances",
+    )
+    def drone_instances(self, request):
+        """
+        Return one row per physical drone (_01, _02, ...), with the exact
+        component serial allocation for that drone.
+
+        Existing fully-issued MRs are lazily backfilled, so deploying this
+        change does not require the Inventory team to issue those MRs again.
+        """
+        reference = str(
+            request.query_params.get("material_request")
+            or request.query_params.get("material_request_id")
+            or request.query_params.get("mr_id")
+            or ""
+        ).strip()
+
+        queryset = MaterialRequest.objects.filter(
+            status__in=[
+                "INVENTORY_ISSUED",
+                "MR_COMPLETED",
+                "ISSUED",
+                "COMPLETED",
+            ]
+        ).exclude(request_type="RETURNABLE")
+
+        if reference:
+            if reference.isdigit():
+                queryset = queryset.filter(
+                    Q(pk=int(reference))
+                    | Q(material_request_id=reference)
+                )
+            else:
+                queryset = queryset.filter(
+                    material_request_id=reference
+                )
+
+        material_requests = list(
+            queryset.order_by("id")[:500]
+        )
+
+        for material_request in material_requests:
+            project_rows = list(
+                ProjectInventory.objects
+                .select_related("component")
+                .filter(material_request=material_request)
+                .order_by("component_id", "id")
+            )
+            ensure_drone_instances(
+                material_request,
+                project_rows,
+            )
+            refresh_drone_instance_statuses(
+                material_request
+            )
+
+        instance_queryset = (
+            DroneInstance.objects
+            .select_related(
+                "material_request",
+                "replacement_material_request",
+            )
+            .prefetch_related(
+                "component_allocations",
+                "component_allocations__component",
+            )
+            .filter(
+                material_request__in=material_requests
+            )
+            .order_by(
+                "material_request_id",
+                "sequence",
+            )
+        )
+
+        return Response(
+            DroneInstanceSerializer(
+                instance_queryset,
+                many=True,
+                context=self.get_serializer_context(),
+            ).data,
+            status=status.HTTP_200_OK,
+        )
+
+
+    @action(
+        detail=False,
         methods=["post"],
         url_path="sync-mr",
     )
@@ -1605,6 +2127,18 @@ class ProjectInventoryViewSet(
                 update_fields=["status"]
             )
 
+            # Create persistent physical drone instances only after all MR
+            # components are fully issued. Each instance receives its own
+            # exact component serial allocation.
+            ensure_drone_instances(
+                material_request,
+                project_rows,
+                lock=True,
+            )
+            refresh_drone_instance_statuses(
+                material_request
+            )
+
             # ------------------------------------------------------
             # INVENTORY NOTIFICATION LIFECYCLE
             # ------------------------------------------------------
@@ -1661,7 +2195,7 @@ class ProjectInventoryViewSet(
                 transaction.on_commit(
                     lambda mr_id=material_request.id,
                     issuer=issued_by_name: (
-                        self.send_requester_all_components_issued_email(
+                        self.queue_requester_all_components_issued_email(
                             mr_id,
                             issued_by_name=issuer,
                         )

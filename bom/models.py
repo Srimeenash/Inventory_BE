@@ -4,103 +4,34 @@ from components.models import Component
 
 class BOM(models.Model):
     STATUS_CHOICES = [
-        (
-            "PENDING_MANAGER",
-            "Pending Manager",
-        ),
-        (
-            "APPROVED",
-            "Approved",
-        ),
-        (
-            "MANAGER_REJECTED",
-            "Manager Rejected",
-        ),
-        (
-            "MODIFIED",
-            "Modified",
-        ),
+        ("PENDING_MANAGER", "Pending Manager"),
+        ("APPROVED", "Approved"),
+        ("MANAGER_REJECTED", "Manager Rejected"),
+        ("MODIFIED", "Modified"),
     ]
 
-    bom_number = models.CharField(
-        max_length=100,
-        unique=True,
-    )
-
-    bom_name = models.CharField(
-        max_length=100,
-        blank=True,
-        null=True,
-    )
-
-    product_name = models.CharField(
-        max_length=255,
-    )
-
-    version = models.CharField(
-        max_length=20,
-        default="v1",
-    )
-
-    created_by = models.CharField(
-        max_length=100,
-    )
-
-    description = models.TextField(
-        blank=True,
-        null=True,
-    )
-
+    bom_number = models.CharField(max_length=100, unique=True)
+    bom_name = models.CharField(max_length=100, blank=True, null=True)
+    product_name = models.CharField(max_length=255)
+    version = models.CharField(max_length=20, default="v1")
+    created_by = models.CharField(max_length=100)
+    description = models.TextField(blank=True, null=True)
     status = models.CharField(
         max_length=30,
         choices=STATUS_CHOICES,
         default="PENDING_MANAGER",
     )
-
-    manager_rejection_reason = models.TextField(
-        blank=True,
-        null=True,
-    )
-
-    manager_rejected_by = models.CharField(
-        max_length=100,
-        blank=True,
-        null=True,
-    )
-
-    manager_rejected_at = models.DateTimeField(
-        blank=True,
-        null=True,
-    )
-
-    manager_approved_by = models.CharField(
-        max_length=100,
-        blank=True,
-        null=True,
-    )
-
-    manager_approved_at = models.DateTimeField(
-        blank=True,
-        null=True,
-    )
-
-    is_active = models.BooleanField(
-        default=True,
-    )
-
-    created_at = models.DateTimeField(
-        auto_now_add=True,
-    )
-
-    updated_at = models.DateTimeField(
-        auto_now=True,
-    )
+    manager_rejection_reason = models.TextField(blank=True, null=True)
+    manager_rejected_by = models.CharField(max_length=100, blank=True, null=True)
+    manager_rejected_at = models.DateTimeField(blank=True, null=True)
+    manager_approved_by = models.CharField(max_length=100, blank=True, null=True)
+    manager_approved_at = models.DateTimeField(blank=True, null=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
-        return (
-            f"{self.bom_number} - "
-            f"{self.bom_name or self.product_name}"
-        )
+        return f"{self.bom_number} - {self.bom_name or self.product_name}"
 
 
 class BOMItem(models.Model):
@@ -109,52 +40,29 @@ class BOMItem(models.Model):
         on_delete=models.CASCADE,
         related_name="items",
     )
-
     component = models.ForeignKey(
         Component,
         on_delete=models.CASCADE,
         null=True,
         blank=True,
     )
+    component_code = models.CharField(max_length=100, blank=True, null=True)
+    category = models.CharField(max_length=100, blank=True, null=True)
+    specifications = models.TextField(blank=True, null=True)
+    quantity = models.PositiveIntegerField(default=1)
 
-    component_code = models.CharField(
+    # User-entered BOM UOM. Do not auto-copy Component Master UOM.
+    unit = models.CharField(
         max_length=100,
         blank=True,
-        null=True,
+        default="",
     )
 
-    category = models.CharField(
-        max_length=100,
-        blank=True,
-        null=True,
-    )
-
-    specifications = models.TextField(
-        blank=True,
-        null=True,
-    )
-
-    quantity = models.PositiveIntegerField(
-        default=1,
-    )
-
-    vendor = models.CharField(
-        max_length=255,
-        blank=True,
-        null=True,
-    )
-
-    remarks = models.TextField(
-        blank=True,
-        null=True,
-    )
+    vendor = models.CharField(max_length=255, blank=True, null=True)
+    remarks = models.TextField(blank=True, null=True)
 
     def __str__(self):
         return (
             self.component_code
-            or (
-                self.component.name
-                if self.component
-                else "Component"
-            )
+            or (self.component.name if self.component else "Component")
         )
