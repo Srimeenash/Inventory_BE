@@ -38,6 +38,10 @@ BOM_LIST_CACHE_VERSION_KEY = "ipms:bom:list:version"
 BOM_ITEM_LIST_CACHE_TTL_SECONDS = 60
 BOM_ITEM_LIST_CACHE_VERSION_KEY = "ipms:bom_items:list:version"
 
+# BOM writes Notification rows directly, so it must also invalidate the
+# shared Notification list cache used by Manager Notifications.
+NOTIFICATION_LIST_CACHE_VERSION_KEY = "ipms:notifications:list:version"
+
 
 def enqueue_bom_email(callback, *args, **kwargs):
     """Send workflow email after commit without blocking the API response."""
@@ -63,6 +67,11 @@ def get_bom_item_cache_version():
 
 def invalidate_bom_item_cache():
     invalidate_cache_version(BOM_ITEM_LIST_CACHE_VERSION_KEY)
+
+
+def invalidate_notification_list_cache():
+    """Refresh notification lists after direct BOM workflow writes."""
+    invalidate_cache_version(NOTIFICATION_LIST_CACHE_VERSION_KEY)
 
 
 def get_actor_name(request, payload_field):
@@ -375,6 +384,11 @@ def update_manager_notification(
         )
 
 
+    # These Notification writes bypass NotificationViewSet, whose list endpoint
+    # is cached. Expire that shared cache only after the DB transaction commits.
+    transaction.on_commit(invalidate_notification_list_cache)
+
+
 def mark_bom_as_modified(
     bom,
     *,
@@ -468,6 +482,8 @@ def mark_bom_as_modified(
             f"manager approval again."
         ),
     )
+
+    transaction.on_commit(invalidate_bom_cache)
 
     if should_send_manager_email:
         print(
@@ -813,6 +829,8 @@ class BOMViewSet(viewsets.ModelViewSet):
             requested_by=creator_email or None,
         )
 
+        transaction.on_commit(invalidate_bom_cache)
+
         transaction.on_commit(
             lambda bom_id=bom.id,
             actor=actor_name: (
@@ -842,6 +860,8 @@ class BOMViewSet(viewsets.ModelViewSet):
 
         bom = serializer.save()
 
+        transaction.on_commit(invalidate_bom_cache)
+
         actor_name = get_actor_name(
             self.request,
             "modified_by",
@@ -859,6 +879,34 @@ class BOMViewSet(viewsets.ModelViewSet):
                 bom,
                 actor_name=actor_name,
             )
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        """
+        Permanently delete the BOM and synchronize all related cached lists.
+
+        BOMItem rows are deleted automatically by the BOM -> BOMItem CASCADE.
+        BOM workflow notifications use a generic reference_id, so delete those
+        explicitly to avoid stale Manager notification records.
+        """
+        bom_id = instance.pk
+
+        Notification.objects.filter(
+            category="BOM",
+            reference_id=str(bom_id),
+        ).delete()
+
+        instance.delete()
+
+        transaction.on_commit(
+            invalidate_bom_cache
+        )
+        transaction.on_commit(
+            invalidate_bom_item_cache
+        )
+        transaction.on_commit(
+            invalidate_notification_list_cache
+        )
 
     def list(self, request, *args, **kwargs):
         version = get_bom_cache_version()
@@ -1033,6 +1081,8 @@ class BOMViewSet(viewsets.ModelViewSet):
             ),
         )
 
+        transaction.on_commit(invalidate_bom_cache)
+
         transaction.on_commit(
             lambda bom_id=bom.id,
             manager_name=approved_by: (
@@ -1135,6 +1185,8 @@ class BOMViewSet(viewsets.ModelViewSet):
                 f"by {rejected_by}. Remarks: {remarks}"
             ),
         )
+
+        transaction.on_commit(invalidate_bom_cache)
 
         transaction.on_commit(
             lambda bom_id=bom.id,
@@ -1284,6 +1336,8 @@ class BOMItemViewSet(viewsets.ModelViewSet):
             ),
         )
 
+        transaction.on_commit(invalidate_bom_cache)
+
     @transaction.atomic
     def perform_update(self, serializer):
         invalidate_bom_item_cache()
@@ -1303,6 +1357,8 @@ class BOMItemViewSet(viewsets.ModelViewSet):
             ),
         )
 
+        transaction.on_commit(invalidate_bom_cache)
+
     @transaction.atomic
     def perform_destroy(self, instance):
         invalidate_bom_item_cache()
@@ -1319,3 +1375,5 @@ class BOMItemViewSet(viewsets.ModelViewSet):
                 "modified_by",
             ),
         )
+
+        transaction.on_commit(invalidate_bom_cache)

@@ -390,6 +390,11 @@ def refresh_drone_instance_statuses(material_request):
             }:
                 continue
             metadata = _metadata_dict(row.inventory_allocations)
+            workflow = str(
+                metadata.get("workflow")
+                or ""
+            ).strip().upper()
+
             instance = None
             if metadata.get("drone_instance_id"):
                 instance = next(
@@ -420,6 +425,45 @@ def refresh_drone_instance_statuses(material_request):
                 replacement = MaterialRequest.objects.filter(
                     material_request_id=replacement_number
                 ).first()
+            if workflow == "RETURNABLE_DRONE_QC_V1":
+                # A Returnable QC failure is NOT Engineer Scrap of the whole
+                # physical drone. The original drone remains permanently
+                # visible as "<Purpose> QC Failed". If Finance approves a
+                # rebuild, replacement_material_request links to the new PR/FR.
+                history = {
+                    "workflow":
+                        "RETURNABLE_QC_FAILED",
+                    "purpose":
+                        metadata.get(
+                            "returnable_purpose",
+                            "",
+                        ),
+                    "purpose_label":
+                        metadata.get(
+                            "returnable_purpose_label",
+                            "",
+                        ),
+                    "scrap_id":
+                        row.pk,
+                    "scrap_code":
+                        row.code,
+                    "reorder_choice":
+                        reorder_choice,
+                    "approval_status":
+                        approval,
+                    "replacement_mr_number":
+                        replacement_number,
+                }
+
+                set_state(
+                    instance,
+                    "QC_FAILED",
+                    history,
+                    replacement,
+                    priority=110,
+                )
+                continue
+
             history = {
                 "workflow": "SCRAP",
                 "scrap_id": row.pk,

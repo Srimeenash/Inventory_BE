@@ -1,4 +1,5 @@
 from collections import defaultdict
+from datetime import timedelta
 import re
 
 from django.conf import settings
@@ -348,6 +349,24 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
 
         return request_type == "SCRAP_ONLY"
 
+
+    @staticmethod
+    def skips_manager_approval(material_request):
+        """
+        Normal BOMs (BOM + customized_bom=False) bypass Manager approval.
+
+        Custom BOM, R&D, Returnable and Retail Sales keep the existing
+        Manager approval workflow unchanged.
+        """
+        request_type = str(
+            getattr(material_request, "request_type", "") or ""
+        ).strip().upper()
+
+        customized_bom = bool(
+            getattr(material_request, "customized_bom", False)
+        )
+
+        return request_type == "BOM" and not customized_bom
 
     @staticmethod
     def is_retail_sales_request(material_request):
@@ -1957,11 +1976,16 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
 
         approval_source = str(approval_source or "MANAGER").strip().upper()
         is_finance_approved_scrap_rebuild = approval_source == "FINANCE"
-        approval_message = (
-            "Finance-approved From Scrap rebuild"
-            if is_finance_approved_scrap_rebuild
-            else "Manager approved"
-        )
+        is_normal_bom_auto_route = approval_source == "NORMAL_BOM_AUTO"
+
+        if is_finance_approved_scrap_rebuild:
+            approval_message = "Finance-approved From Scrap rebuild"
+        elif is_normal_bom_auto_route:
+            approval_message = (
+                "Normal BOM created - Manager approval not required."
+            )
+        else:
+            approval_message = "Manager approved"
 
         allocations, shortages = (
             self.reserve_request_components(
@@ -2241,6 +2265,85 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
 
     @transaction.atomic
     def perform_create(self, serializer):
+        """
+        GLOBAL Material Request Required Date cutoff.
+
+        Applies to every newly-created MR:
+            - BOM
+            - Custom BOM
+            - R&D
+            - Returnable
+            - Retail Sales
+
+        Before 4:00 PM local server time:
+            Required Date = today is allowed.
+
+        At/after 4:00 PM local server time:
+            Required Date = today is rejected.
+            Tomorrow or any later valid date is allowed.
+
+        This backend validation is authoritative so the rule cannot be
+        bypassed by calling the API directly.
+        """
+        validated_data = serializer.validated_data
+
+        request_type = str(
+            validated_data.get(
+                "request_type",
+                "",
+            )
+            or ""
+        ).strip().upper()
+
+        required_date = validated_data.get(
+            "required_date"
+        )
+
+        supported_request_types = {
+            "BOM",
+            "R&D",
+            "RD",
+            "RETURNABLE",
+            "RETAIL_SALES",
+        }
+
+        if request_type in supported_request_types:
+            if required_date is None:
+                raise ValidationError(
+                    {
+                        "required_date": [
+                            "Required Date is mandatory for this Material Request."
+                        ]
+                    }
+                )
+
+            local_now = timezone.localtime()
+            today = local_now.date()
+
+            if (
+                local_now.hour >= 16
+                and required_date == today
+            ):
+                tomorrow = (
+                    today
+                    + timedelta(days=1)
+                )
+
+                raise ValidationError(
+                    {
+                        "required_date": [
+                            (
+                                "The Required Date is today, but the current "
+                                "time is 4:00 PM or later. A Material Request "
+                                "cannot be submitted for today's Required Date "
+                                "after 4:00 PM. Please change the Required Date "
+                                f"to tomorrow ({tomorrow.isoformat()}) or a "
+                                "later date."
+                            )
+                        ]
+                    }
+                )
+
         invalidate_material_request_cache()
         current_user = self.request.user
 
@@ -2263,6 +2366,8 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
             self.get_next_material_request_id()
         )
 
+        # Save first so nested BOM/R&D/request items are created by the
+        # serializer before stock reservation/routing runs.
         material_request = serializer.save(
             material_request_id=material_request_id,
             requester=current_user,
@@ -2271,6 +2376,71 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
             approval_status="PENDING_MANAGER",
         )
 
+        # ----------------------------------------------------------
+        # NEW FLOW: NORMAL / NON-CUSTOMIZED BOM
+        # ----------------------------------------------------------
+        # BOM + customized_bom=False does NOT require Manager approval.
+        # Immediately reserve available In-Store stock and split the MR:
+        #   available quantity -> Inventory notification
+        #   shortage           -> Procurement notification
+        #
+        # Custom BOM, R&D, Returnable and Retail Sales continue through
+        # the existing Manager approval workflow below.
+        # ----------------------------------------------------------
+        if self.skips_manager_approval(
+            material_request
+        ):
+            self.route_after_manager_approval(
+                material_request,
+                approval_source="NORMAL_BOM_AUTO",
+            )
+
+            # There must never be an actionable Manager notification for
+            # this special flow, including stale/duplicate rows.
+            Notification.objects.filter(
+                category="MR",
+                reference_id=str(material_request.id),
+                receiver="MANAGER",
+            ).delete()
+
+            # Procurement and Inventory are independent split routes.
+            if (
+                str(
+                    material_request.status or ""
+                ).strip().upper()
+                == "PROCUREMENT_PENDING"
+            ):
+                transaction.on_commit(
+                    lambda mr_id=material_request.id: (
+                        self.send_procurement_required_email(
+                            mr_id
+                        )
+                    )
+                )
+
+            has_inventory_allocation = (
+                InventoryReservation.objects
+                .filter(
+                    material_request=material_request,
+                    reserved_store_quantity__gt=0,
+                )
+                .exists()
+            )
+
+            if has_inventory_allocation:
+                transaction.on_commit(
+                    lambda mr_id=material_request.id: (
+                        self.send_inventory_required_email(
+                            mr_id
+                        )
+                    )
+                )
+
+            return
+
+        # ----------------------------------------------------------
+        # EXISTING FLOW: all other MR types
+        # ----------------------------------------------------------
         self.create_manager_notification(
             material_request
         )

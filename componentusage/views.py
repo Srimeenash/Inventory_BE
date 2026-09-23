@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta
 from uuid import uuid4
 
+from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.db import transaction
 from django.db.models import Q, Sum
@@ -24,6 +26,7 @@ from inventory_backend.pagination import (
 )
 
 from components.models import Component
+from notifications.email_service import send_ipms_email
 from notifications.models import Notification
 
 from inventory.models import (
@@ -42,6 +45,13 @@ from .serializers import ComponentUsageSerializer
 COMPONENT_USAGE_LIST_CACHE_TTL_SECONDS = 60
 COMPONENT_USAGE_LIST_CACHE_VERSION_KEY = "ipms:componentusage:list:version"
 
+# ComponentUsage creates/updates Manager Notification rows directly through
+# the ORM. Use the same version key as NotificationViewSet so its cached list
+# is invalidated immediately when Returnable workflow changes.
+NOTIFICATION_LIST_CACHE_VERSION_KEY = "ipms:notifications:list:version"
+
+User = get_user_model()
+
 
 def get_component_usage_cache_version():
     return get_cache_version(COMPONENT_USAGE_LIST_CACHE_VERSION_KEY)
@@ -49,6 +59,15 @@ def get_component_usage_cache_version():
 
 def invalidate_component_usage_cache():
     invalidate_cache_version(COMPONENT_USAGE_LIST_CACHE_VERSION_KEY)
+
+
+def invalidate_notification_cache():
+    """
+    ComponentUsage bypasses NotificationViewSet when it creates/updates
+    Returnable workflow notifications, so explicitly bump Notification's
+    versioned list-cache key here.
+    """
+    invalidate_cache_version(NOTIFICATION_LIST_CACHE_VERSION_KEY)
 
 
 class ComponentUsageViewSet(ModelViewSet):
@@ -734,8 +753,176 @@ class ComponentUsageViewSet(ModelViewSet):
             notification.status = status_value
             notification.is_read = False
             notification.save(update_fields=["title", "message", "status", "is_read"])
+
         queryset.exclude(pk=notification.pk).delete()
+
+        # NotificationViewSet.perform_create/perform_update is not involved in
+        # this ORM path. Invalidate after commit so Manager's next GET is fresh.
+        transaction.on_commit(invalidate_notification_cache)
         return notification
+
+    @staticmethod
+    def _mail_user_display_name(user, fallback="Manager"):
+        if user is None:
+            return fallback
+
+        values = [
+            getattr(user, "employee_name", ""),
+            getattr(user, "full_name", ""),
+            getattr(user, "name", ""),
+        ]
+
+        try:
+            values.append(user.get_full_name())
+        except Exception:
+            pass
+
+        values.extend([
+            getattr(user, "username", ""),
+            getattr(user, "email", ""),
+        ])
+
+        for value in values:
+            value = str(value or "").strip()
+            if value:
+                return value.split("@", 1)[0] if "@" in value else value
+
+        return fallback
+
+    @staticmethod
+    def _format_mail_date(value):
+        if not value:
+            return "-"
+        try:
+            return value.strftime("%d/%m/%Y")
+        except Exception:
+            return str(value)
+
+    @classmethod
+    def send_manager_usage_approval_email(cls, usage_id):
+        """
+        Send Event / Flight Test / Demo-Trials Manager approval e-mail after
+        the Returnable movement transaction commits.
+        """
+        try:
+            usage = (
+                ComponentUsage.objects
+                .select_related("material_request", "component")
+                .get(pk=usage_id)
+            )
+        except ComponentUsage.DoesNotExist:
+            return
+
+        material_request = usage.material_request
+        mr_number = (
+            getattr(material_request, "material_request_id", "")
+            or "In-Drone MR"
+        )
+
+        purpose = str(usage.purpose or "").strip().upper()
+        purpose_label = {
+            "FLIGHT_TEST": "Flight Test",
+            "CUSTOMER_DEMO": "Demo/Trials",
+            "EVENT": "Event",
+        }.get(
+            purpose,
+            purpose.replace("_", " ").title() or "Returnable",
+        )
+
+        details = usage.inventory_issue_details
+        if isinstance(details, dict):
+            details = [details]
+        elif not isinstance(details, list):
+            details = []
+
+        metadata = next(
+            (item for item in details if isinstance(item, dict)),
+            {},
+        )
+
+        drone_instance_code = str(
+            metadata.get("drone_instance_code")
+            or metadata.get("droneInstanceCode")
+            or ""
+        ).strip()
+
+        requester_name = (
+            getattr(material_request, "requester_name", "")
+            or usage.employee_name
+            or "User"
+        )
+
+        managers = (
+            User.objects
+            .filter(
+                role__iexact="manager",
+                is_active=True,
+            )
+            .exclude(email__isnull=True)
+            .exclude(email="")
+            .order_by("id")
+        )
+
+        base_url = str(
+            getattr(
+                settings,
+                "IPMS_BASE_URL",
+                "http://localhost:5173",
+            )
+            or "http://localhost:5173"
+        ).rstrip("/")
+
+        subject = f"{mr_number} - {purpose_label} Approval Required"
+
+        for manager in managers:
+            try:
+                send_ipms_email(
+                    recipient_email=manager.email,
+                    subject=subject,
+                    context={
+                        "recipient_name": cls._mail_user_display_name(
+                            manager,
+                            "Manager",
+                        ),
+                        "message": (
+                            f"{requester_name} requested {purpose_label} "
+                            "for an available In-Drone drone. "
+                            "Manager approval is required."
+                        ),
+                        "table_headers": [
+                            "MR ID",
+                            "Drone Instance",
+                            "Purpose",
+                            "Requested By",
+                            "Returnable Date",
+                            "Status",
+                        ],
+                        "table_values": [
+                            mr_number,
+                            drone_instance_code or "-",
+                            purpose_label,
+                            requester_name,
+                            cls._format_mail_date(
+                                usage.return_due_date
+                            ),
+                            "Pending Manager",
+                        ],
+                        "status": "Pending Manager",
+                        "instruction": (
+                            "Please review the Returnable request and "
+                            "Approve or Reject it in IPMS."
+                        ),
+                        "button_text": "Review Returnable Request",
+                        "action_url": f"{base_url}/notifications",
+                    },
+                )
+            except Exception as exc:
+                # E-mail is a side effect. It must never roll back the valid
+                # Returnable workflow already committed in the database.
+                print(
+                    "Unable to send Returnable Manager approval email "
+                    f"to {getattr(manager, 'email', '')}: {exc}"
+                )
 
     @staticmethod
     def _resolve_material_request(reference, *, lock=False):
@@ -1224,14 +1411,16 @@ class ComponentUsageViewSet(ModelViewSet):
             "FLIGHT_TEST",
             "EVENT",
             "CUSTOMER_DEMO",
+            "QC_CHECK",
+            "MISCELLANEOUS_USAGE",
         }
 
         if purpose not in allowed_purposes:
             return Response(
                 {
                     "purpose": (
-                        "Purpose must be Flight Test, Event, "
-                        "or Demo/Trials."
+                        "Purpose must be Flight Test, Demo/Trials, "
+                        "QC Check, Event, or Miscellaneous Usage."
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
@@ -1437,9 +1626,23 @@ class ComponentUsageViewSet(ModelViewSet):
                 ),
                 message=(
                     f"{drone_instance.instance_code} is in In Drone. "
-                    f"Inventory requested {purpose_label}. Manager approval is required."
+                    f"{material_request.requester_name or 'User'} requested "
+                    f"{purpose_label}. Manager approval is required."
                 ),
             )
+
+            # These rows were created directly through ComponentUsage.objects,
+            # so the versioned list cache must be invalidated explicitly.
+            transaction.on_commit(invalidate_component_usage_cache)
+
+            # Match normal MR behavior: send Manager approval mail only after
+            # the database transaction has committed successfully.
+            transaction.on_commit(
+                lambda usage_id=first_usage.pk: (
+                    self.send_manager_usage_approval_email(usage_id)
+                )
+            )
+
             return Response(
                 {
                     "detail": "Drone instance usage submitted for Manager approval.",
@@ -1765,9 +1968,17 @@ class ComponentUsageViewSet(ModelViewSet):
             ),
             message=(
                 f"{material_request.material_request_id} is already in In Drone. "
-                f"Inventory requested {purpose_label} usage for "
-                f"{requested_quantity} unit(s). Manager approval is required."
+                f"{material_request.requester_name or 'User'} requested "
+                f"{purpose_label} usage for {requested_quantity} unit(s). "
+                "Manager approval is required."
             ),
+        )
+
+        transaction.on_commit(invalidate_component_usage_cache)
+        transaction.on_commit(
+            lambda usage_id=first_usage.pk: (
+                self.send_manager_usage_approval_email(usage_id)
+            )
         )
 
         return Response(
@@ -1823,12 +2034,18 @@ class ComponentUsageViewSet(ModelViewSet):
             )
 
         purpose = str(usage.purpose or "").strip().upper()
-        if purpose not in {"FLIGHT_TEST", "CUSTOMER_DEMO", "EVENT"}:
+        if purpose not in {
+            "FLIGHT_TEST",
+            "CUSTOMER_DEMO",
+            "QC_CHECK",
+            "EVENT",
+            "MISCELLANEOUS_USAGE",
+        }:
             return Response(
                 {
                     "detail": (
-                        "This approval endpoint is only for Flight Test, "
-                        "Demo/Trials, and Event requests created from In Drone."
+                        "This approval endpoint is only for Returnable usage "
+                        "requests created from an existing In-Drone drone."
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
@@ -1876,18 +2093,6 @@ class ComponentUsageViewSet(ModelViewSet):
             .order_by("id")
         )
 
-        if not rows.exists():
-            return Response(
-                {
-                    "detail": (
-                        "This Returnable movement is not pending Manager "
-                        "approval anymore. Refresh Notifications to see the "
-                        "latest status."
-                    )
-                },
-                status=status.HTTP_409_CONFLICT,
-            )
-
         notification = (
             Notification.objects
             .filter(
@@ -1898,6 +2103,47 @@ class ComponentUsageViewSet(ModelViewSet):
             .order_by("-id")
             .first()
         )
+
+        if not rows.exists():
+            # Race/idempotency protection. A stale Manager screen may submit
+            # after this movement was already processed in another tab/session.
+            # Synchronize the stale notification and return success instead of
+            # raising a misleading 409.
+            current_states = {
+                str(row.return_approval_status or "").strip().upper()
+                for row in movement_rows
+                if row is not None
+            }
+
+            if "NOT_REQUIRED" in current_states:
+                processed_status = "MANAGER_APPROVED"
+            elif current_states and current_states.issubset({"REJECTED"}):
+                processed_status = "MANAGER_REJECTED"
+            else:
+                processed_status = "PROCESSED"
+
+            if notification is not None:
+                notification.status = processed_status
+                notification.is_read = True
+                notification.save(
+                    update_fields=["status", "is_read"]
+                )
+
+            transaction.on_commit(invalidate_component_usage_cache)
+            transaction.on_commit(invalidate_notification_cache)
+
+            return Response(
+                {
+                    "detail": (
+                        "This Returnable movement was already processed. "
+                        "The latest workflow status has been synchronized."
+                    ),
+                    "status": processed_status,
+                    "already_processed": True,
+                    "return_approval_statuses": sorted(current_states),
+                },
+                status=status.HTTP_200_OK,
+            )
 
         if decision == "REJECT":
             reason = str(
@@ -1931,6 +2177,9 @@ class ComponentUsageViewSet(ModelViewSet):
                     ]
                 )
 
+            transaction.on_commit(invalidate_component_usage_cache)
+            transaction.on_commit(invalidate_notification_cache)
+
             return Response(
                 {
                     "detail": "Drone usage request rejected by Manager.",
@@ -1961,6 +2210,9 @@ class ComponentUsageViewSet(ModelViewSet):
             notification.save(
                 update_fields=["status", "is_read"]
             )
+
+        transaction.on_commit(invalidate_component_usage_cache)
+        transaction.on_commit(invalidate_notification_cache)
 
         return Response(
             {
@@ -2359,6 +2611,34 @@ class ComponentUsageViewSet(ModelViewSet):
                 "status": "INVENTORY_CHECK_PENDING",
                 "is_read": False,
             },
+        )
+
+        # For a physical Event / Flight Test / Demo drone, hand-back means the
+        # assembly is no longer active usage, but it is NOT available for Sale
+        # until Inventory/Admin finishes return QC.
+        drone_instance = self._drone_instance_from_usage(
+            first,
+            lock=True,
+        )
+        self._set_drone_instance_status(
+            drone_instance,
+            "RETURN_QC_PENDING",
+            workflow="RETURN_QC_PENDING",
+            purpose=str(first.purpose or "").strip().upper(),
+            movement_id=movement_id,
+            returned_by=actor,
+            return_date=raw_date,
+        )
+
+        # engineer_return changes ComponentUsage and writes an Inventory
+        # Notification directly. Without these invalidations the frontend can
+        # receive the previous 60-second cached state, making Submit appear to
+        # do nothing.
+        transaction.on_commit(
+            invalidate_component_usage_cache
+        )
+        transaction.on_commit(
+            invalidate_notification_cache
         )
 
         return Response(
@@ -3007,8 +3287,30 @@ class ComponentUsageViewSet(ModelViewSet):
             else "RETURNABLE_COMPONENT_QC_V1"
         )
 
+        first_usage_metadata = cls._usage_metadata(
+            first
+        )
+
         metadata = {
             "workflow": workflow,
+            "drone_instance_id": (
+                first_usage_metadata.get(
+                    "drone_instance_id"
+                )
+                or first_usage_metadata.get(
+                    "droneInstanceId"
+                )
+                or None
+            ),
+            "drone_instance_code": (
+                first_usage_metadata.get(
+                    "drone_instance_code"
+                )
+                or first_usage_metadata.get(
+                    "droneInstanceCode"
+                )
+                or ""
+            ),
             # Drone: PARTIAL when at least one returned component passed QC,
             # TOTAL when every returned component failed. Loose-component
             # Returnable failures do not use PR/FR, so TOTAL is sufficient.
@@ -3035,7 +3337,7 @@ class ComponentUsageViewSet(ModelViewSet):
             # GOOD = reusable pieces of a failed returned drone.
             # For loose component QC this remains empty because only failed
             # units enter the Scrap/Restore decision.
-            "selected_items": good_items if drone_mode else [],
+            "selected_items": good_items,
             "return_items": [],
             "reorder_items": [],
             "good_items": good_items,
@@ -3262,7 +3564,13 @@ class ComponentUsageViewSet(ModelViewSet):
         purpose = str(usage.purpose or "").strip().upper()
         drone_mode = (
             request_type != "RETURNABLE"
-            and purpose in {"FLIGHT_TEST", "CUSTOMER_DEMO", "EVENT"}
+            and purpose in {
+                "FLIGHT_TEST",
+                "CUSTOMER_DEMO",
+                "QC_CHECK",
+                "EVENT",
+                "MISCELLANEOUS_USAGE",
+            }
         )
         any_bad_in_movement = any(
             item["condition"] == "NOT_OK"
@@ -3308,8 +3616,8 @@ class ComponentUsageViewSet(ModelViewSet):
                 # Every failed Returnable unit now goes through the same
                 # Manager YES / NO disposition gate.
                 #
-                # Manager YES -> Procurement -> replacement PO -> Finance.
-                # Manager NO  -> Finance -> final QC-failed Scrap.
+                # Manager YES -> Finance -> PR/FR rebuild -> stock-first routing.
+                # Manager NO  -> Finance -> GOOD to In Store, BAD stays QC Failed.
                 #
                 # This applies to BOTH loose Returnable components and
                 # assembled-drone Returnable movements.
@@ -3354,10 +3662,25 @@ class ComponentUsageViewSet(ModelViewSet):
         )
 
         # FINAL RETURNABLE STOCK RULE:
-        # every OK unit returned by the Engineer goes directly to Central
-        # In Store, even when another unit in the same movement failed QC.
+        #
+        # COMPONENT mode:
+        #   Every OK loose component goes back to Central In Store.
+        #
+        # DRONE mode (Flight Test / Demo / Event):
+        #   The component serials are still assembled inside the SAME physical
+        #   drone instance. A QC-passed drone returns to In Drone/AVAILABLE and
+        #   must NOT also duplicate its component serials into Central In Store.
+        #
+        # A failed drone keeps its GOOD serials with the drone disposition data
+        # and sends only the failed disposition through the existing Outward /
+        # Manager Restore-Reorder workflow.
         returned_to_store = (
-            self._return_returnable_qc_passed_to_store(
+            []
+            if (
+                drone_mode
+                or any_bad_in_movement
+            )
+            else self._return_returnable_qc_passed_to_store(
                 rows,
                 normalized_by_usage,
             )
@@ -3380,6 +3703,13 @@ class ComponentUsageViewSet(ModelViewSet):
                 else "QC_PASSED_RETURNED_TO_STORE"
             )
 
+        transaction.on_commit(
+            invalidate_component_usage_cache
+        )
+        transaction.on_commit(
+            invalidate_notification_cache
+        )
+
         return Response(
             {
                 "detail": (
@@ -3389,7 +3719,11 @@ class ComponentUsageViewSet(ModelViewSet):
                         else "Return QC failed. The failed drone component(s) were sent to Manager for Reorder YES / NO."
                     )
                     if any_bad_in_movement
-                    else "Return QC passed and returned components were moved to In Store."
+                    else (
+                        "Return QC completed. The drone is available again in In Drone for Sale or another Returnable action."
+                        if drone_mode
+                        else "Return QC completed. Passed returned components were moved to In Store."
+                    )
                 ),
                 "qc_status": qc_status,
                 "material_request_id": mr_number,
@@ -3728,6 +4062,8 @@ class ComponentUsageViewSet(ModelViewSet):
                 {"detail": str(exc)},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        transaction.on_commit(invalidate_component_usage_cache)
 
         output = self.get_serializer(usage)
 

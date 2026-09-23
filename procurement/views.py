@@ -3599,20 +3599,57 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         lock=False,
     ):
         """
-        Return BOM or R&D component rows for one MR.
+        Return the correct component rows for one Material Request.
+
+        BOM
+            -> bom_items
+
+        R&D
+            -> rd_items
+
+        RETURNABLE / RETAIL_SALES
+            -> request_items
+
+        PR / FR children keep the request_type copied from their
+        source MR, so a Returnable _PR/_FR must continue using
+        request_items.
         """
 
-        if (
-            str(
-                material_request.request_type or ""
-            ).strip().upper()
-            in {"R&D", "RD"}
-        ):
+        request_type = str(
+            material_request.request_type or ""
+        ).strip().upper()
+
+        if request_type in {"R&D", "RD"}:
             manager = material_request.rd_items
+
+        elif request_type in {
+            "RETURNABLE",
+            "RETAIL_SALES",
+        }:
+            manager = getattr(
+                material_request,
+                "request_items",
+                None,
+            )
+
+            if manager is None:
+                raise ValidationError({
+                    "items": [
+                        (
+                            "This Material Request type "
+                            "requires request_items."
+                        )
+                    ]
+                })
+
         else:
             manager = material_request.bom_items
 
-        queryset = manager.all()
+        queryset = (
+            manager
+            .all()
+            .order_by("id")
+        )
 
         if lock:
             queryset = queryset.select_for_update()
