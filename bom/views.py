@@ -1,4 +1,5 @@
 import threading
+from decimal import Decimal, ROUND_HALF_UP
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
@@ -11,7 +12,9 @@ from notifications.models import Notification
 
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.permissions import IsAuthenticated
+from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework.response import Response
 from django.core.cache import cache
 from inventory_backend.cache_utils import (
@@ -24,10 +27,12 @@ from inventory_backend.pagination import (
     apply_server_query_parameters,
 )
 
-from .models import BOM, BOMItem
+from .models import BOM, BOMItem, MasterBOMPricing, ProjectBOM
 from .serializers import (
     BOMItemSerializer,
     BOMSerializer,
+    MasterBOMPricingSerializer,
+    ProjectBOMSerializer,
 )
 
 
@@ -1377,3 +1382,156 @@ class BOMItemViewSet(viewsets.ModelViewSet):
         )
 
         transaction.on_commit(invalidate_bom_cache)
+
+
+class ProjectBOMViewSet(viewsets.ReadOnlyModelViewSet):
+    """Saved Custom BOM snapshots, created atomically with their MRs."""
+
+    serializer_class = ProjectBOMSerializer
+    # The MR endpoint explicitly uses JWT authentication. Match it here so
+    # IsAuthenticated can recognize the token sent by fetchAuthenticatedJson.
+    authentication_classes = (JWTAuthentication,)
+    permission_classes = (IsAuthenticated,)
+    pagination_class = None
+    queryset = ProjectBOM.objects.select_related(
+        "material_request", "source_bom",
+    ).order_by("-created_at", "-id")
+
+
+def get_approved_master_components():
+    """One canonical component per active, approved Product BOM."""
+    result = {}
+    items = BOMItem.objects.filter(
+        bom__status="APPROVED", bom__is_active=True,
+    ).select_related("component", "bom").order_by("bom_id", "id")
+    for item in items:
+        component = item.component
+        code = str(
+            (component.component_id if component else "")
+            or item.component_code or ""
+        ).strip()
+        if not code:
+            continue
+        key = code.upper()
+        if key not in result:
+            result[key] = {
+                "component_code": code,
+                "component_name": str(getattr(component, "name", "") or ""),
+                "category": str(getattr(component, "category", "") or item.category or ""),
+                "component_type": str(getattr(component, "component_type", "") or ""),
+                "hsn_no": str(getattr(component, "hsn_numbers", "") or ""),
+                "specifications": str(
+                    getattr(component, "specifications", "") or item.specifications or ""
+                ),
+                "source_bom_numbers": [],
+            }
+        if item.bom.bom_number not in result[key]["source_bom_numbers"]:
+            result[key]["source_bom_numbers"].append(item.bom.bom_number)
+    return result
+
+
+class MasterBOMViewSet(viewsets.ViewSet):
+    """Live distinct approved components with separately saved costing data."""
+
+    authentication_classes = (JWTAuthentication,)
+    permission_classes = (IsAuthenticated,)
+    pricing_fields = (
+        "quantity", "uom", "vendor", "unit_price", "discount",
+        "gst_percent", "freight_cost", "freight_gst_percent",
+    )
+
+    def _response_row(self, component_row, pricing=None):
+        row = dict(component_row)
+        for field in self.pricing_fields:
+            value = getattr(pricing, field, None)
+            row[field] = "" if value is None else str(value)
+
+        qty = getattr(pricing, "quantity", None)
+        unit_price = getattr(pricing, "unit_price", None)
+        freight_cost = getattr(pricing, "freight_cost", None)
+        freight_gst_percent = getattr(pricing, "freight_gst_percent", None)
+        freight_gst = (
+            freight_cost * freight_gst_percent / 100
+            if freight_cost is not None and freight_gst_percent is not None
+            else None
+        )
+        money = lambda value: str(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        row["freight_gst_amount"] = "" if freight_gst is None else money(freight_gst)
+        if qty is None or unit_price is None:
+            row.update(gst_amount="", line_total="")
+        else:
+            base = qty * unit_price - (pricing.discount or Decimal("0"))
+            gst_amount = (
+                base * pricing.gst_percent / 100
+                if pricing.gst_percent is not None else None
+            )
+            freight = freight_cost or Decimal("0")
+            row.update(
+                gst_amount="" if gst_amount is None else money(gst_amount),
+                line_total=money(base + (gst_amount or Decimal("0")) + freight + (freight_gst or Decimal("0"))),
+            )
+        return row
+
+    def list(self, request):
+        components = get_approved_master_components()
+        prices = {
+            item.component_code.upper(): item
+            for item in MasterBOMPricing.objects.filter(
+                component_code__in=[row["component_code"] for row in components.values()]
+            )
+        }
+        return Response([
+            self._response_row(components[key], prices.get(key))
+            for key in sorted(components)
+        ])
+
+    @action(detail=False, methods=["patch"], url_path="bulk")
+    @transaction.atomic
+    def bulk_update(self, request):
+        """Save the edited Master BOM rows together or roll all of them back."""
+        rows = request.data.get("rows")
+        if not isinstance(rows, list) or not rows or len(rows) > 1000:
+            return Response(
+                {"rows": "Provide between 1 and 1000 changed lines."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        components = get_approved_master_components()
+        result = []
+        seen = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValidationError({"rows": "Each line must be an object."})
+            key = str(row.get("component_code") or "").strip().upper()
+            if key in seen or key not in components:
+                raise ValidationError({"rows": f"Duplicate or unavailable component: {key}"})
+            seen.add(key)
+            component_row = components[key]
+            pricing, _created = MasterBOMPricing.objects.get_or_create(
+                component_code=component_row["component_code"],
+            )
+            serializer = MasterBOMPricingSerializer(
+                pricing, data={field: row[field] for field in self.pricing_fields if field in row},
+                partial=True,
+            )
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            result.append(self._response_row(component_row, pricing))
+        return Response(result)
+
+    @transaction.atomic
+    def partial_update(self, request, pk=None):
+        components = get_approved_master_components()
+        component_row = components.get(str(pk or "").strip().upper())
+        if component_row is None:
+            return Response(
+                {"detail": "Component is not in an approved Product BOM."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        code = component_row["component_code"]
+        pricing, _created = MasterBOMPricing.objects.get_or_create(component_code=code)
+        serializer = MasterBOMPricingSerializer(
+            pricing, data=request.data, partial=True,
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(self._response_row(component_row, pricing))

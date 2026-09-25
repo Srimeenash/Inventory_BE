@@ -2,6 +2,7 @@ from inventory.cost_serializers import CostDetailsSerializerMixin
 from django.db.models import Sum
 
 from rest_framework import serializers
+from bom.models import BOM as ProductBOM, ProjectBOM
 
 from inventory.models import (
     Inventory,
@@ -685,6 +686,10 @@ class MaterialRequestSerializer(
         many=True,
         required=False,
     )
+    # Includes source row IDs and deletion reasons; deleted rows are not MR items.
+    custom_bom_items = serializers.ListField(
+        child=serializers.DictField(), required=False, write_only=True,
+    )
 
     class Meta:
         model = MaterialRequest
@@ -910,6 +915,7 @@ class MaterialRequestSerializer(
         )
 
     def create(self, validated_data):
+        custom_bom_items = validated_data.pop("custom_bom_items", [])
         bom_items = validated_data.pop(
             "bom_items",
             [],
@@ -922,6 +928,54 @@ class MaterialRequestSerializer(
             "request_items",
             [],
         )
+
+        is_custom_bom = (
+            validated_data.get("request_type") == "BOM"
+            and validated_data.get("customized_bom") is True
+        )
+        source_bom = None
+        original_by_id = {}
+        if is_custom_bom:
+            reference = str(validated_data.get("bom") or "").strip()
+            source_bom = (
+                ProductBOM.objects.filter(pk=int(reference)).first()
+                if reference.isdigit()
+                else ProductBOM.objects.filter(bom_number=reference).first()
+            )
+            if source_bom is None:
+                raise serializers.ValidationError({"bom": "Source Product BOM was not found."})
+            if not custom_bom_items:
+                raise serializers.ValidationError({
+                    "custom_bom_items": "Include the Custom BOM rows, including deleted rows."
+                })
+            original_by_id = {
+                item.pk: item
+                for item in source_bom.items.select_related("component").all()
+            }
+            referenced_ids = [
+                row.get("source_bom_item_id")
+                for row in custom_bom_items
+                if row.get("source_bom_item_id") not in (None, "")
+            ]
+            try:
+                referenced_ids = [int(value) for value in referenced_ids]
+            except (TypeError, ValueError):
+                raise serializers.ValidationError({
+                    "custom_bom_items": "Invalid source BOM line ID."
+                })
+            if (len(set(referenced_ids)) != len(referenced_ids)
+                    or set(referenced_ids) != set(original_by_id)):
+                raise serializers.ValidationError({
+                    "custom_bom_items": "Every original Product BOM line must appear exactly once."
+                })
+            if sum(row.get("change_type") != "DELETED" for row in custom_bom_items) != len(bom_items):
+                raise serializers.ValidationError({
+                    "custom_bom_items": "Custom BOM rows do not match the submitted MR components."
+                })
+            if not bom_items:
+                raise serializers.ValidationError({
+                    "bom_items": "A Custom BOM needs at least one active component."
+                })
 
         if (
             str(
@@ -975,6 +1029,94 @@ class MaterialRequestSerializer(
                     "remarks",
                     "",
                 ),
+            )
+
+        if is_custom_bom:
+            snapshot = []
+            live_items = iter(bom_items)
+            multiplier = int(material_request.required_quantity or 1)
+            for index, row in enumerate(custom_bom_items):
+                original = original_by_id.get(int(row["source_bom_item_id"])) if row.get("source_bom_item_id") not in (None, "") else None
+                change_type = str(row.get("change_type") or "").upper()
+                if change_type not in {"NEW", "EDITED", "UNCHANGED", "DELETED"}:
+                    raise serializers.ValidationError({"custom_bom_items": "Invalid change type."})
+                if change_type == "DELETED":
+                    if original is None:
+                        raise serializers.ValidationError({"custom_bom_items": "Deleted lines must come from the source BOM."})
+                    reason = str(row.get("remarks") or "").strip()
+                    if not reason or reason.lower() in {"none", "null"}:
+                        raise serializers.ValidationError({"custom_bom_items": "Deleted lines require a reason."})
+                    component = original.component
+                    snapshot.append({
+                        "source_bom_item_id": original.pk,
+                        "component_id": component.pk if component else None,
+                        "component_code": (component.component_id if component else original.component_code) or "",
+                        "component_name": str(getattr(component, "name", "") or ""),
+                        "category": original.category or getattr(component, "category", "") or "",
+                        "component_type": getattr(component, "component_type", "") or "",
+                        "specifications": original.specifications or "",
+                        "quantity": original.quantity * multiplier,
+                        "unit": original.unit or "",
+                        "vendor": original.vendor or "",
+                        "remarks": reason,
+                        "change_type": "DELETED",
+                        "position": index,
+                    })
+                    continue
+
+                item = next(live_items)
+                component = item.get("component")
+                try:
+                    submitted_component = int(row.get("component"))
+                except (TypeError, ValueError):
+                    raise serializers.ValidationError({"custom_bom_items": "Invalid component in the snapshot."})
+                if component is None or submitted_component != component.pk or int(row.get("quantity") or 0) != int(item.get("quantity") or 0):
+                    raise serializers.ValidationError({
+                        "custom_bom_items": "Snapshot component or quantity differs from the MR item."
+                    })
+                if original is None and change_type != "NEW":
+                    raise serializers.ValidationError({"custom_bom_items": "New lines must be marked NEW."})
+                if original is not None:
+                    changed = (
+                        original.component_id != component.pk
+                        or original.quantity * multiplier != int(item.get("quantity") or 0)
+                        or (original.unit or "").strip() != str(item.get("unit") or "").strip()
+                        or (original.category or getattr(original.component, "category", "") or "").strip() != str(item.get("category") or "").strip()
+                        or (original.specifications or getattr(original.component, "specifications", "") or "").strip() != str(item.get("specification") or "").strip()
+                    )
+                    change_type = "EDITED" if changed or change_type == "EDITED" else "UNCHANGED"
+                reason = str(item.get("remarks") or "").strip()
+                if change_type == "EDITED" and (not reason or reason.lower() in {"none", "null"}):
+                    raise serializers.ValidationError({"custom_bom_items": "Edited lines require a reason."})
+                snapshot.append({
+                    "source_bom_item_id": original.pk if original else None,
+                    "component_id": component.pk,
+                    "component_code": component.component_id,
+                    "component_name": component.name or "",
+                    "category": item.get("category") or component.category or "",
+                    "component_type": component.component_type or "",
+                    "specifications": item.get("specification") or component.specifications or "",
+                    "quantity": int(item.get("quantity") or 0),
+                    "unit": str(item.get("unit") or "").strip(),
+                    "vendor": str(item.get("vendor") or ""),
+                    "remarks": reason,
+                    "change_type": change_type,
+                    "position": index,
+                })
+
+            ProjectBOM.objects.create(
+                material_request=material_request,
+                material_request_number=material_request.material_request_id,
+                status_snapshot=material_request.status,
+                approval_status_snapshot=material_request.approval_status,
+                source_bom=source_bom,
+                source_bom_number=source_bom.bom_number,
+                bom_name=f"{source_bom.bom_name or source_bom.product_name} - Customized",
+                product_name=source_bom.product_name,
+                version=source_bom.version,
+                project=material_request.project,
+                created_by=material_request.requester_name,
+                items_snapshot=snapshot,
             )
 
         for item in rd_items:
@@ -1044,6 +1186,7 @@ class MaterialRequestSerializer(
         approval_status.
         """
         validated_data.pop("bom_items", None)
+        validated_data.pop("custom_bom_items", None)
         validated_data.pop("rd_items", None)
         validated_data.pop("request_items", None)
 

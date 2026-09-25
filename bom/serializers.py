@@ -2,7 +2,9 @@ from rest_framework import serializers
 
 from notifications.models import Notification
 
-from .models import BOM, BOMItem
+from decimal import Decimal
+
+from .models import BOM, BOMItem, MasterBOMPricing, ProjectBOM
 
 
 class BOMItemSerializer(serializers.ModelSerializer):
@@ -176,3 +178,78 @@ class BOMSerializer(serializers.ModelSerializer):
                 )
 
         return instance
+
+
+class ProjectBOMSerializer(serializers.ModelSerializer):
+    project_bom_number = serializers.CharField(read_only=True)
+    source_bom_id = serializers.IntegerField(read_only=True)
+    status = serializers.SerializerMethodField()
+    approval_status = serializers.SerializerMethodField()
+    component_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProjectBOM
+        fields = (
+            "id", "project_bom_number", "material_request_number",
+            "source_bom_id", "source_bom_number", "bom_name", "product_name",
+            "version", "project", "created_by", "created_at", "status",
+            "approval_status", "component_count", "items_snapshot",
+        )
+        read_only_fields = fields
+
+    def get_component_count(self, obj):
+        return sum(
+            item.get("change_type") != "DELETED"
+            for item in obj.items_snapshot
+        )
+
+    def get_status(self, obj):
+        return getattr(obj.material_request, "status", None) or obj.status_snapshot
+
+    def get_approval_status(self, obj):
+        return getattr(obj.material_request, "approval_status", None) or obj.approval_status_snapshot
+
+
+class MasterBOMPricingSerializer(serializers.ModelSerializer):
+    quantity = serializers.DecimalField(
+        max_digits=12, decimal_places=3, min_value=Decimal("0"),
+        required=False, allow_null=True,
+    )
+    unit_price = serializers.DecimalField(
+        max_digits=14, decimal_places=2, min_value=Decimal("0"),
+        required=False, allow_null=True,
+    )
+    discount = serializers.DecimalField(
+        max_digits=14, decimal_places=2, min_value=Decimal("0"),
+        required=False, allow_null=True,
+    )
+    gst_percent = serializers.DecimalField(
+        max_digits=5, decimal_places=2, min_value=Decimal("0"),
+        max_value=Decimal("100"), required=False, allow_null=True,
+    )
+    freight_cost = serializers.DecimalField(
+        max_digits=14, decimal_places=2, min_value=Decimal("0"),
+        required=False, allow_null=True,
+    )
+    freight_gst_percent = serializers.DecimalField(
+        max_digits=5, decimal_places=2, min_value=Decimal("0"),
+        max_value=Decimal("100"), required=False, allow_null=True,
+    )
+
+    class Meta:
+        model = MasterBOMPricing
+        fields = (
+            "quantity", "uom", "vendor", "unit_price", "discount",
+            "gst_percent", "freight_cost", "freight_gst_percent",
+        )
+
+    def validate(self, attrs):
+        quantity = attrs.get("quantity", getattr(self.instance, "quantity", None))
+        unit_price = attrs.get("unit_price", getattr(self.instance, "unit_price", None))
+        discount = attrs.get("discount", getattr(self.instance, "discount", None))
+        if quantity is not None and unit_price is not None and discount is not None:
+            if discount > quantity * unit_price:
+                raise serializers.ValidationError({
+                    "discount": "Discount cannot exceed quantity × unit price."
+                })
+        return attrs
