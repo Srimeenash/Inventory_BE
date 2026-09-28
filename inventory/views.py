@@ -8,8 +8,10 @@ from django.core.cache import cache
 from django.utils import timezone
 from django.db.models import Prefetch, Q
 
-from rest_framework import mixins, status, viewsets
+from rest_framework import mixins, serializers, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from inventory_backend.cache_utils import (
@@ -36,6 +38,7 @@ from .models import (
 )
 from .serializers import (
     InventorySerializer,
+    InventoryLocationSerializer,
     ProjectInventorySerializer,
     DroneInstanceSerializer,
 )
@@ -77,6 +80,41 @@ class InventoryViewSet(viewsets.ModelViewSet):
 
     serializer_class = InventorySerializer
     pagination_class = OptionalPageNumberPagination
+
+    @action(detail=True, methods=["patch"], url_path="location", permission_classes=[IsAuthenticated])
+    @transaction.atomic
+    def location(self, request, pk=None):
+        user = request.user
+        assigned = (
+            user.get_all_roles()
+            if callable(getattr(user, "get_all_roles", None))
+            else [getattr(user, "role", "")]
+        )
+        assigned_roles = {str(role).strip().lower() for role in assigned or []}
+        active_role = ""
+        if request.auth is not None:
+            try:
+                active_role = str(request.auth.get("active_role") or "").strip().lower()
+            except (AttributeError, TypeError):
+                pass
+        if not active_role:
+            active_role = str(getattr(user, "role", "") or "").strip().lower()
+        if active_role not in assigned_roles or active_role not in {"admin", "inventory", "procurement"}:
+            raise PermissionDenied("You cannot edit stock locations with this role.")
+
+        location = {field: request.data[field] for field in ("rack_no", "box_no") if field in request.data}
+        if not location:
+            raise serializers.ValidationError({"detail": "Provide Rack No or Box No."})
+        row = self.get_object()
+        serializer = InventoryLocationSerializer(row, data=location, partial=True)
+        serializer.is_valid(raise_exception=True)
+        # A location change must not trigger Inventory's cost recalculation signal.
+        Inventory.objects.filter(pk=row.pk).update(**serializer.validated_data)
+        for field, value in serializer.validated_data.items():
+            setattr(row, field, value)
+        InwardEntry.objects.filter(code=row.inventory_code).update(**serializer.validated_data)
+        transaction.on_commit(invalidate_inventory_cache)
+        return Response(InventoryLocationSerializer(row).data)
 
     def get_serializer_context(self):
         context = super().get_serializer_context()

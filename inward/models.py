@@ -41,6 +41,8 @@ class InwardEntry(models.Model):
     )
     quantity_received = models.PositiveIntegerField()
     batch_number = models.CharField(max_length=100, blank=True, null=True)
+    rack_no = models.CharField(max_length=100, blank=True, default="")
+    box_no = models.CharField(max_length=100, blank=True, default="")
     received_date = models.DateField()
     qc_status = models.CharField(
         max_length=20,

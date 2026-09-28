@@ -93,6 +93,8 @@ class InwardQCSerializer(serializers.Serializer):
         allow_blank=True,
         allow_null=True,
     )
+    rack_no = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    box_no = serializers.CharField(max_length=100, required=False, allow_blank=True)
 
     @staticmethod
     def get_row_quantity(row):
@@ -1010,6 +1012,19 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             default_ordering=("-received_date", "-id"),
         )
 
+    @transaction.atomic
+    def perform_update(self, serializer):
+        entry = serializer.save()
+        location = {
+            field: getattr(entry, field)
+            for field in ("rack_no", "box_no")
+            if field in serializer.validated_data
+        }
+        if location and Inventory.objects.filter(inventory_code=entry.code).update(**location):
+            from inventory.views import invalidate_inventory_cache
+
+            transaction.on_commit(invalidate_inventory_cache)
+
     @staticmethod
     def get_qc_row_quantity(row):
         raw_value = (
@@ -1660,6 +1675,8 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
         values = {
             "component":
                 inward_entry.component,
+            "rack_no": inward_entry.rack_no,
+            "box_no": inward_entry.box_no,
             "category": (
                 getattr(
                     inward_entry.component,
@@ -1703,6 +1720,8 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             update_fields=[
                 "component",
                 "category",
+                "rack_no",
+                "box_no",
                 "vendor",
                 "purchase_order",
                 "quantity",
@@ -5779,13 +5798,19 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                 top_level_remarks
             )
 
+        location_fields = []
+        for field_name in ("rack_no", "box_no"):
+            if field_name in serializer.validated_data:
+                setattr(inward_entry, field_name, serializer.validated_data[field_name])
+                location_fields.append(field_name)
+
         update_fields = [
             "qc_passed_rows",
             "qc_failed_rows",
             "qc_status",
             "qc_timestamp",
             "updated_at",
-        ]
+        ] + location_fields
 
         if top_level_remarks:
             update_fields.append("remarks")
@@ -5836,6 +5861,11 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                 )
             )
 
+            if inventory_row is not None:
+                from inventory.views import invalidate_inventory_cache
+
+                transaction.on_commit(invalidate_inventory_cache)
+
             if is_returnable_restore_po:
                 self.complete_returnable_restore_after_qc(
                     inward_entry,
@@ -5871,6 +5901,8 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                     inward_entry.qc_timestamp,
                 "source_mr_number":
                     source_mr_number,
+                "rack_no": inward_entry.rack_no,
+                "box_no": inward_entry.box_no,
                 "inventory_code": (
                     inventory_row.inventory_code
                     if inventory_row

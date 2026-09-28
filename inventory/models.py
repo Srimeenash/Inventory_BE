@@ -16,6 +16,20 @@ class Inventory(models.Model):
         blank=True,
     )
 
+    # Source identity allows safe retries without duplicating stock rows.
+    legacy_source_key = models.CharField(
+        max_length=120,
+        unique=True,
+        blank=True,
+        null=True,
+    )
+    legacy_source_data = models.JSONField(
+        default=dict,
+        blank=True,
+    )
+    rack_no = models.CharField(max_length=100, blank=True, default="")
+    box_no = models.CharField(max_length=100, blank=True, default="")
+
     component = models.ForeignKey(
         "components.Component",
         on_delete=models.CASCADE,

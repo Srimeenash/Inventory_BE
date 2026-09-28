@@ -37,6 +37,57 @@ class InventorySerializer(CostDetailsSerializerMixin, serializers.ModelSerialize
         default="",
     )
 
+    # Stock imported from Excel keeps the original ID independently of the
+    # category-based ID used by the Component master and its foreign keys.
+    source_component_id = serializers.SerializerMethodField()
+    source_specification = serializers.SerializerMethodField()
+    source_original_quantity = serializers.SerializerMethodField()
+
+    @staticmethod
+    def _legacy_values(obj):
+        metadata = obj.legacy_source_data or {}
+        if not isinstance(metadata, dict):
+            return {}
+        values = metadata.get("original_values") or {}
+        return values if isinstance(values, dict) else {}
+
+    def get_source_component_id(self, obj):
+        if not obj.legacy_source_key:
+            return str(
+                obj.component.legacy_inventory_id or ""
+            ).strip() if obj.component_id else ""
+        values = self._legacy_values(obj)
+        identifier = str(values.get("Comp ID") or "").strip()
+        if not identifier and obj.component_id:
+            identifier = str(obj.component.legacy_inventory_id or "").strip()
+        return (
+            identifier
+            if identifier.upper() not in {"", "-", "NA", "N/A", "NONE", "NULL"}
+            else "N/A"
+        )
+
+    def get_source_specification(self, obj):
+        if not obj.legacy_source_key:
+            return ""
+        values = self._legacy_values(obj)
+        return str(values.get("Component Specification") or values.get("Description") or "").strip()
+
+    def get_source_original_quantity(self, obj):
+        """Original Excel Qty (receipt total), separate from available stock."""
+        if not obj.legacy_source_key:
+            return None
+        metadata = obj.legacy_source_data or {}
+        raw = metadata.get("historical_display_quantity", self._legacy_values(obj).get("Qty"))
+        if raw is None or str(raw).strip() == "":
+            return None
+        try:
+            quantity = Decimal(str(raw).replace(",", ""))
+        except (InvalidOperation, ValueError):
+            return None
+        if not quantity.is_finite() or quantity < 0:
+            return None
+        return int(quantity) if quantity == quantity.to_integral_value() else float(quantity)
+
     category_display = serializers.SerializerMethodField()
 
     class Meta:
@@ -46,12 +97,17 @@ class InventorySerializer(CostDetailsSerializerMixin, serializers.ModelSerialize
             "inventory_code",
             "component",
             "component_code",
+            "source_component_id",
             "component_name",
             "category",
             "category_display",
             "specifications",
+            "source_specification",
+            "source_original_quantity",
             "component_type",
             "uom",
+            "rack_no",
+            "box_no",
             "vendor",
             "purchase_order",
             "quantity",
@@ -98,6 +154,14 @@ class InventorySerializer(CostDetailsSerializerMixin, serializers.ModelSerialize
                 "required": False,
                 "allow_blank": True,
                 "allow_null": True,
+            },
+            "rack_no": {
+                "required": False,
+                "allow_blank": True,
+            },
+            "box_no": {
+                "required": False,
+                "allow_blank": True,
             },
             "vendor": {
                 "required": False,
@@ -147,6 +211,9 @@ class InventorySerializer(CostDetailsSerializerMixin, serializers.ModelSerialize
 
         read_only_fields = [
             "component_code",
+            "source_component_id",
+            "source_specification",
+            "source_original_quantity",
             "component_name",
             "category_display",
             "issued_serial_numbers",
@@ -833,6 +900,13 @@ class InventorySerializer(CostDetailsSerializerMixin, serializers.ModelSerialize
                 last_no = 0
 
         return f"INV{last_no + 1:05d}"
+
+
+class InventoryLocationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Inventory
+        fields = ("id", "rack_no", "box_no")
+        read_only_fields = ("id",)
 
 
 class InventoryReservationSerializer(

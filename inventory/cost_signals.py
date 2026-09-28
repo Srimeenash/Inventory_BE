@@ -7,6 +7,11 @@ from .models import Inventory
 def inventory_serial_cost_value(sender, instance, created, raw=False, **kwargs):
     if raw:
         return
+    # The import goes through InventorySerializer, which writes the complete
+    # per-serial GST/price breakdown immediately after stock creation. Let it
+    # own the snapshot instead of pre-empting it with the generic fallback.
+    if created and instance.legacy_source_key:
+        return
     from .costing import record_inventory_costs, update_stock_value
     if created:
         record_inventory_costs(instance)

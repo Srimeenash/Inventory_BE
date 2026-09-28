@@ -16,6 +16,14 @@ class Component(models.Model):
         unique=True,
     )
 
+    # Keep the original spreadsheet ID while preserving IPMS category IDs.
+    legacy_inventory_id = models.CharField(
+        max_length=100,
+        unique=True,
+        blank=True,
+        null=True,
+    )
+
     # Legacy storage retained for historical transaction compatibility.
     # New component creation no longer requires or exposes this field.
     name = models.CharField(
