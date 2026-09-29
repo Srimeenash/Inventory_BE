@@ -52,6 +52,8 @@ INVENTORY_LIST_CACHE_TTL_SECONDS = 60
 INVENTORY_LIST_CACHE_VERSION_KEY = "ipms:inventory:list:version"
 PROJECT_INVENTORY_LIST_CACHE_TTL_SECONDS = 60
 PROJECT_INVENTORY_LIST_CACHE_VERSION_KEY = "ipms:project_inventory:list:version"
+MATERIAL_REQUEST_LIST_CACHE_VERSION_KEY = "ipms:materialrequests:list:version"
+NOTIFICATION_LIST_CACHE_VERSION_KEY = "ipms:notifications:list:version"
 
 
 def get_inventory_cache_version():
@@ -68,6 +70,14 @@ def get_project_inventory_cache_version():
 
 def invalidate_project_inventory_cache():
     invalidate_cache_version(PROJECT_INVENTORY_LIST_CACHE_VERSION_KEY)
+
+
+def invalidate_sync_mr_caches():
+    """Publish issued quantities and notification state after the transaction."""
+    invalidate_project_inventory_cache()
+    invalidate_inventory_cache()
+    invalidate_cache_version(MATERIAL_REQUEST_LIST_CACHE_VERSION_KEY)
+    invalidate_cache_version(NOTIFICATION_LIST_CACHE_VERSION_KEY)
 
 
 class InventoryViewSet(viewsets.ModelViewSet):
@@ -2311,6 +2321,10 @@ class ProjectInventoryViewSet(
                 ),
                 is_read=False,
             )
+
+        # The list endpoints above use versioned 60-second caches. Issue
+        # results must be visible before the next Provide Components click.
+        transaction.on_commit(invalidate_sync_mr_caches)
 
         response_serializer = self.get_serializer(
             project_rows,
