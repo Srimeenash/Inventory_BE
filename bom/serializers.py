@@ -86,6 +86,21 @@ class BOMSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
 
+    def validate(self, attrs):
+        # A new BOM must contain at least one actual selected component.
+        # Existing BOM updates keep their current items when items is omitted.
+        if self.instance is None:
+            items = attrs.get("items") or []
+            if not items:
+                raise serializers.ValidationError({
+                    "items": ["Add at least one BOM component before submitting."]
+                })
+            if any(item.get("component") is None for item in items):
+                raise serializers.ValidationError({
+                    "items": ["Select a component for every BOM item."]
+                })
+        return attrs
+
     def create(self, validated_data):
         items_data = validated_data.pop(
             "items",
