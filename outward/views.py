@@ -4937,7 +4937,7 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
         )
 
     @classmethod
-    def require_finance_for_in_drone_sales(cls, request):
+    def require_in_drone_sales_requester(cls, request):
         user = getattr(request, "user", None)
 
         if not user or not getattr(user, "is_authenticated", False):
@@ -4945,11 +4945,11 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
 
         role = cls.get_active_role(request)
 
-        if role not in {"finance", "admin"} and not getattr(
+        if role not in {"inventory", "finance", "admin"} and not getattr(
             user, "is_superuser", False
         ):
             raise PermissionDenied(
-                "Only Finance can send an In-Drone request for Sales approval."
+                "Only Inventory, Finance, or Admin can request In-Drone Sales approval."
             )
 
         return user
@@ -5052,7 +5052,7 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
             for row in sales_rows
         ) or "-"
 
-        requester_name = str(first_row.requested_by or "Finance").strip() or "Finance"
+        requester_name = str(first_row.requested_by or "IPMS user").strip() or "IPMS user"
         subject = f"{mr_number} - Sales Approval Required"
         sent_any = False
 
@@ -5067,7 +5067,7 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                             "Management",
                         ),
                         "message": (
-                            f"Finance submitted In-Drone Sales for {mr_number}. "
+                            f"{requester_name} submitted In-Drone Sales for {mr_number}. "
                             "Management approval is required before the Sales is finalized."
                         ),
                         "table_headers": [
@@ -5171,14 +5171,14 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
     )
     def in_drone_sales(self, request):
         """
-        Finance sends an already-issued In-Drone MR to Sales.
+        Inventory, Finance, or Admin sends an issued In-Drone MR to Sales.
 
         The exact issued ProjectInventory component quantities/serials are
         copied into Outward as SALES rows in PENDING_MANAGEMENT state.
         No Inventory quantity is deducted here because the stock has already
         left In Store when the MR reached In Drone.
         """
-        user = self.require_finance_for_in_drone_sales(request)
+        user = self.require_in_drone_sales_requester(request)
         material_request = self._resolve_material_request(
             request.data.get("material_request_id")
             or request.data.get("materialRequestId")
@@ -5234,7 +5234,7 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                     {
                         "detail": (
                             "All requested components must be fully issued "
-                            "before Finance can send this request to Sales."
+                            "before a Sales request can be sent."
                         )
                     }
                 )
@@ -5392,7 +5392,7 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                 f"{material_request.material_request_id}"
             )
             message = (
-                f"Finance submitted {material_request.material_request_id} "
+                f"{requester_name} submitted {material_request.material_request_id} "
                 "from In Drone for Sales. Management approval is required."
             )
 
