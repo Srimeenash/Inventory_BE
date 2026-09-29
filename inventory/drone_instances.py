@@ -243,6 +243,66 @@ def _best_instance_for_serials(instances, serials):
     return best
 
 
+def returnable_history_instance_ids(instances, usage_rows):
+    """Physical drones already requested for Returnable, including completed trips.
+
+    A prior request makes an instance ineligible for another *new* Returnable
+    request even when its inventory status later becomes AVAILABLE. Old
+    movements without an instance reference use serials when possible; when
+    their physical drone cannot be identified, exclude the parent MR's drones
+    rather than offer one which might already have been requested.
+    """
+    instances = list(instances)
+    by_mr = defaultdict(list)
+    for instance in instances:
+        by_mr[instance.material_request_id].append(instance)
+
+    movements = defaultdict(list)
+    for usage in usage_rows:
+        metadata = _usage_metadata(usage)
+        if not (
+            str(metadata.get("source") or "").strip().upper() == "IN_DRONE"
+            or metadata.get("drone_instance_id")
+            or metadata.get("drone_instance_code")
+        ):
+            continue
+        key = (
+            usage.material_request_id,
+            str(metadata.get("movement_id") or f"legacy-{usage.pk}"),
+        )
+        movements[key].append(usage)
+
+    used_ids = set()
+    for (mr_id, _movement_id), rows in movements.items():
+        candidates = by_mr.get(mr_id, [])
+        if not candidates:
+            continue
+        metadata = _usage_metadata(rows[0])
+        raw_id = metadata.get("drone_instance_id")
+        raw_code = str(metadata.get("drone_instance_code") or "").strip().upper()
+        instance = next(
+            (
+                candidate for candidate in candidates
+                if (raw_id and str(candidate.pk) == str(raw_id))
+                or (raw_code and candidate.instance_code.strip().upper() == raw_code)
+            ),
+            None,
+        )
+        if instance is None and not (raw_id or raw_code):
+            instance = _best_instance_for_serials(
+                candidates,
+                [
+                    serial for row in rows
+                    for serial in normalize_serials(row.issued_serial_numbers)
+                ],
+            )
+        if instance is None:
+            used_ids.update(candidate.pk for candidate in candidates)
+        else:
+            used_ids.add(instance.pk)
+    return used_ids
+
+
 @transaction.atomic
 def refresh_drone_instance_statuses(material_request):
     """Reconcile instance state from persisted Sales, Returnable and Scrap history."""

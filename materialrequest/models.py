@@ -59,6 +59,19 @@ class MaterialRequest(models.Model):
         default="",
         db_index=True,
     )
+    returnable_date = models.DateField(null=True, blank=True)
+    source_drone_mr = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="linked_component_returnables",
+    )
+    source_drone_movement_id = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+    )
     required_quantity = models.PositiveIntegerField(default=1)
     required_date = models.DateField()
     remarks = models.TextField(blank=True, null=True)

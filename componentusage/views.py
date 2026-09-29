@@ -36,6 +36,7 @@ from inventory.models import (
     DroneInstance,
     DroneComponentAllocation,
 )
+from inventory.drone_instances import returnable_history_instance_ids
 from materialrequest.models import MaterialRequest
 from outward.models import OutwardEntry
 
@@ -1325,6 +1326,43 @@ class ComponentUsageViewSet(ModelViewSet):
         instance.workflow_metadata = workflow_metadata
         instance.save(update_fields=["status", "workflow_metadata", "updated_at"])
 
+    @staticmethod
+    def _create_linked_component_request(
+        request, component_serializer, source_mr, movement_id, usage_rows,
+    ):
+        """Create the separate component MR inside the drone movement transaction."""
+        if component_serializer is None:
+            return None
+
+        # Reuse the normal MR creation path (daily ID, requester, manager
+        # notification, and cutoff checks) so Both behaves like Components.
+        from materialrequest.views import MaterialRequestViewSet
+
+        mr_view = MaterialRequestViewSet()
+        mr_view.request = request
+        mr_view.perform_create(
+            component_serializer,
+            source_drone_mr=source_mr,
+            source_drone_movement_id=movement_id,
+        )
+        component_mr = component_serializer.instance
+
+        # The link remains visible from the existing drone's usage rows too.
+        for usage in usage_rows:
+            details = list(usage.inventory_issue_details or [])
+            usage.inventory_issue_details = [
+                {
+                    **detail,
+                    "linked_component_mr_id": component_mr.pk,
+                    "linked_component_mr_number": component_mr.material_request_id,
+                }
+                for detail in details
+            ]
+        ComponentUsage.objects.bulk_update(
+            usage_rows, ["inventory_issue_details"]
+        )
+        return component_mr
+
     @action(
         detail=False,
         methods=["post"],
@@ -1496,6 +1534,46 @@ class ComponentUsageViewSet(ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        component_request = request.data.get("component_request")
+        component_serializer = None
+        if component_request is not None:
+            if not isinstance(component_request, dict):
+                return Response(
+                    {"component_request": "Expected a component MR object."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if str(component_request.get("request_type") or "").upper() != "RETURNABLE":
+                return Response(
+                    {"component_request": "The linked MR must be Returnable."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if str(component_request.get("returnable_purpose") or "").upper() != purpose:
+                return Response(
+                    {"component_request": "Drone and components must have the same purpose."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            from materialrequest.serializers import MaterialRequestSerializer
+
+            component_serializer = MaterialRequestSerializer(
+                data=component_request, context={"request": request},
+            )
+            component_serializer.is_valid(raise_exception=True)
+            items = component_serializer.validated_data.get("request_items") or []
+            if not items or any(
+                not item.get("component") or int(item.get("quantity") or 0) < 1
+                for item in items
+            ):
+                return Response(
+                    {"request_items": "Add at least one valid component and quantity."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if component_serializer.validated_data.get("returnable_date") != return_due_date:
+                return Response(
+                    {"returnable_date": "Drone and components must share the same return date."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         remarks = str(
             request.data.get("remarks") or ""
         ).strip()
@@ -1506,6 +1584,16 @@ class ComponentUsageViewSet(ModelViewSet):
             or request.data.get("droneInstanceId")
             or request.data.get("droneInstanceCode")
         )
+
+        if (
+            str(request.data.get("source") or "").strip().upper()
+            == "NEW_MATERIAL_REQUEST_PAGE"
+            and not drone_instance_reference
+        ):
+            return Response(
+                {"drone_instance_id": "Select a fresh physical drone (_01, _02, etc.)."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         if drone_instance_reference:
             drone_instance = self._drone_instance_from_reference(
@@ -1524,6 +1612,28 @@ class ComponentUsageViewSet(ModelViewSet):
                         "detail": (
                             f"{drone_instance.instance_code} is not available. "
                             f"Current state: {drone_instance.status}."
+                        )
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+            # The dropdown is only a convenience. Recheck persisted usage
+            # under the locked source MR so another submission or a completed
+            # return cannot make the same physical drone selectable again.
+            all_instances = list(
+                DroneInstance.objects.filter(material_request=material_request)
+                .prefetch_related("component_allocations")
+            )
+            previous_ids = returnable_history_instance_ids(
+                all_instances,
+                ComponentUsage.objects.filter(material_request=material_request)
+                .order_by("id"),
+            )
+            if drone_instance.pk in previous_ids:
+                return Response(
+                    {
+                        "detail": (
+                            f"{drone_instance.instance_code} was already requested "
+                            "for Returnable. Select a fresh available drone."
                         )
                     },
                     status=status.HTTP_409_CONFLICT,
@@ -1612,6 +1722,10 @@ class ComponentUsageViewSet(ModelViewSet):
             )
 
             first_usage = created_rows[0]
+            component_mr = self._create_linked_component_request(
+                request, component_serializer, material_request,
+                movement_id, created_rows,
+            )
             purpose_label = {
                 "FLIGHT_TEST": "Flight Test",
                 "CUSTOMER_DEMO": "Demo/Trials",
@@ -1647,6 +1761,9 @@ class ComponentUsageViewSet(ModelViewSet):
                 {
                     "detail": "Drone instance usage submitted for Manager approval.",
                     "material_request_id": material_request.material_request_id,
+                    "component_material_request_id": (
+                        component_mr.material_request_id if component_mr else None
+                    ),
                     "drone_instance_id": drone_instance.pk,
                     "drone_instance_code": drone_instance.instance_code,
                     "purpose": purpose,
@@ -1952,6 +2069,10 @@ class ComponentUsageViewSet(ModelViewSet):
             )
 
         first_usage = created_rows[0]
+        component_mr = self._create_linked_component_request(
+            request, component_serializer, material_request,
+            movement_id, created_rows,
+        )
         purpose_label = {
             "FLIGHT_TEST": "Flight Test",
             "CUSTOMER_DEMO": "Demo/Trials",
@@ -1985,6 +2106,9 @@ class ComponentUsageViewSet(ModelViewSet):
             {
                 "detail": "Drone usage submitted for Manager approval.",
                 "material_request_id": material_request.material_request_id,
+                "component_material_request_id": (
+                    component_mr.material_request_id if component_mr else None
+                ),
                 "purpose": purpose,
                 "quantity": requested_quantity,
                 "movement_id": movement_id,
@@ -2448,10 +2572,9 @@ class ComponentUsageViewSet(ModelViewSet):
                     ),
                     purpose=purpose,
                     requested_date=timezone.localdate(),
-                    return_due_date=getattr(
-                        material_request,
-                        "required_date",
-                        None,
+                    return_due_date=(
+                        material_request.returnable_date
+                        or material_request.required_date
                     ),
                     issued_date=timezone.localdate(),
                     quantity=issued_quantity,

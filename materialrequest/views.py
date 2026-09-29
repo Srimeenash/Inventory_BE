@@ -2264,7 +2264,7 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
                 project_row.save()
 
     @transaction.atomic
-    def perform_create(self, serializer):
+    def perform_create(self, serializer, **linked_fields):
         """
         GLOBAL Material Request Required Date cutoff.
 
@@ -2374,6 +2374,7 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
             requester_name=requester_name,
             status="PENDING_MANAGER",
             approval_status="PENDING_MANAGER",
+            **linked_fields,
         )
 
         # ----------------------------------------------------------

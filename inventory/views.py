@@ -42,7 +42,11 @@ from .serializers import (
     ProjectInventorySerializer,
     DroneInstanceSerializer,
 )
-from .drone_instances import ensure_drone_instances, refresh_drone_instance_statuses
+from .drone_instances import (
+    ensure_drone_instances,
+    refresh_drone_instance_statuses,
+    returnable_history_instance_ids,
+)
 
 INVENTORY_LIST_CACHE_TTL_SECONDS = 60
 INVENTORY_LIST_CACHE_VERSION_KEY = "ipms:inventory:list:version"
@@ -1891,12 +1895,34 @@ class ProjectInventoryViewSet(
             )
         )
 
+        # Availability and "never requested for Returnable" are separate:
+        # a successfully returned drone can be AVAILABLE for Inventory while
+        # it is no longer a fresh choice for a new Returnable request.
+        instances = list(instance_queryset)
+        from componentusage.models import ComponentUsage
+
+        usage_rows = ComponentUsage.objects.filter(
+            material_request__in=material_requests,
+        ).only(
+            "id", "material_request", "inventory_issue_details",
+            "issued_serial_numbers",
+        ).order_by("id")
+        previously_requested_ids = returnable_history_instance_ids(
+            instances, usage_rows,
+        )
+        data = DroneInstanceSerializer(
+            instances,
+            many=True,
+            context=self.get_serializer_context(),
+        ).data
+        for row, instance in zip(data, instances):
+            row["returnable_eligible"] = (
+                instance.status == "AVAILABLE"
+                and instance.pk not in previously_requested_ids
+            )
+
         return Response(
-            DroneInstanceSerializer(
-                instance_queryset,
-                many=True,
-                context=self.get_serializer_context(),
-            ).data,
+            data,
             status=status.HTTP_200_OK,
         )
 

@@ -686,6 +686,11 @@ class MaterialRequestSerializer(
         many=True,
         required=False,
     )
+    source_drone_mr_number = serializers.CharField(
+        source="source_drone_mr.material_request_id",
+        read_only=True,
+        default="",
+    )
     # Includes source row IDs and deletion reasons; deleted rows are not MR items.
     custom_bom_items = serializers.ListField(
         child=serializers.DictField(), required=False, write_only=True,
@@ -694,6 +699,7 @@ class MaterialRequestSerializer(
     class Meta:
         model = MaterialRequest
         fields = "__all__"
+        read_only_fields = ("source_drone_mr", "source_drone_movement_id")
 
     def validate_material_request_id(self, value):
         value = str(value or "").strip()
@@ -787,8 +793,8 @@ class MaterialRequestSerializer(
             # Every Returnable purpose may create a NEW MR when the user
             # chooses Components on the New Material Request page.
             #
-            # Drone mode does not call this serializer at all; it reuses an
-            # existing In-Drone MR through componentusage/move-from-in-drone.
+            # Drone-only mode reuses an In-Drone MR. Both mode creates the
+            # component MR here and links it to the existing drone movement.
             valid_purposes = {
                 choice[0]
                 for choice in MaterialRequest.RETURNABLE_PURPOSE_CHOICES
@@ -820,27 +826,43 @@ class MaterialRequestSerializer(
                 "date",
                 getattr(self.instance, "date", None),
             )
-            return_date = attrs.get(
+            required_date = attrs.get(
                 "required_date",
                 getattr(self.instance, "required_date", None),
             )
+            return_date = attrs.get(
+                "returnable_date",
+                getattr(self.instance, "returnable_date", None),
+            )
 
-            if request_date and return_date:
-                if return_date < request_date:
+            if request_date and required_date:
+                if required_date < request_date:
                     raise serializers.ValidationError(
-                        {"required_date": ["Returnable date cannot be before request date."]}
+                        {"required_date": ["Required date cannot be before request date."]}
                     )
 
                 if purpose in {
                     "FLIGHT_TEST",
                     "QC_CHECK",
                     "MISCELLANEOUS_USAGE",
-                } and (return_date - request_date).days > 4:
+                } and (required_date - request_date).days > 4:
                     raise serializers.ValidationError(
                         {"required_date": ["This Returnable purpose allows a maximum of 4 days."]}
                     )
+            if return_date:
+                if required_date and return_date < required_date:
+                    raise serializers.ValidationError(
+                        {"returnable_date": ["Returnable date cannot be before the required date."]}
+                    )
+                if request_date and purpose in {
+                    "FLIGHT_TEST", "QC_CHECK", "MISCELLANEOUS_USAGE",
+                } and (return_date - request_date).days > 4:
+                    raise serializers.ValidationError(
+                        {"returnable_date": ["This Returnable purpose allows a maximum of 4 days."]}
+                    )
         else:
             attrs["returnable_purpose"] = ""
+            attrs["returnable_date"] = None
 
         return attrs
 
