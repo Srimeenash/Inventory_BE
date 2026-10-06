@@ -5,6 +5,7 @@ import re
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import transaction
+from django.db.models.deletion import ProtectedError
 from django.db.models import Prefetch, Q, Sum
 from django.utils import timezone
 from rest_framework.permissions import IsAuthenticated
@@ -27,6 +28,7 @@ from inventory.models import (
     Inventory,
     InventoryReservation,
     ProjectInventory,
+    DroneInstance,
 )
 from inventory.views import ProjectInventoryViewSet
 from notifications.email_service import send_ipms_email
@@ -36,6 +38,7 @@ from procurement.models import (
     PurchaseOrderItem,
 )
 from inward.models import InwardEntry
+from outward.models import OutwardEntry
 
 from .models import BOMItem, MaterialRequest, RDItem, RequestItem
 from .serializers import MaterialRequestSerializer
@@ -83,6 +86,21 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
 
     serializer_class = MaterialRequestSerializer
     pagination_class = OptionalPageNumberPagination
+
+    def handle_exception(self, exc):
+        # A protected relation may also be added by a future module. Keep
+        # the entire atomic DELETE rolled back and return a usable error.
+        if isinstance(exc, ProtectedError):
+            linked_models = sorted({
+                obj._meta.verbose_name
+                for obj in exc.protected_objects
+            })
+            names = ", ".join(linked_models) or "workflow records"
+            return Response(
+                {"detail": f"This MR cannot be deleted while linked {names} remain."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        return super().handle_exception(exc)
 
     @staticmethod
     def _query_flag(value):
@@ -195,6 +213,12 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
         )
 
         queryset = MaterialRequest.objects.select_related("requester")
+
+        # Soft-deleted MRs are hidden only from the Material Request list/table.
+        # Detail endpoints and linked workflow records can still access the MR,
+        # so inventory, PO, QC, serial and audit history remain intact.
+        if is_list_action:
+            queryset = queryset.filter(is_hidden_from_mr_page=False)
 
         if not summary_mode:
             queryset = queryset.prefetch_related(
@@ -2695,23 +2719,12 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
         **kwargs,
     ):
         """
-        Permanently delete one Material Request and its complete
-        MR-linked workflow.
+        Hide one Material Request from the Material Request table.
 
-        Deleted together:
-        - MR BOM / R&D component rows
-        - InventoryReservation rows
-        - ProjectInventory rows
-        - Purchase Orders whose source_mr_number is this MR
-        - PurchaseOrderItem rows belonging to those POs
-        - Inward entries belonging to those POs
-        - Inward line items and saved QC pass/fail rows
-        - MR, Procurement, Inventory and Finance notifications
-
-        Not deleted:
-        - Direct Purchase Orders without this source_mr_number
-        - Direct Inward entries without this MR link
-        - unrelated central In-Store Inventory
+        This is a SOFT DELETE. It intentionally does not delete the MR or
+        any linked inventory/workflow data. Existing InventoryReservation,
+        ProjectInventory, PurchaseOrder, Inward, Outward, QC, serial,
+        ComponentUsage, drone and notification history remains untouched.
         """
         try:
             material_request = (
@@ -2721,270 +2734,30 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
             )
         except MaterialRequest.DoesNotExist:
             return Response(
-                {
-                    "detail": (
-                        "Material Request was not found."
-                    )
-                },
+                {"detail": "Material Request was not found."},
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        deleted_id = material_request.id
-
-        mr_number = str(
-            material_request.material_request_id
-            or ""
-        ).strip()
-
-        # ------------------------------------------------------
-        # 1. Find every PO created from this exact MR.
-        # Direct POs have no matching source_mr_number and are
-        # therefore never included.
-        # ------------------------------------------------------
-        linked_purchase_orders = list(
-            PurchaseOrder.objects
-            .select_for_update()
-            .filter(
-                source_mr_number=mr_number
-            )
-            .order_by("id")
+        material_request.is_hidden_from_mr_page = True
+        material_request.save(
+            update_fields=["is_hidden_from_mr_page"]
         )
 
-        linked_po_ids = [
-            purchase_order.id
-            for purchase_order
-            in linked_purchase_orders
-        ]
-
-        linked_po_numbers = [
-            str(
-                getattr(
-                    purchase_order,
-                    "po_number",
-                    "",
-                )
-                or purchase_order.id
-            )
-            for purchase_order
-            in linked_purchase_orders
-        ]
-
-        # ------------------------------------------------------
-        # 2. Lock all Inward records created from the MR POs.
-        # QC pass/fail rows are stored on these Inward entries.
-        # ------------------------------------------------------
-        linked_inwards = []
-
-        if linked_po_ids:
-            linked_inwards = list(
-                InwardEntry.objects
-                .select_for_update()
-                .filter(
-                    purchase_order_id__in=(
-                        linked_po_ids
-                    )
-                )
-                .order_by("id")
-            )
-
-        linked_inward_ids = [
-            inward.id
-            for inward in linked_inwards
-        ]
-
-        linked_inward_codes = [
-            str(inward.code).strip()
-            for inward in linked_inwards
-            if str(inward.code or "").strip()
-        ]
-
-        # ------------------------------------------------------
-        # 3. Delete accidental Inventory rows created by old code
-        # for an MR-linked Inward. Correct current code stores this
-        # stock only in ProjectInventory, but this cleanup prevents
-        # old test data from remaining as free In-Store stock.
-        #
-        # Inventory rows belonging to Direct Inward are unaffected,
-        # because only codes from this MR's linked Inward entries
-        # are used.
-        # ------------------------------------------------------
-        deleted_inventory_rows = 0
-
-        if linked_inward_codes:
-            deleted_inventory_rows, _ = (
-                Inventory.objects
-                .select_for_update()
-                .filter(
-                    inventory_code__in=(
-                        linked_inward_codes
-                    )
-                )
-                .delete()
-            )
-
-        # ------------------------------------------------------
-        # 4. Delete Inward records first.
-        # InwardLineItem rows are removed by their FK cascade.
-        # This also removes stored QC pass/fail JSON with the entry.
-        # ------------------------------------------------------
-        deleted_inward_rows = 0
-
-        if linked_inward_ids:
-            deleted_inward_rows, _ = (
-                InwardEntry.objects
-                .filter(
-                    id__in=linked_inward_ids
-                )
-                .delete()
-            )
-
-        # ------------------------------------------------------
-        # 5. Delete all PO-related notifications, including Finance
-        # approval notifications whose reference_id is a PO ID.
-        # ------------------------------------------------------
-        po_reference_values = [
-            str(po_id)
-            for po_id in linked_po_ids
-        ]
-
-        po_notification_filter = Q()
-
-        if po_reference_values:
-            po_notification_filter |= Q(
-                category="PO",
-                reference_id__in=(
-                    po_reference_values
-                ),
-            )
-
-        for po_number in linked_po_numbers:
-            po_notification_filter |= Q(
-                category="PO",
-                title__icontains=po_number,
-            )
-            po_notification_filter |= Q(
-                category="PO",
-                message__icontains=po_number,
-            )
-
-        if linked_po_ids:
-            Notification.objects.filter(
-                po_notification_filter
-            ).delete()
-
-        # ------------------------------------------------------
-        # 6. Delete PO items and the linked POs.
-        # Explicit item deletion works even when an older schema
-        # does not use CASCADE on PurchaseOrderItem.
-        # ------------------------------------------------------
-        deleted_po_item_rows = 0
-        deleted_po_rows = 0
-
-        if linked_po_ids:
-            deleted_po_item_rows, _ = (
-                PurchaseOrderItem.objects
-                .filter(
-                    purchase_order_id__in=(
-                        linked_po_ids
-                    )
-                )
-                .delete()
-            )
-
-            deleted_po_rows, _ = (
-                PurchaseOrder.objects
-                .filter(
-                    id__in=linked_po_ids
-                )
-                .delete()
-            )
-
-        # ------------------------------------------------------
-        # 7. Delete all notifications belonging to this MR.
-        # reference_id normally stores the MR database ID.
-        # Older records may store the public MR number instead.
-        # ------------------------------------------------------
-        mr_reference_values = [
-            str(material_request.id),
-            mr_number,
-        ]
-
-        Notification.objects.filter(
-            Q(
-                category="MR",
-                reference_id__in=(
-                    mr_reference_values
-                ),
-            )
-            | Q(
-                category="MR",
-                title__icontains=mr_number,
-            )
-            | Q(
-                category="MR",
-                message__icontains=mr_number,
-            )
-        ).delete()
-
-        # ------------------------------------------------------
-        # 8. These two models use on_delete=PROTECT, so they must
-        # be removed before deleting MaterialRequest.
-        # Removing a reservation releases undeducted physical stock
-        # because the actual Inventory quantity was not changed.
-        # ------------------------------------------------------
-        deleted_project_rows, _ = (
-            ProjectInventory.objects
-            .filter(
-                material_request=material_request
-            )
-            .delete()
-        )
-
-        deleted_reservation_rows, _ = (
-            InventoryReservation.objects
-            .filter(
-                material_request=material_request
-            )
-            .delete()
-        )
-
-        # ------------------------------------------------------
-        # 9. Delete the MaterialRequest last.
-        # BOMItem and RDItem rows are removed through CASCADE.
-        # ------------------------------------------------------
-        material_request.delete()
+        # The MR list is cached, so clear its cache after the transaction
+        # commits. Otherwise the hidden row could temporarily reappear.
+        transaction.on_commit(invalidate_material_request_cache)
 
         return Response(
             {
                 "detail": (
-                    "Material Request and complete linked "
-                    "workflow deleted successfully."
+                    "Material Request removed from the Material Request "
+                    "table successfully."
                 ),
-                "deleted_id": deleted_id,
-                "material_request_id": mr_number,
-                "deleted": {
-                    "purchase_orders": (
-                        len(linked_po_ids)
-                    ),
-                    "purchase_order_items": (
-                        deleted_po_item_rows
-                    ),
-                    "inward_entries": (
-                        len(linked_inward_ids)
-                    ),
-                    "inward_delete_rows": (
-                        deleted_inward_rows
-                    ),
-                    "project_inventory_rows": (
-                        deleted_project_rows
-                    ),
-                    "inventory_reservations": (
-                        deleted_reservation_rows
-                    ),
-                    "old_accidental_inventory_rows": (
-                        deleted_inventory_rows
-                    ),
-                },
+                "deleted_id": material_request.id,
+                "material_request_id": (
+                    material_request.material_request_id
+                ),
+                "soft_deleted": True,
             },
             status=status.HTTP_200_OK,
         )

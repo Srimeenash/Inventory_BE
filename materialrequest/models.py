@@ -13,6 +13,14 @@ def generate_material_request_id():
 
 
 class MaterialRequest(models.Model):
+    # Soft-delete flag used by the Material Request page.
+    # When True, the MR remains in the database and keeps all linked
+    # inventory/workflow history, but it is hidden from the MR table.
+    is_hidden_from_mr_page = models.BooleanField(
+        default=False,
+        db_index=True,
+    )
+
     REQUEST_TYPE_CHOICES = [
         ("BOM", "BOM"),
         ("R&D", "R&D"),
