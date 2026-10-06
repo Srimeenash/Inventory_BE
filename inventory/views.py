@@ -1303,21 +1303,20 @@ class ProjectInventoryViewSet(
                 )
             ]
 
-            component_po_ids = {
-                purchase_order.id
-                for purchase_order
-                in component_purchase_orders
-            }
-
+            # NOTE:
+            # `inwards` is already restricted to Purchase Orders belonging
+            # to this Material Request. For Retail Sales, some historical PO
+            # line data may not carry the same component link even though the
+            # InwardEntry itself has the correct component.
+            #
+            # Therefore the authoritative QC source is InwardEntry.component.
+            # Requiring POItem.component as an additional join can incorrectly
+            # make QC Ready = 0.
             component_inwards = [
                 inward
                 for inward in inwards
-                if (
-                    str(inward.component_id)
-                    == str(component_id)
-                    and inward.purchase_order_id
-                    in component_po_ids
-                )
+                if str(inward.component_id)
+                == str(component_id)
             ]
 
             qc_passed_quantity = sum(
@@ -1933,6 +1932,66 @@ class ProjectInventoryViewSet(
 
         return Response(
             data,
+            status=status.HTTP_200_OK,
+        )
+
+
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="refresh-mr",
+    )
+    @transaction.atomic
+    def refresh_material_request(self, request):
+        """
+        Recalculate ProjectInventory for one MR from the authoritative
+        reservation + Inward QC data without issuing any stock.
+
+        This endpoint is intentionally refresh-only. It is used by the
+        Inventory Notifications "Provide Components" popup so old/stale
+        Retail Sales ProjectInventory rows are repaired before quantities
+        and serials are displayed.
+        """
+        reference = (
+            request.data.get("material_request_id")
+            or request.data.get("source_mr_number")
+            or request.data.get("reference_id")
+            or request.data.get("mr_id")
+        )
+
+        material_request = self.resolve_material_request(
+            reference,
+            lock=True,
+        )
+
+        if not material_request:
+            return Response(
+                {"detail": "Material Request was not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        project_rows = self.synchronize_project_rows(
+            material_request
+        )
+
+        serializer = self.get_serializer(
+            project_rows,
+            many=True,
+            context={
+                **self.get_serializer_context(),
+                "include_store_serials": True,
+            },
+        )
+
+        return Response(
+            {
+                "material_request_id":
+                    material_request.material_request_id,
+                "mr_status":
+                    material_request.status,
+                "project_inventory":
+                    serializer.data,
+            },
             status=status.HTTP_200_OK,
         )
 

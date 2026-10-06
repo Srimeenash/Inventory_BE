@@ -1752,8 +1752,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             "RETAIL_SALES",
             "RETURNABLE",
         }:
-            # Retail Sales and Returnable components are stored in
-            # MaterialRequest.request_items, not bom_items.
+            # Retail Sales / Returnable component rows live in request_items.
             manager = getattr(
                 material_request,
                 "request_items",
