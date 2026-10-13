@@ -13,6 +13,7 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework_simplejwt.authentication import JWTAuthentication
 
 from inventory_backend.cache_utils import (
     build_list_cache_key,
@@ -95,7 +96,13 @@ class InventoryViewSet(viewsets.ModelViewSet):
     serializer_class = InventorySerializer
     pagination_class = OptionalPageNumberPagination
 
-    @action(detail=True, methods=["patch"], url_path="location", permission_classes=[IsAuthenticated])
+    @action(
+        detail=True,
+        methods=["patch"],
+        url_path="location",
+        authentication_classes=[JWTAuthentication],
+        permission_classes=[IsAuthenticated],
+    )
     @transaction.atomic
     def location(self, request, pk=None):
         user = request.user

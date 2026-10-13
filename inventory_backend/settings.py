@@ -231,7 +231,7 @@ DATABASES = {
         ),
         "NAME": os.environ.get(
             "DATABASE_NAME",
-            "ipms_db1",
+            "ipms_db3",
         ),
         "USER": os.environ.get(
             "DATABASE_USER",

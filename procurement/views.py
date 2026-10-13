@@ -4580,6 +4580,26 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         and recalculate the linked MR component progress.
         """
 
+        # Ordering or recording delivery is PO work, not a Finance/Manager
+        # approval. Enforce the active JWT role for these transitions.
+        requested_status = str(
+            serializer.validated_data.get("status") or ""
+        ).strip().upper()
+        previous_status = str(
+            serializer.instance.status or ""
+        ).strip().upper()
+        if (
+            requested_status in {
+                "ORDERED",
+                "PARTIALLY_DELIVERED",
+                "DELIVERED",
+            }
+            and requested_status != previous_status
+        ):
+            self.require_active_role(
+                self.request, "procurement", "inventory", "admin"
+            )
+
         old_approval_status = str(
             serializer.instance.approval_status
             or ""
@@ -5182,13 +5202,14 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
     @transaction.atomic
     def replacement_procurement_approve(self, request, pk=None):
         """
-        Procurement approves a newly raised QC Replacement PO.
+        Procurement or Inventory approves a newly raised QC Replacement PO.
 
         No Manager/Finance email or notification is created here.
         """
         self.require_active_role(
             request,
             "procurement",
+            "inventory",
             "admin",
         )
 
@@ -5538,7 +5559,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
     )
     @transaction.atomic
     def replacement_mark_ordered(self, request, pk=None):
-        self.require_active_role(request, "procurement", "admin")
+        self.require_active_role(request, "procurement", "inventory", "admin")
 
         purchase_order, error_response = (
             self.get_replacement_po_or_error(pk)
@@ -5633,6 +5654,8 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         For an MR-based PO, the linked Material Request is then
         recalculated across every PO belonging to the same MR.
         """
+
+        self.require_active_role(request, "procurement", "inventory", "admin")
 
         try:
             purchase_order = (
