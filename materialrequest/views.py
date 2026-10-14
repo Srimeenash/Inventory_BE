@@ -1,4 +1,5 @@
 from collections import defaultdict
+from copy import deepcopy
 from datetime import timedelta
 import re
 
@@ -21,8 +22,6 @@ from inventory_backend.cache_utils import (
     invalidate_cache_version,
 )
 from inventory_backend.pagination import OptionalPageNumberPagination
-
-from componentusage.models import ComponentUsage
 
 from inventory.models import (
     Inventory,
@@ -77,7 +76,8 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
     Inventory team provides the component.
 
     List endpoint supports summary mode, optional pagination, search,
-    filtering, ordering, and hiding completed MRs reused as DRONE sources.
+    filtering, and ordering. Source MRs and all generated reorder MRs remain
+    visible as separate history rows unless a user explicitly removes one.
     """
 
     authentication_classes = [JWTAuthentication]
@@ -173,6 +173,75 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
 
         return f"{prefix}{next_sequence:05d}"
 
+    @staticmethod
+    def apply_inventory_pending_display_status(payload):
+        """Show Inventory Pending while an In-Store reservation is unissued.
+
+        Older workflow records can have a final status even though an
+        InventoryReservation still has quantity waiting for the store team.
+        This corrects the MR list response only; it does not mutate the MR on
+        a read request. The workflow action updates the stored status later.
+        """
+        if isinstance(payload, dict):
+            rows = payload.get("results")
+        elif isinstance(payload, list):
+            rows = payload
+        else:
+            rows = None
+
+        if not isinstance(rows, list):
+            return payload
+
+        candidate_ids = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+
+            row_status = str(row.get("status") or "").strip().upper()
+            if row_status in {"MANAGER_REJECTED", "REJECTED"}:
+                continue
+
+            try:
+                candidate_ids.add(int(row.get("id")))
+            except (TypeError, ValueError):
+                continue
+
+        if not candidate_ids:
+            return payload
+
+        pending_request_ids = set()
+        reservations = (
+            InventoryReservation.objects
+            .filter(material_request_id__in=candidate_ids)
+            .only(
+                "material_request_id",
+                "reserved_store_quantity",
+                "issued_store_quantity",
+                "status",
+            )
+        )
+
+        for reservation in reservations:
+            if reservation.status in {"RELEASED", "CANCELLED"}:
+                continue
+            if reservation.remaining_reserved_quantity > 0:
+                pending_request_ids.add(reservation.material_request_id)
+
+        if not pending_request_ids:
+            return payload
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                request_id = int(row.get("id"))
+            except (TypeError, ValueError):
+                continue
+            if request_id in pending_request_ids:
+                row["status"] = "INVENTORY_PENDING"
+
+        return payload
+
     def list(self, request, *args, **kwargs):
         version = get_material_request_cache_version()
         cache_key = None
@@ -188,19 +257,30 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
             except Exception:
                 cached_data = None
             if cached_data is not None:
-                return Response(cached_data)
+                display_data = self.apply_inventory_pending_display_status(
+                    deepcopy(cached_data)
+                )
+                return Response(display_data)
 
         response = super().list(request, *args, **kwargs)
+        if response.status_code == 200:
+            # Cache the unmodified serializer response. The display correction
+            # is recalculated from current reservations on every list request.
+            raw_data = deepcopy(response.data)
+            display_data = self.apply_inventory_pending_display_status(
+                deepcopy(raw_data)
+            )
+            response.data = display_data
 
-        if cache_key and response.status_code == 200:
-            try:
-                cache.set(
-                    cache_key,
-                    response.data,
-                    timeout=MATERIAL_REQUEST_LIST_CACHE_TTL_SECONDS,
-                )
-            except Exception:
-                pass
+            if cache_key:
+                try:
+                    cache.set(
+                        cache_key,
+                        raw_data,
+                        timeout=MATERIAL_REQUEST_LIST_CACHE_TTL_SECONDS,
+                    )
+                except Exception:
+                    pass
 
         return response
 
@@ -261,26 +341,6 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
 
         if not is_list_action:
             return queryset
-
-        if self._query_flag(
-            request.query_params.get("hide_drone_returnable_source")
-        ):
-            drone_source_ids = (
-                ComponentUsage.objects
-                .filter(
-                    material_request_id__isnull=False,
-                    purpose__in=[
-                        "FLIGHT_TEST",
-                        "CUSTOMER_DEMO",
-                        "EVENT",
-                    ],
-                )
-                .exclude(
-                    material_request__request_type__iexact="RETURNABLE"
-                )
-                .values_list("material_request_id", flat=True)
-            )
-            queryset = queryset.exclude(id__in=drone_source_ids)
 
         search_value = str(
             request.query_params.get("search", "") or ""
@@ -2053,17 +2113,37 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
         #   reserved partially from In Store
         #   AND short for Procurement.
         # ----------------------------------------------------------
-        store_allocations = [
-            item
+        allocation_by_component = {
+            str(item.get("component_id")): item
             for item in allocations
-            if int(
-                item.get(
-                    "reserved_store_quantity",
-                    0,
-                )
-                or 0
-            ) > 0
-        ]
+        }
+        store_allocations = []
+        reservations = (
+            InventoryReservation.objects
+            .filter(material_request=material_request)
+            .order_by("id")
+        )
+
+        for reservation in reservations:
+            if reservation.status in {"RELEASED", "CANCELLED"}:
+                continue
+
+            remaining_to_issue = max(
+                int(reservation.reserved_store_quantity or 0)
+                - int(reservation.issued_store_quantity or 0),
+                0,
+            )
+            if remaining_to_issue <= 0:
+                continue
+
+            allocation = allocation_by_component.get(
+                str(reservation.component_id)
+            )
+            if allocation is not None:
+                store_allocations.append({
+                    **allocation,
+                    "reserved_store_quantity": remaining_to_issue,
+                })
 
         # ----------------------------------------------------------
         # A From-Scrap rebuild is complete only when the FULL source
@@ -2082,20 +2162,30 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
             .order_by("id")
         )
 
-        all_fulfilled = bool(
-            project_rows
-        ) and all(
-            row.is_fulfilled
-            for row in project_rows
+        inventory_pending = bool(store_allocations)
+        all_fulfilled = (
+            bool(project_rows)
+            and all(
+                row.is_fulfilled
+                for row in project_rows
+            )
+            and not inventory_pending
+            and not shortages
         )
 
-        if all_fulfilled:
+        # An open In-Store issue takes precedence in the single MR status.
+        # Procurement work remains separately tracked by its notification.
+        if inventory_pending:
             material_request.status = (
-                "INVENTORY_ISSUED"
+                "INVENTORY_PENDING"
             )
         elif shortages:
             material_request.status = (
                 "PROCUREMENT_PENDING"
+            )
+        elif all_fulfilled:
+            material_request.status = (
+                "INVENTORY_ISSUED"
             )
         else:
             material_request.status = (
@@ -2116,10 +2206,7 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
         # also required. Inventory must be able to issue the reserved
         # quantity immediately.
         # ----------------------------------------------------------
-        if (
-            not all_fulfilled
-            and store_allocations
-        ):
+        if inventory_pending:
             allocation_text = "; ".join(
                 (
                     f"{item['component_code']} "

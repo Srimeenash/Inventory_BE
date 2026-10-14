@@ -1,11 +1,13 @@
 from uuid import uuid4
 from decimal import Decimal
+import re
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models import Max, Q
 from django.utils import timezone
+from django.utils.dateparse import parse_date
 
 from django.core.cache import cache
 from rest_framework import status, viewsets
@@ -29,8 +31,10 @@ from inventory.models import (
     InventoryReservation,
     ProjectInventory,
 )
+from components.models import Component
 from materialrequest.models import MaterialRequest, BOMItem, RDItem, RequestItem
 from procurement.models import PurchaseOrder, PurchaseOrderApproval, PurchaseOrderItem
+from vendors.models import Vendor
 from notifications.email_service import send_ipms_email
 from notifications.models import Notification
 
@@ -4463,19 +4467,57 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
             )
 
     @staticmethod
-    def generate_restore_po_number():
-        """Generate the same NN/YY-YY PO format used by the frontend."""
+    def generate_restore_po_number(source_mr_number=""):
+        """Generate the regular financial-year PO number used by the app."""
         today = timezone.localdate()
         start_year = today.year if today.month >= 4 else today.year - 1
         fy = f"{str(start_year)[-2:]}-{str(start_year + 1)[-2:]}"
-        highest = 0
-        for value in PurchaseOrder.objects.filter(po_number__endswith=f"/{fy}").values_list("po_number", flat=True):
-            try:
-                prefix = str(value).split("/", 1)[0]
-                highest = max(highest, int(prefix))
-            except (TypeError, ValueError):
-                continue
-        return f"{highest + 1:02d}/{fy}"
+        existing_rows = list(
+            PurchaseOrder.objects.values_list("po_number", "source_mr_number")
+        )
+        existing_numbers = {str(number or "").strip() for number, _ in existing_rows}
+
+        # Keep POs for the same MR in one numbered batch, matching the normal
+        # format (for example, 03/26-27_01, 03/26-27_02).
+        same_mr_numbers = [
+            str(number or "").strip()
+            for number, mr_number in existing_rows
+            if str(mr_number or "").strip() == str(source_mr_number or "").strip()
+        ]
+        same_mr_matches = [
+            match
+            for number in same_mr_numbers
+            if (match := re.fullmatch(rf"(\d+)/{re.escape(fy)}_(\d{{2}})", number))
+        ]
+        if same_mr_matches:
+            batch = max(same_mr_matches, key=lambda match: int(match.group(2))).group(1)
+            suffix = max(int(match.group(2)) for match in same_mr_matches) + 1
+        else:
+            highest_batch = 0
+            has_suffixed_batch = False
+            legacy_batches = set()
+            for number in existing_numbers:
+                match = re.fullmatch(r"(\d+)/(\d{2}-\d{2})(?:_(\d{2}))?", number)
+                if match and match.group(2) == fy:
+                    highest_batch = max(highest_batch, int(match.group(1)))
+                    has_suffixed_batch = has_suffixed_batch or bool(match.group(3))
+                    continue
+                legacy = re.fullmatch(r"PO-(\d+)-\d{2}", number)
+                if legacy:
+                    legacy_batches.add(legacy.group(1))
+            next_batch = (
+                highest_batch + 1
+                if has_suffixed_batch
+                else highest_batch + len(legacy_batches) + 1
+            )
+            batch = f"{next_batch:02d}"
+            suffix = 1
+
+        candidate = f"{int(batch):02d}/{fy}_{suffix:02d}"
+        while candidate in existing_numbers:
+            suffix += 1
+            candidate = f"{int(batch):02d}/{fy}_{suffix:02d}"
+        return candidate
 
     @staticmethod
     def normalize_serials(values):
@@ -8175,8 +8217,9 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
                 ),
                 "message": (
                     "Returned component failed Inventory QC. "
-                    "Approve Restore to automatically raise replacement "
-                    "PO only for the failed quantity. "
+                    "Procurement must enter the vendor, requested date, "
+                    "expected delivery date, unit price, and GST for the "
+                    "failed quantity, then submit the Restore PO to Finance. "
                     f"{failed_summary}"
                 ),
                 "status":
@@ -8271,54 +8314,15 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
         request,
         pk=None,
     ):
-        """
-        Procurement approval for a Returnable Restore request.
+        """Create a Restore PO from Procurement-entered vendor and pricing."""
+        user = getattr(request, "user", None)
+        if not user or not getattr(user, "is_authenticated", False):
+            raise PermissionDenied("Authentication is required.")
 
-        Procurement DOES NOT manually re-enter vendor/component/quantity.
-
-        The backend resolves the original PO line for every failed component
-        and creates replacement PO(s) with:
-            - same original vendor
-            - same failed component
-            - failed quantity only
-            - same source Returnable MR
-            - REPLACEMENT_PENDING_FINANCE
-
-        Finance is the next approval stage.
-        """
-        user = getattr(
-            request,
-            "user",
-            None,
-        )
-
+        active_role = self.get_active_role(request)
         if (
-            not user
-            or not getattr(
-                user,
-                "is_authenticated",
-                False,
-            )
-        ):
-            raise PermissionDenied(
-                "Authentication is required."
-            )
-
-        active_role = self.get_active_role(
-            request
-        )
-
-        if (
-            active_role
-            not in {
-                "procurement",
-                "admin",
-            }
-            and not getattr(
-                user,
-                "is_superuser",
-                False,
-            )
+            active_role not in {"procurement", "admin"}
+            and not getattr(user, "is_superuser", False)
         ):
             raise PermissionDenied(
                 "Only Procurement can approve a Returnable Restore request."
@@ -8329,733 +8333,423 @@ class OutwardEntryViewSet(viewsets.ModelViewSet):
             .select_for_update()
             .get(pk=pk)
         )
-
         metadata = (
             instance.inventory_allocations
-            if isinstance(
-                instance.inventory_allocations,
-                dict,
-            )
+            if isinstance(instance.inventory_allocations, dict)
             else {}
         )
 
-        restore_workflow = str(
-            metadata.get("workflow") or ""
-        ).strip().upper()
-
-        if restore_workflow not in {
+        workflow = str(metadata.get("workflow") or "").strip().upper()
+        if workflow not in {
             "RETURNABLE_COMPONENT_QC_V1",
             "RETURNABLE_DRONE_QC_V1",
         }:
-            raise ValidationError(
-                {
-                    "detail": (
-                        "Restore/Reorder PO is available only for failed "
-                        "Returnable component or drone QC records."
-                    )
-                }
-            )
+            raise ValidationError({
+                "detail": (
+                    "Restore is available only for failed Returnable component "
+                    "or drone QC records."
+                )
+            })
 
         restore_status = str(
-            metadata.get(
-                "procurement_restore_status"
-            )
-            or ""
+            metadata.get("procurement_restore_status") or ""
         ).strip().upper()
 
-        if metadata.get(
-            "restore_po_ids"
-        ) or metadata.get(
-            "restore_po_id"
-        ):
+        if metadata.get("restore_po_ids") or metadata.get("restore_po_id"):
             return Response(
                 {
-                    "detail":
-                        "Restore Purchase Order already exists.",
-                    "purchase_order_ids":
-                        metadata.get(
-                            "restore_po_ids"
-                        )
-                        or [
-                            metadata.get(
-                                "restore_po_id"
-                            )
-                        ],
-                    "po_numbers":
-                        metadata.get(
-                            "restore_po_numbers"
-                        )
-                        or [
-                            metadata.get(
-                                "restore_po_number"
-                            )
-                        ],
-                    "status":
-                        restore_status,
+                    "detail": "Restore Purchase Order already exists.",
+                    "purchase_order_ids": (
+                        metadata.get("restore_po_ids")
+                        or [metadata.get("restore_po_id")]
+                    ),
+                    "po_numbers": (
+                        metadata.get("restore_po_numbers")
+                        or [metadata.get("restore_po_number")]
+                    ),
+                    "status": restore_status,
                 },
                 status=status.HTTP_200_OK,
             )
 
-        if (
-            restore_status
-            != "PENDING_PROCUREMENT"
-        ):
-            raise ValidationError(
-                {
-                    "detail": (
-                        "This Restore request is not pending Procurement approval. "
-                        f"Current state: {restore_status or 'UNKNOWN'}."
-                    )
-                }
-            )
-
-        original_source_mr_number = str(
-            metadata.get("source_mr_number") or ""
-        ).strip()
+        if restore_status != "PENDING_PROCUREMENT":
+            raise ValidationError({
+                "detail": (
+                    "This Restore request is not pending Procurement approval. "
+                    f"Current state: {restore_status or 'UNKNOWN'}."
+                )
+            })
 
         source_mr_number = str(
             metadata.get("replacement_mr_number")
-            or original_source_mr_number
+            or metadata.get("source_mr_number")
             or ""
         ).strip()
-
+        original_source_mr_number = str(
+            metadata.get("source_mr_number") or ""
+        ).strip()
         if not original_source_mr_number:
-            raise ValidationError(
-                {
-                    "detail":
-                        "Source Returnable Material Request is missing."
-                }
-            )
+            raise ValidationError({
+                "detail": "Source Returnable Material Request is missing."
+            })
 
         failed_items = (
-            metadata.get(
-                "scrap_items",
-                [],
-            )
-            or metadata.get(
-                "failed_items",
-                [],
-            )
+            metadata.get("scrap_items")
+            or metadata.get("failed_items")
             or []
         )
-
         if not failed_items:
-            raise ValidationError(
-                {
-                    "detail":
-                        "No failed component quantities are available for Restore."
-                }
-            )
+            raise ValidationError({
+                "detail": "No failed component quantities are available for Restore."
+            })
 
-        # Resolve the exact original PO line for every failed component.
-        grouped_by_root_po = {}
+        try:
+            vendor_id = int(request.data.get("vendor_id"))
+        except (TypeError, ValueError):
+            vendor_id = None
+        vendor = (
+            Vendor.objects.filter(pk=vendor_id, is_active=True).first()
+            if vendor_id
+            else None
+        )
+        if vendor is None:
+            raise ValidationError({
+                "vendor_id": "Select an active vendor."
+            })
 
+        requested_date = parse_date(
+            str(request.data.get("requested_date") or "").strip()
+        )
+        expected_delivery_date = parse_date(
+            str(request.data.get("expected_delivery_date") or "").strip()
+        )
+        if requested_date is None:
+            raise ValidationError({
+                "requested_date": "Enter a valid requested date."
+            })
+        if expected_delivery_date is None:
+            raise ValidationError({
+                "expected_delivery_date": "Enter a valid expected delivery date."
+            })
+        if expected_delivery_date < requested_date:
+            raise ValidationError({
+                "expected_delivery_date": (
+                    "Expected delivery date must be on or after the requested date."
+                )
+            })
+
+        try:
+            round_off = Decimal(str(request.data.get("round_off", "0") or "0"))
+        except (TypeError, ValueError, ArithmeticError):
+            raise ValidationError({"round_off": "Enter a valid round-off amount."})
+        if not round_off.is_finite() or abs(round_off) > Decimal("9999999999.99"):
+            raise ValidationError({"round_off": "Round-off must be a finite amount."})
+        round_off = round_off.quantize(Decimal("0.01"))
+
+        failed_by_component = {}
         for failed in failed_items:
-            if not isinstance(
-                failed,
-                dict,
-            ):
+            if not isinstance(failed, dict):
                 continue
-
-            component_id = (
-                failed.get(
-                    "component_id"
-                )
-                or failed.get(
-                    "component"
-                )
-            )
-
+            component_pk = failed.get("component") or failed.get("component_id")
             quantity = max(
                 int(
-                    failed.get(
-                        "quantity"
-                    )
-                    or len(
-                        failed.get(
-                            "serial_numbers"
-                        )
-                        or []
-                    )
+                    failed.get("quantity")
+                    or len(failed.get("serial_numbers") or [])
                     or 0
                 ),
                 0,
             )
+            if component_pk and quantity > 0:
+                key = str(component_pk).strip()
+                failed_by_component[key] = (
+                    failed_by_component.get(key, 0) + quantity
+                )
 
-            if (
-                not component_id
-                or quantity <= 0
-            ):
+        submitted_items = request.data.get("items")
+        if not isinstance(submitted_items, list) or not submitted_items:
+            raise ValidationError({
+                "items": "Enter a unit price and GST rate for each failed component."
+            })
+
+        priced_items = {}
+        for submitted in submitted_items:
+            if not isinstance(submitted, dict):
                 continue
 
-            source_item = (
-                PurchaseOrderItem.objects
-                .select_for_update()
-                .select_related(
-                    "purchase_order"
+            component_pk = str(
+                submitted.get("component_id")
+                or submitted.get("component")
+                or ""
+            ).strip()
+            if not component_pk or component_pk in priced_items:
+                raise ValidationError({
+                    "items": "Each failed component must appear exactly once."
+                })
+            if component_pk not in failed_by_component:
+                raise ValidationError({
+                    "items": "Submitted component does not match the QC-failed components."
+                })
+
+            try:
+                quantity = int(submitted.get("quantity"))
+                unit_price = Decimal(str(submitted.get("unit_price")))
+                gst_percentage = Decimal(str(submitted.get("gst_percentage")))
+                discount = Decimal(str(submitted.get("discount") or "0"))
+                freight_cost = Decimal(str(submitted.get("freight_cost") or "0"))
+                freight_gst_percentage = Decimal(
+                    str(submitted.get("freight_gst_percentage") or "0")
                 )
-                .filter(
-                    purchase_order__source_mr_number=
-                        original_source_mr_number,
-                    component_id=
-                        component_id,
-                )
-                .exclude(
-                    purchase_order__status__in=[
-                        "DRAFT",
-                        "REJECTED",
-                        "FINANCE_REJECTED",
-                        "REPLACEMENT_MANAGER_REJECTED",
-                        "REPLACEMENT_FINANCE_REJECTED",
-                    ]
-                )
-                .order_by(
-                    "-purchase_order_id",
-                    "-id",
-                )
-                .first()
-            )
+            except (TypeError, ValueError, ArithmeticError):
+                raise ValidationError({
+                    "items": "Enter valid quantity and pricing values for every component."
+                })
 
-            if source_item is None:
-                # Returned components may originally have been fulfilled from
-                # Central In Store rather than purchased specifically for this
-                # Returnable MR.
-                #
-                # Recover source lineage from the exact returned serial.
-                # Inventory rows retain issued_serial_numbers plus the
-                # original purchase_order text.
-                failed_serials = (
-                    self.normalize_serials(
-                        failed.get(
-                            "serial_numbers"
-                        )
-                        or []
-                    )
-                )
+            if not all(value.is_finite() for value in (
+                unit_price,
+                gst_percentage,
+                discount,
+                freight_cost,
+                freight_gst_percentage,
+            )):
+                raise ValidationError({
+                    "items": "Pricing values must be finite numbers."
+                })
+            if quantity != failed_by_component[component_pk]:
+                raise ValidationError({
+                    "items": "PO quantity must equal the QC-failed quantity."
+                })
+            if unit_price <= 0:
+                raise ValidationError({
+                    "items": "Unit price must be greater than zero."
+                })
+            if unit_price > Decimal("9999999999.99"):
+                raise ValidationError({
+                    "items": "Unit price is too large."
+                })
+            if gst_percentage < 0 or gst_percentage > 100:
+                raise ValidationError({
+                    "items": "GST percentage must be between 0 and 100."
+                })
+            if discount < 0:
+                raise ValidationError({"items": "Discount cannot be negative."})
+            if discount > Decimal(quantity) * unit_price:
+                raise ValidationError({
+                    "items": "Discount cannot exceed the component line amount."
+                })
+            if freight_cost < 0:
+                raise ValidationError({"items": "Freight cost cannot be negative."})
+            if freight_gst_percentage < 0 or freight_gst_percentage > 100:
+                raise ValidationError({
+                    "items": "Freight GST percentage must be between 0 and 100."
+                })
+            try:
+                component_db_id = int(component_pk)
+            except (TypeError, ValueError):
+                raise ValidationError({
+                    "items": "A failed component has an invalid component ID."
+                })
 
-                source_inventory_row = None
+            priced_items[component_pk] = {
+                "component_id": component_db_id,
+                "quantity": quantity,
+                "unit_price": unit_price.quantize(Decimal("0.01")),
+                "gst_percentage": gst_percentage.quantize(Decimal("0.01")),
+                "discount": discount.quantize(Decimal("0.01")),
+                "freight_cost": freight_cost.quantize(Decimal("0.01")),
+                "freight_gst_percentage": freight_gst_percentage.quantize(Decimal("0.01")),
+                "uom": str(submitted.get("uom") or "").strip()[:100],
+            }
 
-                if failed_serials:
-                    inventory_candidates = (
-                        Inventory.objects
-                        .select_for_update()
-                        .filter(
-                            component_id=
-                                component_id,
-                        )
-                        .order_by(
-                            "-id"
-                        )
-                    )
+        if set(priced_items) != set(failed_by_component):
+            raise ValidationError({
+                "items": "Enter price and GST for every failed component."
+            })
 
-                    failed_serial_set = set(
-                        failed_serials
-                    )
+        actor = self.get_actor_name(user)
+        address = str(getattr(vendor, "address", "") or "").strip()
+        location_parts = [
+            address,
+            str(getattr(vendor, "city", "") or "").strip(),
+            str(getattr(vendor, "state", "") or "").strip(),
+            str(getattr(vendor, "pincode", "") or "").strip(),
+        ]
+        vendor_location = ", ".join(part for part in location_parts if part)
 
-                    for inventory_row in (
-                        inventory_candidates
-                    ):
-                        issued_serials = (
-                            self.normalize_serials(
-                                getattr(
-                                    inventory_row,
-                                    "issued_serial_numbers",
-                                    [],
-                                )
-                                or []
-                            )
-                        )
+        # The PO is created as a Finance-pending replacement request. Finance
+        # approves it first; the existing PO screen then exposes Mark as Ordered.
+        replacement_round = 1
+        po_number = self.generate_restore_po_number(source_mr_number)
 
-                        current_serials = (
-                            self.normalize_serials(
-                                getattr(
-                                    inventory_row,
-                                    "serial_numbers",
-                                    [],
-                                )
-                                or []
-                            )
-                        )
-
-                        if failed_serial_set.intersection(
-                            set(
-                                issued_serials
-                                + current_serials
-                            )
-                        ):
-                            source_inventory_row = (
-                                inventory_row
-                            )
-                            break
-
-                if (
-                    source_inventory_row
-                    is not None
-                ):
-                    inventory_po_number = str(
-                        getattr(
-                            source_inventory_row,
-                            "purchase_order",
-                            "",
-                        )
-                        or ""
-                    ).strip()
-
-                    if inventory_po_number:
-                        source_item = (
-                            PurchaseOrderItem.objects
-                            .select_for_update()
-                            .select_related(
-                                "purchase_order"
-                            )
-                            .filter(
-                                purchase_order__po_number=
-                                    inventory_po_number,
-                                component_id=
-                                    component_id,
-                            )
-                            .order_by(
-                                "-purchase_order_id",
-                                "-id",
-                            )
-                            .first()
-                        )
-
-            if source_item is None:
-                raise ValidationError(
-                    {
-                        "detail": (
-                            "The original vendor/PO could not be automatically "
-                            "resolved for failed component "
-                            f"{failed.get('component_name') or failed.get('label') or component_id}. "
-                            "The exact returned serial must remain traceable to "
-                            "its source Inventory / Purchase Order before Restore "
-                            "can automatically create a same-vendor PO."
-                        )
-                    }
-                )
-
-            immediate_po = (
-                source_item.purchase_order
-            )
-
-            root_po = (
-                immediate_po.replacement_for
-                if (
-                    str(
-                        getattr(
-                            immediate_po,
-                            "order_type",
-                            "STANDARD",
-                        )
-                        or "STANDARD"
-                    )
-                    .strip()
-                    .upper()
-                    == "REPLACEMENT"
-                    and immediate_po
-                    .replacement_for_id
-                )
-                else immediate_po
-            )
-
-            group = (
-                grouped_by_root_po
-                .setdefault(
-                    root_po.pk,
-                    {
-                        "root_po":
-                            root_po,
-                        "immediate_po":
-                            immediate_po,
-                        "items":
-                            [],
-                    },
-                )
-            )
-
-            group["items"].append(
-                {
-                    "component_id":
-                        component_id,
-                    "quantity":
-                        quantity,
-                    "unit_price":
-                        source_item.unit_price,
-                    "gst_percentage":
-                        source_item
-                        .gst_percentage,
-                    "expected_delivery_date":
-                        (
-                            source_item
-                            .expected_delivery_date
-                            or immediate_po
-                            .expected_delivery_date
-                        ),
-                }
-            )
-
-        if not grouped_by_root_po:
-            raise ValidationError(
-                {
-                    "detail":
-                        "No valid failed components were available for Restore."
-                }
-            )
-
-        actor = self.get_actor_name(
-            user
+        po = PurchaseOrder.objects.create(
+            po_number=po_number,
+            vendor_name=vendor.name,
+            gstin=str(
+                getattr(vendor, "gst_number", "")
+                or getattr(vendor, "gstin", "")
+                or ""
+            )[:30],
+            location=vendor_location[:255],
+            ordered_date=None,
+            expected_delivery_date=expected_delivery_date,
+            round_off=round_off,
+            remarks=(
+                "RETURNABLE_RESTORE "
+                f"RETURNABLE_RESTORE_OUTWARD:{instance.pk}; "
+                f"Requested date: {requested_date.isoformat()}; "
+                f"Source Returnable MR: {original_source_mr_number}; "
+                f"Restore Outward: {instance.code}."
+            ),
+            finance_remarks=None,
+            status="REPLACEMENT_PENDING_FINANCE",
+            approval_status="REPLACEMENT_PENDING_FINANCE",
+            source_mr_number=source_mr_number or original_source_mr_number,
+            order_type="REPLACEMENT",
+            replacement_for=None,
+            replacement_round=replacement_round,
+            replacement_source_inward_id=None,
         )
 
-        created_pos = []
-
-        for group in (
-            grouped_by_root_po.values()
-        ):
-            root_po = group[
-                "root_po"
-            ]
-
-            immediate_po = group[
-                "immediate_po"
-            ]
-
-            last_round = (
-                PurchaseOrder.objects
-                .filter(
-                    replacement_for=
-                        root_po,
-                    order_type=
-                        "REPLACEMENT",
-                )
-                .aggregate(
-                    max_round=Max(
-                        "replacement_round"
-                    )
-                )
-                .get(
-                    "max_round"
-                )
-                or 0
-            )
-
-            replacement_round = (
-                int(last_round)
-                + 1
-            )
-
-            po_number = (
-                f"{root_po.po_number}"
-                f"-R{replacement_round}"
-            )
-
-            while (
-                PurchaseOrder.objects
-                .filter(
-                    po_number=po_number
-                )
-                .exists()
-            ):
-                replacement_round += 1
-
-                po_number = (
-                    f"{root_po.po_number}"
-                    f"-R{replacement_round}"
-                )
-
-            expected_dates = [
-                item.get(
-                    "expected_delivery_date"
-                )
-                for item in group[
-                    "items"
-                ]
-                if item.get(
-                    "expected_delivery_date"
-                )
-            ]
-
-            po_expected = (
-                max(expected_dates)
-                if expected_dates
-                else None
-            )
-
-            po = (
-                PurchaseOrder.objects
-                .create(
-                    po_number=
-                        po_number,
-                    vendor_name=
-                        immediate_po
-                        .vendor_name,
-                    gstin=
-                        immediate_po
-                        .gstin,
-                    location=
-                        immediate_po
-                        .location,
-                    ordered_date=
-                        None,
-                    expected_delivery_date=
-                        po_expected,
-                    remarks=(
-                        "RETURNABLE_RESTORE "
-                        f"RETURNABLE_RESTORE_OUTWARD:{instance.pk}; "
-                        f"Source Returnable MR: {original_source_mr_number}; "
-                        f"Reorder MR: {source_mr_number}; "
-                        f"Failed-QC Outward: {instance.code}."
-                    ),
-                    finance_remarks=
-                        None,
-                    status=
-                        "REPLACEMENT_PENDING_FINANCE",
-                    approval_status=
-                        "REPLACEMENT_PENDING_FINANCE",
-                    source_mr_number=
-                        source_mr_number,
-                    order_type=
-                        "REPLACEMENT",
-                    replacement_for=
-                        root_po,
-                    replacement_round=
-                        replacement_round,
-                    replacement_source_inward_id=
-                        None,
-                )
-            )
-
-            for item in group[
-                "items"
-            ]:
-                PurchaseOrderItem.objects.create(
-                    purchase_order=
-                        po,
-                    component_id=
-                        item[
-                            "component_id"
-                        ],
-                    quantity=
-                        item[
-                            "quantity"
-                        ],
-                    received_quantity=
-                        0,
-                    unit_price=
-                        item[
-                            "unit_price"
-                        ],
-                    gst_percentage=
-                        item[
-                            "gst_percentage"
-                        ],
-                    expected_delivery_date=
-                        item[
-                            "expected_delivery_date"
-                        ],
-                )
-
-            PurchaseOrderApproval.objects.create(
+        for item in priced_items.values():
+            component_uom = item["uom"]
+            if not component_uom:
+                component_uom = str(
+                    Component.objects.filter(pk=item["component_id"])
+                    .values_list("unit_of_measurements", flat=True)
+                    .first()
+                    or ""
+                ).strip()[:100]
+            PurchaseOrderItem.objects.create(
                 purchase_order=po,
-                action=
-                    "REPLACEMENT_REQUESTED",
-                requested_by=
-                    actor,
-                approved_by=
-                    actor,
+                component_id=item["component_id"],
+                quantity=item["quantity"],
+                received_quantity=0,
+                unit_price=item["unit_price"],
+                discount=item["discount"],
+                gst_percentage=item["gst_percentage"],
+                freight_cost=item["freight_cost"],
+                freight_gst_percentage=item["freight_gst_percentage"],
+                uom=component_uom,
+                expected_delivery_date=expected_delivery_date,
             )
 
-            Notification.objects.update_or_create(
-                category="PO",
-                receiver="FINANCE",
-                reference_id=str(
-                    po.pk
+        PurchaseOrderApproval.objects.create(
+            purchase_order=po,
+            action="REPLACEMENT_REQUESTED",
+            requested_by=actor,
+            approved_by=actor,
+        )
+
+        Notification.objects.update_or_create(
+            category="PO",
+            receiver="FINANCE",
+            reference_id=str(po.pk),
+            defaults={
+                "requested_by": actor,
+                "title": f"Returnable Restore Finance Approval - {po.po_number}",
+                "message": (
+                    f"Procurement submitted Restore PO {po.po_number} for "
+                    f"{vendor.name}. Review vendor, dates, failed quantities, "
+                    "unit prices, and GST before approval."
                 ),
-                defaults={
-                    "requested_by":
-                        actor,
-                    "title": (
-                        "Returnable Restore Finance Approval - "
-                        f"{po.po_number}"
-                    ),
-                    "message": (
-                        "Procurement approved the Returnable QC Restore. "
-                        f"Replacement PO {po.po_number} is waiting for Finance approval."
-                    ),
-                    "status":
-                        "REPLACEMENT_PENDING_FINANCE",
-                    "is_read":
-                        False,
-                },
-            )
-
-            created_pos.append(
-                po
-            )
-
-        restore_po_ids = [
-            po.pk
-            for po in created_pos
-        ]
-
-        restore_po_numbers = [
-            po.po_number
-            for po in created_pos
-        ]
-
-        metadata[
-            "procurement_restore_ready"
-        ] = False
-
-        metadata[
-            "procurement_restore_status"
-        ] = "PENDING_FINANCE"
-
-        metadata[
-            "restore_po_ids"
-        ] = restore_po_ids
-
-        metadata[
-            "restore_po_numbers"
-        ] = restore_po_numbers
-
-        # Backward-compatible singular values when only one PO exists.
-        metadata[
-            "restore_po_id"
-        ] = (
-            restore_po_ids[0]
-            if len(
-                restore_po_ids
-            )
-            == 1
-            else None
+                "status": "REPLACEMENT_PENDING_FINANCE",
+                "is_read": False,
+            },
         )
 
-        metadata[
-            "restore_po_number"
-        ] = (
-            restore_po_numbers[0]
-            if len(
-                restore_po_numbers
-            )
-            == 1
-            else ""
-        )
+        restore_po_ids = [po.pk]
+        restore_po_numbers = [po.po_number]
+        metadata.update({
+            "procurement_restore_ready": False,
+            "procurement_restore_status": "PENDING_FINANCE",
+            "restore_po_ids": restore_po_ids,
+            "restore_po_numbers": restore_po_numbers,
+            "restore_po_id": po.pk,
+            "restore_po_number": po.po_number,
+            "restore_po_raised_by": actor,
+            "restore_po_raised_at": timezone.now().isoformat(),
+            "restore_vendor_id": vendor.pk,
+            "restore_vendor_name": vendor.name,
+            "restore_requested_date": requested_date.isoformat(),
+            "restore_expected_delivery_date": expected_delivery_date.isoformat(),
+            "restore_round_off": str(round_off),
+            "restore_pricing_items": [
+                {
+                    "component_id": item["component_id"],
+                    "quantity": item["quantity"],
+                    "unit_price": str(item["unit_price"]),
+                    "discount": str(item["discount"]),
+                    "gst_percentage": str(item["gst_percentage"]),
+                    "freight_cost": str(item["freight_cost"]),
+                    "freight_gst_percentage": str(item["freight_gst_percentage"]),
+                    "uom": item["uom"],
+                }
+                for item in priced_items.values()
+            ],
+        })
 
-        metadata[
-            "restore_po_raised_by"
-        ] = actor
-
-        metadata[
-            "restore_po_raised_at"
-        ] = timezone.now().isoformat()
-
-        replacement_mr_id = metadata.get("replacement_mr_id")
-        if replacement_mr_id:
-            MaterialRequest.objects.filter(pk=replacement_mr_id).update(
-                status="PO_RAISED",
-                approval_status="MANAGER_APPROVED",
-                po_raised=True,
-            )
-
-        instance.inventory_allocations = (
-            metadata
-        )
-
-        instance.approval_status = (
-            "RESTORE_PENDING_FINANCE"
-        )
-
-        instance.status = (
-            "RESTORE_PENDING_FINANCE"
-        )
-
-        instance.save(
-            update_fields=[
-                "inventory_allocations",
-                "approval_status",
-                "status",
-                "updated_at",
-            ]
-        )
+        instance.inventory_allocations = metadata
+        instance.approval_status = "RESTORE_PENDING_FINANCE"
+        instance.status = "RESTORE_PENDING_FINANCE"
+        instance.save(update_fields=[
+            "inventory_allocations",
+            "approval_status",
+            "status",
+            "updated_at",
+        ])
 
         Notification.objects.filter(
             category="QC_FAILED",
             receiver="PROCUREMENT",
-            reference_id=(
-                f"OUTWARD:{instance.pk}"
-            ),
-        ).update(
-            status=
-                "PROCUREMENT_APPROVED",
-            is_read=True,
-        )
+            reference_id=f"OUTWARD:{instance.pk}",
+        ).update(status="PROCUREMENT_APPROVED", is_read=True)
 
-        # Keep linked Returnable rows auditable while restore PO(s)
-        # move through Finance -> Ordered -> Inward -> QC -> In Store.
         from componentusage.models import ComponentUsage
-
-        usage_ids = (
-            metadata.get(
-                "returnable_usage_ids"
-            )
-            or []
-        )
-
+        usage_ids = metadata.get("returnable_usage_ids") or []
         for usage in (
             ComponentUsage.objects
             .select_for_update()
-            .filter(
-                pk__in=usage_ids
-            )
+            .filter(pk__in=usage_ids)
         ):
             details = (
                 usage.inventory_issue_details
-                if isinstance(
-                    usage.inventory_issue_details,
-                    list,
-                )
+                if isinstance(usage.inventory_issue_details, list)
                 else []
             )
-
             if not details:
                 details = [{}]
+            details[0].update({
+                "restore_po_ids": restore_po_ids,
+                "restore_po_numbers": restore_po_numbers,
+                "restore_status": "PENDING_FINANCE",
+                "restore_outward_id": instance.pk,
+                "restore_vendor_name": vendor.name,
+                "restore_requested_date": requested_date.isoformat(),
+                "restore_expected_delivery_date": expected_delivery_date.isoformat(),
+            })
+            usage.inventory_issue_details = details
+            usage.save(update_fields=["inventory_issue_details"])
 
-            details[0].update(
-                {
-                    "restore_po_ids":
-                        restore_po_ids,
-                    "restore_po_numbers":
-                        restore_po_numbers,
-                    "restore_status":
-                        "PENDING_FINANCE",
-                    "restore_outward_id":
-                        instance.pk,
-                }
+        transaction.on_commit(invalidate_outward_cache)
+        transaction.on_commit(
+            lambda: invalidate_cache_version(
+                "ipms:componentusage:list:version"
             )
-
-            usage.inventory_issue_details = (
-                details
+        )
+        transaction.on_commit(
+            lambda: invalidate_cache_version(
+                "ipms:notifications:list:version"
             )
-
-            usage.save(
-                update_fields=[
-                    "inventory_issue_details"
-                ]
-            )
+        )
 
         return Response(
             {
                 "detail": (
-                    "Procurement approved Restore. "
-                    "Replacement PO is now pending Finance approval."
+                    "Procurement submitted the Restore PO. It is waiting for "
+                    "Finance approval; after approval, Procurement can mark it as ordered."
                 ),
-                "purchase_order_ids":
-                    restore_po_ids,
-                "po_numbers":
-                    restore_po_numbers,
-                "status":
-                    "PENDING_FINANCE",
+                "purchase_order_ids": restore_po_ids,
+                "po_numbers": restore_po_numbers,
+                "status": "PENDING_FINANCE",
             },
             status=status.HTTP_201_CREATED,
         )
