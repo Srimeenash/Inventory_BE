@@ -13,7 +13,6 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from rest_framework_simplejwt.authentication import JWTAuthentication
 
 from inventory_backend.cache_utils import (
     build_list_cache_key,
@@ -96,13 +95,7 @@ class InventoryViewSet(viewsets.ModelViewSet):
     serializer_class = InventorySerializer
     pagination_class = OptionalPageNumberPagination
 
-    @action(
-        detail=True,
-        methods=["patch"],
-        url_path="location",
-        authentication_classes=[JWTAuthentication],
-        permission_classes=[IsAuthenticated],
-    )
+    @action(detail=True, methods=["patch"], url_path="location", permission_classes=[IsAuthenticated])
     @transaction.atomic
     def location(self, request, pk=None):
         user = request.user
@@ -2346,47 +2339,94 @@ class ProjectInventoryViewSet(
                 material_request.status or ""
             ).strip().upper()
 
+            active_reservations = list(
+                InventoryReservation.objects
+                .filter(material_request=material_request)
+                .exclude(status__in=["RELEASED", "CANCELLED"])
+            )
+            has_store_quantity_pending = any(
+                reservation.remaining_reserved_quantity > 0
+                for reservation in active_reservations
+            )
+            has_inventory_quantity_ready = any(
+                int(row.remaining_quantity or 0) > 0
+                and (
+                    int(row.remaining_store_quantity or 0)
+                    + int(row.remaining_purchased_quantity or 0)
+                ) > 0
+                for row in project_rows
+            )
+            has_procurement_work = Notification.objects.filter(
+                category="MR",
+                receiver="PROCUREMENT",
+                reference_id=str(material_request.id),
+                status__in=[
+                    "PROCUREMENT_PENDING",
+                    "PO_RAISED",
+                    "PARTIALLY_DELIVERED",
+                ],
+            ).exists()
+
+            # Once every currently available Store unit is issued, the
+            # remaining work belongs to Procurement until new stock passes QC.
+            # If any Store/QC-passed quantity is still ready, Inventory keeps
+            # priority for the overall MR status.
+            if has_store_quantity_pending or has_inventory_quantity_ready:
+                material_request.status = "INVENTORY_PENDING"
+                material_request.save(update_fields=["status"])
+                current_status = "INVENTORY_PENDING"
+            elif has_procurement_work:
+                material_request.status = "PROCUREMENT_PENDING"
+                material_request.save(update_fields=["status"])
+                current_status = "PROCUREMENT_PENDING"
+
             if current_status in {
                 "PO_DELIVERED",
                 "QC_CHECKED",
                 "PROJECT_INVENTORY_READY",
             }:
-                pending_notification_status = (
-                    "QC_CHECKED"
-                )
+                pending_notification_status = "QC_CHECKED"
             else:
-                pending_notification_status = (
-                    "INVENTORY_PENDING"
-                )
+                pending_notification_status = "INVENTORY_PENDING"
 
-            self.upsert_inventory_notification(
-                material_request,
-                notification_status=(
-                    pending_notification_status
-                ),
-                title=(
-                    (
-                        "Components Partially Issued - "
-                        if any_issued
-                        else "Components Pending - "
-                    )
-                    + canonical_mr_number
-                ),
-                message=(
-                    (
-                        "Some components were provided, "
-                        "but remaining quantities are "
-                        "still pending for "
-                        if any_issued
-                        else
-                        "Components are ready only in "
-                        "part. Remaining quantities are "
-                        "still pending for "
-                    )
-                    + f"{canonical_mr_number}."
-                ),
-                is_read=False,
-            )
+            if (
+                has_procurement_work
+                and not has_store_quantity_pending
+                and not has_inventory_quantity_ready
+            ):
+                # Inventory has no available units left to issue. Clear its
+                # actionable notification while Procurement works on the
+                # shortage; inward QC will create a new Inventory task when
+                # purchased stock becomes available.
+                Notification.objects.filter(
+                    category="MR",
+                    receiver="INVENTORY",
+                    reference_id=str(material_request.id),
+                ).delete()
+            else:
+                self.upsert_inventory_notification(
+                    material_request,
+                    notification_status=pending_notification_status,
+                    title=(
+                        (
+                            "Components Partially Issued - "
+                            if any_issued
+                            else "Components Pending - "
+                        )
+                        + canonical_mr_number
+                    ),
+                    message=(
+                        (
+                            "Some components were provided, but remaining quantities "
+                            "are still pending for "
+                            if any_issued
+                            else "Components are ready only in part. Remaining quantities "
+                            "are still pending for "
+                        )
+                        + f"{canonical_mr_number}."
+                    ),
+                    is_read=False,
+                )
 
         # The list endpoints above use versioned 60-second caches. Issue
         # results must be visible before the next Provide Components click.

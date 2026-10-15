@@ -2436,12 +2436,15 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                     desired_status = "QC_FAILED_ACTION_REQUIRED"
                 elif replacement_status:
                     desired_status = replacement_status
-                elif all_purchase_orders_delivered:
-                    desired_status = "PO_DELIVERED"
-                elif any_delivery_progress:
-                    desired_status = (
-                        "PARTIALLY_DELIVERED"
-                    )
+                elif total_ready_to_issue > 0:
+                    desired_status = "INVENTORY_PENDING"
+                elif any_delivery_progress or current_status in {
+                    "PROCUREMENT_PENDING",
+                    "PO_RAISED",
+                    "PARTIALLY_DELIVERED",
+                    "PO_DELIVERED",
+                }:
+                    desired_status = "PROCUREMENT_PENDING"
 
                 if (
                     desired_status
@@ -2457,6 +2460,9 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                             "status",
                             "po_raised",
                         ]
+                    )
+                    invalidate_cache_version(
+                        "ipms:materialrequests:list:version"
                     )
 
             # CRITICAL BUSINESS RULE:
@@ -2511,13 +2517,16 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
         }:
             return material_request
 
-        material_request.status = "QC_CHECKED"
+        material_request.status = "INVENTORY_PENDING"
         material_request.po_raised = True
         material_request.save(
             update_fields=[
                 "status",
                 "po_raised",
             ]
+        )
+        invalidate_cache_version(
+            "ipms:materialrequests:list:version"
         )
 
         total_passed_quantity = sum(

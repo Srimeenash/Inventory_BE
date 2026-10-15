@@ -12,6 +12,7 @@ from django.utils import timezone
 from rest_framework.permissions import IsAuthenticated
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework import status, viewsets
+from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 
@@ -22,6 +23,8 @@ from inventory_backend.cache_utils import (
     invalidate_cache_version,
 )
 from inventory_backend.pagination import OptionalPageNumberPagination
+
+from components.models import Component
 
 from inventory.models import (
     Inventory,
@@ -241,6 +244,126 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
                 row["status"] = "INVENTORY_PENDING"
 
         return payload
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="available-inventory",
+        url_name="available-inventory",
+    )
+    def available_inventory(self, request):
+        """Return live central In-Store stock after active MR reservations.
+
+        The endpoint is intentionally uncached so a newly opened or refreshed
+        MR form sees reservations made by earlier requests. It uses the same
+        remaining-reservation calculation as MR approval routing.
+        """
+        physical_rows = (
+            Inventory.objects
+            .filter(
+                issued=False,
+                quantity__gt=0,
+                component_id__isnull=False,
+            )
+            .values("component_id")
+            .annotate(physical_quantity=Sum("quantity"))
+        )
+        physical_by_component = {
+            int(row["component_id"]): max(
+                int(row["physical_quantity"] or 0),
+                0,
+            )
+            for row in physical_rows
+        }
+
+        reserved_by_component = defaultdict(int)
+        reservation_details_by_component = defaultdict(dict)
+        reservations = (
+            InventoryReservation.objects
+            .select_related("material_request")
+            .filter(status__in=ACTIVE_RESERVATION_STATUSES)
+            .order_by("created_at", "id")
+        )
+
+        for reservation in reservations:
+            remaining_quantity = max(
+                int(reservation.reserved_store_quantity or 0)
+                - int(reservation.issued_store_quantity or 0),
+                0,
+            )
+            if remaining_quantity <= 0:
+                continue
+
+            component_pk = int(reservation.component_id)
+            request_number = (
+                getattr(
+                    reservation.material_request,
+                    "material_request_id",
+                    "",
+                )
+                or f"MR database ID {reservation.material_request_id}"
+            )
+            reserved_by_component[component_pk] += remaining_quantity
+            reservation_details_by_component[component_pk][request_number] = (
+                reservation_details_by_component[component_pk].get(
+                    request_number,
+                    0,
+                )
+                + remaining_quantity
+            )
+
+        component_pks = set(physical_by_component) | set(
+            reserved_by_component
+        )
+        component_codes = dict(
+            Component.objects
+            .filter(pk__in=component_pks)
+            .values_list("pk", "component_id")
+        )
+
+        results = []
+        for component_pk in sorted(component_pks):
+            physical_quantity = physical_by_component.get(
+                component_pk,
+                0,
+            )
+            reserved_quantity = reserved_by_component.get(
+                component_pk,
+                0,
+            )
+            component_code = component_codes.get(component_pk) or ""
+            request_details = reservation_details_by_component.get(
+                component_pk,
+                {},
+            )
+            results.append(
+                {
+                    "component_pk": component_pk,
+                    "component_db_id": component_pk,
+                    "component_id": component_code,
+                    "component_code": component_code,
+                    "physical_quantity": physical_quantity,
+                    "reserved_quantity": reserved_quantity,
+                    "reserved_by_other_mrs": reserved_quantity,
+                    "available_quantity": max(
+                        physical_quantity - reserved_quantity,
+                        0,
+                    ),
+                    "reserved_by_other_mr_details": [
+                        {
+                            "material_request_id": request_number,
+                            "reserved_quantity": quantity,
+                        }
+                        for request_number, quantity
+                        in request_details.items()
+                    ],
+                }
+            )
+
+        response = Response({"results": results})
+        response["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response["Pragma"] = "no-cache"
+        return response
 
     def list(self, request, *args, **kwargs):
         version = get_material_request_cache_version()

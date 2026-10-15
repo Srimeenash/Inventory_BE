@@ -11,7 +11,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from django.contrib.staticfiles import finders
-from inventory.models import InventoryReservation
+from inventory.models import InventoryReservation, ProjectInventory
 from components.models import Component
 from materialrequest.models import MaterialRequest
 from notifications.models import Notification
@@ -4372,10 +4372,33 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             for row in shortage_components
         )
 
+        # The MR status reflects the next team with an actionable quantity.
+        # In-Store reservations and QC-passed purchased quantities stay with
+        # Inventory; otherwise Procurement owns the open shortage through PO
+        # creation, Finance approval, delivery, and inward QC.
+        project_inventory_rows = list(
+            ProjectInventory.objects
+            .select_for_update()
+            .filter(material_request=material_request)
+        )
+        has_inventory_quantity_ready = any(
+            int(row.remaining_quantity or 0) > 0
+            and (
+                int(row.remaining_store_quantity or 0)
+                + int(row.remaining_purchased_quantity or 0)
+            ) > 0
+            for row in project_inventory_rows
+        )
+        next_workflow_status = (
+            "INVENTORY_PENDING"
+            if has_inventory_quantity_ready
+            else "PROCUREMENT_PENDING"
+        )
+
         reference_id = str(material_request.id)
 
         if all_delivered:
-            material_request.status = "PO_DELIVERED"
+            material_request.status = next_workflow_status
             material_request.po_raised = True
             material_request.save(update_fields=["status", "po_raised"])
             Notification.objects.filter(
@@ -4391,7 +4414,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 ),
             )
         elif any_shortage_delivered:
-            material_request.status = "PARTIALLY_DELIVERED"
+            material_request.status = next_workflow_status
             material_request.po_raised = True
             material_request.save(update_fields=["status", "po_raised"])
             Notification.objects.filter(
@@ -4408,7 +4431,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 ),
             )
         elif all_shortages_have_po:
-            material_request.status = "PO_RAISED"
+            material_request.status = next_workflow_status
             material_request.po_raised = True
             material_request.save(update_fields=["status", "po_raised"])
             Notification.objects.filter(
@@ -4424,7 +4447,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 ),
             )
         else:
-            material_request.status = "PROCUREMENT_PENDING"
+            material_request.status = next_workflow_status
             material_request.po_raised = False
             material_request.save(update_fields=["status", "po_raised"])
             Notification.objects.filter(
@@ -4441,6 +4464,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 ),
             )
 
+        invalidate_cache_version("ipms:materialrequests:list:version")
         return material_request
 
     # ==========================================================
