@@ -11,7 +11,7 @@ from django.db.models import Prefetch, Q
 from rest_framework import mixins, serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, SAFE_METHODS
 from rest_framework.response import Response
 
 from inventory_backend.cache_utils import (
@@ -38,6 +38,7 @@ from .models import (
 )
 from .serializers import (
     InventorySerializer,
+    EngineerInventorySerializer,
     InventoryLocationSerializer,
     ProjectInventorySerializer,
     DroneInstanceSerializer,
@@ -80,6 +81,56 @@ def invalidate_sync_mr_caches():
     invalidate_cache_version(NOTIFICATION_LIST_CACHE_VERSION_KEY)
 
 
+
+
+def _request_active_role_name(request):
+    """Return the role selected for this authenticated session."""
+    auth = getattr(request, "auth", None)
+    role = ""
+    if auth is not None:
+        try:
+            role = auth.get("active_role") or auth.get("activeRole") or ""
+        except (AttributeError, TypeError):
+            role = ""
+    user = getattr(request, "user", None)
+    role = role or getattr(user, "active_role", "") or getattr(user, "activeRole", "")
+    if not role:
+        role = getattr(user, "role", "")
+    role = getattr(role, "name", role)
+    return str(role or "").strip().lower()
+
+
+
+
+def _request_user_roles(request):
+    """Return roles currently assigned to the authenticated account."""
+    user = getattr(request, "user", None)
+    get_all_roles = getattr(user, "get_all_roles", None)
+    if callable(get_all_roles):
+        try:
+            roles = get_all_roles()
+        except Exception:
+            roles = []
+    else:
+        roles = [getattr(user, "role", "")]
+
+    if not isinstance(roles, (list, tuple, set)):
+        roles = [roles]
+    additional_roles = getattr(user, "additional_roles", []) or []
+    if isinstance(additional_roles, (list, tuple, set)):
+        roles = [*roles, *additional_roles]
+
+    return {
+        str(getattr(role, "name", role) or "").strip().lower()
+        for role in roles
+        if str(getattr(role, "name", role) or "").strip()
+    }
+
+
+def _request_has_engineer_role(request):
+    return "engineer" in _request_user_roles(request)
+
+
 class InventoryViewSet(viewsets.ModelViewSet):
     """
     Physical In-Store inventory API.
@@ -94,6 +145,46 @@ class InventoryViewSet(viewsets.ModelViewSet):
 
     serializer_class = InventorySerializer
     pagination_class = OptionalPageNumberPagination
+
+    def get_serializer_class(self):
+        action_name = getattr(self, "action", "")
+        if action_name == "engineer_store" or (
+            _request_active_role_name(self.request) == "engineer"
+            and action_name in {"list", "retrieve"}
+        ):
+            return EngineerInventorySerializer
+        return super().get_serializer_class()
+    def check_permissions(self, request):
+        super().check_permissions(request)
+        if _request_active_role_name(request) == "engineer":
+            if request.method not in SAFE_METHODS:
+                raise PermissionDenied("Engineer access to In-Store inventory is read-only.")
+            if getattr(self, "action", "") not in {"list", "retrieve", "engineer_store"}:
+                raise PermissionDenied("This Inventory action is not available to Engineer users.")
+
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="engineer-store",
+        permission_classes=[IsAuthenticated],
+    )
+    def engineer_store(self, request):
+        """Read-only, price-free In-Store list for the Engineer role."""
+        if not _request_has_engineer_role(request):
+            raise PermissionDenied(
+                "Assign the Engineer role to this account to view In-Store stock."
+            )
+
+        queryset = self.filter_queryset(self.get_queryset())
+        page = self.paginate_queryset(queryset)
+        serializer = self.get_serializer(
+            page if page is not None else queryset,
+            many=True,
+        )
+        if page is not None:
+            return self.get_paginated_response(serializer.data)
+        return Response(serializer.data)
 
     @action(detail=True, methods=["patch"], url_path="location", permission_classes=[IsAuthenticated])
     @transaction.atomic
@@ -139,6 +230,10 @@ class InventoryViewSet(viewsets.ModelViewSet):
         return context
 
     def list(self, request, *args, **kwargs):
+        # Never share cached full Inventory responses with Engineer users.
+        if _request_active_role_name(request) == "engineer":
+            return super().list(request, *args, **kwargs)
+
         version = get_inventory_cache_version()
         cache_key = None
 
@@ -170,8 +265,14 @@ class InventoryViewSet(viewsets.ModelViewSet):
         return response
 
     def get_queryset(self):
+        queryset = super().get_queryset()
+        if (
+            getattr(self, "action", "") == "engineer_store"
+            or _request_active_role_name(self.request) == "engineer"
+        ):
+            queryset = queryset.filter(quantity__gt=0, issued=False)
         return apply_server_query_parameters(
-            super().get_queryset(),
+            queryset,
             self.request,
             search_fields=(
                 "inventory_code",

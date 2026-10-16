@@ -1386,3 +1386,45 @@ class DroneInstanceSerializer(serializers.ModelSerializer):
     def get_replacement_mr_number(self, obj):
         replacement = obj.replacement_material_request
         return str(getattr(replacement, "material_request_id", "") or "")
+
+class EngineerInventorySerializer(serializers.ModelSerializer):
+    """Minimal In-Store fields available to Engineer users."""
+
+    component_id = serializers.SerializerMethodField()
+    specification = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Inventory
+        fields = (
+            "id",
+            "component_id",
+            "specification",
+            "quantity",
+            "uom",
+        )
+        read_only_fields = fields
+
+    def get_component_id(self, obj):
+        inventory_serializer = InventorySerializer()
+        if obj.legacy_source_key:
+            # Preserve the workbook ID. Missing source IDs remain N/A; do not
+            # replace them with a category-generated component ID.
+            return inventory_serializer.get_source_component_id(obj) or "N/A"
+
+        legacy_id = str(
+            getattr(obj.component, "legacy_inventory_id", "") or ""
+        ).strip()
+        return legacy_id or str(
+            getattr(obj.component, "component_id", "") or "N/A"
+        ).strip()
+
+    def get_specification(self, obj):
+        value = str(obj.specifications or "").strip()
+        if value in {"", "-", "—"}:
+            value = InventorySerializer().get_source_specification(obj)
+        if value in {"", "-", "—"} and obj.component_id:
+            value = str(
+                getattr(obj.component, "specifications", "") or ""
+            ).strip()
+        return value or "—"
+
