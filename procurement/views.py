@@ -431,6 +431,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
 
         rejected_po_statuses = {
             "REJECTED",
+            "MANAGER_REJECTED",
             "FINANCE_REJECTED",
             "REPLACEMENT_MANAGER_REJECTED",
             "REPLACEMENT_FINANCE_REJECTED",
@@ -921,6 +922,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             .exclude(
                 status__in=[
                     "REJECTED",
+                    "MANAGER_REJECTED",
                     "FINANCE_REJECTED",
                 ]
             )
@@ -3870,6 +3872,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             .exclude(
                 status__in=[
                     "REJECTED",
+                    "MANAGER_REJECTED",
                     "FINANCE_REJECTED",
                 ]
             )
@@ -4088,6 +4091,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             .exclude(
                 status__in=[
                     "REJECTED",
+                    "MANAGER_REJECTED",
                     "FINANCE_REJECTED",
                 ]
             )
@@ -4243,6 +4247,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             .exclude(
                 status__in=[
                     "REJECTED",
+                    "MANAGER_REJECTED",
                     "FINANCE_REJECTED",
                 ]
             )
@@ -5184,11 +5189,10 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             request
         )
 
-        purchase_order.status = "REJECTED"
-
-        # Keep approval_status inside the existing model choices.
-        # The authoritative rejected state is PurchaseOrder.status.
-        purchase_order.approval_status = "PENDING"
+        # Preserve which approval stage rejected this Direct PO.
+        # Manager rejected: both PO status and approval_status must agree.
+        purchase_order.status = "MANAGER_REJECTED"
+        purchase_order.approval_status = "MANAGER_REJECTED"
         purchase_order.rejection_reason = reason
         purchase_order.rejected_by = actor
 
@@ -5208,7 +5212,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 purchase_order.id
             ),
         ).update(
-            status="REJECTED",
+            status="MANAGER_REJECTED",
             is_read=True,
         )
 

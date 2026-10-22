@@ -68,6 +68,7 @@ class PurchaseOrder(models.Model):
         ("PENDING", "Pending"),
         ("PENDING_FINANCE", "Pending Finance"),
         ("FINANCE_APPROVED", "Finance Approved"),
+        ("MANAGER_REJECTED", "Manager Rejected"),
         ("FINANCE_REJECTED", "Finance Rejected"),
         ("APPROVED", "Approved"),
         ("ORDERED", "Ordered"),
@@ -105,6 +106,7 @@ class PurchaseOrder(models.Model):
         ("PENDING", "Pending"),
         ("PENDING_FINANCE", "Pending Finance"),
         ("FINANCE_APPROVED", "Finance Approved"),
+        ("MANAGER_REJECTED", "Manager Rejected"),
         ("FINANCE_REJECTED", "Finance Rejected"),
         # Replacement-specific approval states.
         (
