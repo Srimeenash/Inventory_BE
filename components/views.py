@@ -1,8 +1,9 @@
 from uuid import uuid4
 
 from django.core.cache import cache
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Q
+from django.db.models.deletion import ProtectedError
 
 from django_filters.rest_framework import DjangoFilterBackend
 
@@ -165,7 +166,7 @@ class ComponentViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
 
-        return apply_server_query_parameters(
+        queryset = apply_server_query_parameters(
 
             super().get_queryset(),
 
@@ -207,6 +208,32 @@ class ComponentViewSet(viewsets.ModelViewSet):
             ),
         )
 
+        # Normal component pickers and the Component Generation table should
+        # only show active master records. Callers that manage archived records
+        # can request them explicitly with ?is_active=false or
+        # ?include_inactive=1.
+        include_inactive = str(
+            self.request.query_params.get(
+                "include_inactive",
+                "",
+            )
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+
+        if (
+            getattr(self, "action", None) == "list"
+            and self.request.query_params.get("is_active") is None
+            and not include_inactive
+        ):
+            queryset = queryset.filter(
+                is_active=True
+            )
+
+        return queryset
+
     # -----------------------------------------------------------------
     # CREATE
     # -----------------------------------------------------------------
@@ -245,6 +272,116 @@ class ComponentViewSet(viewsets.ModelViewSet):
     # -----------------------------------------------------------------
     # DELETE
     # -----------------------------------------------------------------
+
+    @staticmethod
+    def _get_component_reference_labels(instance):
+        """Return related records that make a hard delete unsafe."""
+        labels = []
+        database = instance._state.db
+
+        for relation in instance._meta.related_objects:
+            related_model = relation.related_model
+            field = relation.field
+            related_rows = related_model._base_manager.using(
+                database
+            ).filter(
+                **{field.name: instance.pk}
+            )
+
+            count = related_rows.count()
+            if count:
+                label = str(
+                    related_model._meta.verbose_name_plural
+                ).capitalize()
+                labels.append(
+                    f"{label}: {count}"
+                )
+
+        return labels
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        reference_labels = self._get_component_reference_labels(
+            instance
+        )
+
+        if reference_labels:
+            # Preserve BOM, PO, inward, stock, and QC history. An in-use
+            # component is removed from active pickers instead of cascading
+            # deletion into those records.
+            instance.is_active = False
+            instance.save(
+                update_fields=[
+                    "is_active",
+                    "updated_at",
+                ]
+            )
+            transaction.on_commit(
+                invalidate_component_lookup_cache
+            )
+
+            return Response(
+                {
+                    "detail": (
+                        f"{instance.component_id} is in use, so it was "
+                        "deactivated to preserve its linked history."
+                    ),
+                    "deleted": False,
+                    "is_active": False,
+                    "linked_records": reference_labels,
+                }
+            )
+
+        try:
+            # Keep the physical delete atomic. If the database has a legacy
+            # constraint that Django's relation metadata does not know about,
+            # roll back and safely deactivate the master row instead.
+            with transaction.atomic(using=instance._state.db):
+                self.perform_destroy(instance)
+        except ProtectedError as error:
+            protected_labels = sorted(
+                {
+                    str(obj._meta.verbose_name_plural).capitalize()
+                    for obj in error.protected_objects
+                }
+            )
+            return self._deactivate_component(
+                instance,
+                protected_labels,
+            )
+        except IntegrityError:
+            return self._deactivate_component(
+                instance,
+                ["Existing database records"],
+            )
+
+        return Response(status=204)
+
+    @staticmethod
+    def _deactivate_component(instance, linked_records):
+        instance.is_active = False
+        instance.save(
+            update_fields=[
+                "is_active",
+                "updated_at",
+            ]
+        )
+        transaction.on_commit(
+            invalidate_component_lookup_cache
+        )
+
+        return Response(
+            {
+                "detail": (
+                    f"{instance.component_id} could not be physically "
+                    "deleted because it has linked records. It was "
+                    "deactivated instead, and its history is preserved."
+                ),
+                "deleted": False,
+                "is_active": False,
+                "linked_records": linked_records,
+            }
+        )
 
     def perform_destroy(
         self,
