@@ -146,6 +146,12 @@ class InventoryViewSet(viewsets.ModelViewSet):
     serializer_class = InventorySerializer
     pagination_class = OptionalPageNumberPagination
 
+    def perform_create(self, serializer):
+        super().perform_create(serializer)
+        # A new stock receipt changes the cached In-Store inventory list.
+        # Bump the list cache version after the database transaction commits.
+        transaction.on_commit(invalidate_inventory_cache)
+
     def get_serializer_class(self):
         action_name = getattr(self, "action", "")
         if action_name == "engineer_store" or (
