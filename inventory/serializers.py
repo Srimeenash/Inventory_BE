@@ -1,4 +1,5 @@
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import re
 
 from django.db import transaction
 from inventory.cost_serializers import CostDetailsSerializerMixin
@@ -871,35 +872,31 @@ class InventorySerializer(CostDetailsSerializerMixin, serializers.ModelSerialize
 
     @staticmethod
     def _generate_next_inventory_code():
-        last = Inventory.objects.order_by(
-            "-id"
-        ).first()
+        """Return the next sequential code across current and legacy formats.
 
+        Add Stock previews use ``INV_0001``. Older records can use ``INV00001``
+        or ``INV-0001``. Scanning all codes avoids resetting the sequence when
+        the newest row has a non-sequential/legacy code.
+        """
         last_no = 0
 
-        if last and last.inventory_code:
-            raw_code = str(
-                last.inventory_code
-            ).strip()
-
-            for prefix in (
-                "INV-",
-                "INV",
-            ):
-                raw_code = raw_code.replace(
-                    prefix,
-                    "",
-                )
+        for value in Inventory.objects.values_list(
+            "inventory_code",
+            flat=True,
+        ).iterator():
+            code = str(value or "").strip().upper()
+            current_match = re.fullmatch(r"INV_(\d+)", code)
+            legacy_match = re.fullmatch(r"INV-?(\d{1,6})", code)
+            match = current_match or legacy_match
+            if not match:
+                continue
 
             try:
-                last_no = int(raw_code)
-            except (
-                ValueError,
-                TypeError,
-            ):
-                last_no = 0
+                last_no = max(last_no, int(match.group(1)))
+            except (TypeError, ValueError):
+                continue
 
-        return f"INV{last_no + 1:05d}"
+        return f"INV_{last_no + 1:04d}"
 
 
 class InventoryLocationSerializer(serializers.ModelSerializer):

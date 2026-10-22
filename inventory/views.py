@@ -314,26 +314,9 @@ class InventoryViewSet(viewsets.ModelViewSet):
         url_path="next-code",
     )
     def next_code(self, request):
-        last = Inventory.objects.order_by("-id").first()
-
-        last_no = 0
-
-        if last and last.inventory_code:
-            raw_code = str(last.inventory_code).strip()
-
-            for prefix in ("INV-", "INV"):
-                raw_code = raw_code.replace(prefix, "")
-
-            try:
-                last_no = int(raw_code)
-            except (TypeError, ValueError):
-                last_no = 0
-
         return Response(
             {
-                "inventory_code": (
-                    f"INV{last_no + 1:05d}"
-                )
+                "inventory_code": InventorySerializer._generate_next_inventory_code()
             }
         )
 
