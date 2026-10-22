@@ -9,11 +9,12 @@ from inventory.serial_display import (
     display_serial_text,
     get_inventory_code_id_map,
 )
+from inventory.cost_serializers import CostDetailsSerializerMixin
 
 from .models import OutwardEntry
 
 
-class OutwardEntrySerializer(serializers.ModelSerializer):
+class OutwardEntrySerializer(CostDetailsSerializerMixin, serializers.ModelSerializer):
     typeOfOutward = serializers.ChoiceField(
         choices=OutwardEntry.OUTWARD_TYPE_CHOICES,
         source="outward_type",
@@ -208,89 +209,145 @@ class OutwardEntrySerializer(serializers.ModelSerializer):
             or metadata.get("reorder_choice")
             or ""
         ).strip().upper()
-        if decision == "NO" or str(
-            metadata.get("procurement_restore_status") or ""
-        ).strip().upper() == "NOT_REQUIRED":
-            return "FINAL_SCRAP"
-
         approval_status = str(
             getattr(instance, "approval_status", "") or ""
         ).strip().upper()
         if approval_status in {"REJECTED", "MANAGER_REJECTED", "FINANCE_REJECTED"}:
             return "RESTORE_REJECTED"
 
-        restore_po_id = metadata.get("restore_po_id")
-        if restore_po_id:
+        restore_status = str(
+            metadata.get("procurement_restore_status") or ""
+        ).strip().upper()
+        if decision == "NO" or restore_status == "NOT_REQUIRED":
+            if approval_status == "APPROVED":
+                return "FINAL_SCRAP_COMPLETED"
+            if approval_status == "PENDING_FINANCE":
+                return "FINAL_SCRAP_PENDING_FINANCE"
+            return "FINAL_SCRAP"
+
+        raw_po_ids = metadata.get("restore_po_ids")
+        if not isinstance(raw_po_ids, list):
+            raw_po_ids = []
+        else:
+            raw_po_ids = list(raw_po_ids)
+        if metadata.get("restore_po_id") is not None:
+            raw_po_ids.append(metadata["restore_po_id"])
+
+        po_ids = []
+        for raw_po_id in raw_po_ids:
+            try:
+                po_id = int(raw_po_id)
+            except (TypeError, ValueError):
+                continue
+            if po_id > 0 and po_id not in po_ids:
+                po_ids.append(po_id)
+
+        if po_ids:
             # Import lazily so the outward serializer does not introduce an
             # import cycle with Procurement or Inward.
             from procurement.models import PurchaseOrder
 
-            purchase_order = (
-                PurchaseOrder.objects.filter(pk=restore_po_id)
+            purchase_orders = list(
+                PurchaseOrder.objects.filter(pk__in=po_ids)
                 .only("id", "status")
-                .first()
             )
-            if purchase_order:
-                po_status = str(purchase_order.status or "").strip().upper()
-                if po_status == "REPLACEMENT_PARTIALLY_RECEIVED":
-                    return "RESTORE_PARTIALLY_RECEIVED"
-                if po_status == "REPLACEMENT_RECEIVED":
-                    from inward.models import InwardEntry
-
-                    inwards = list(
-                        InwardEntry.objects.filter(
-                            purchase_order_id=purchase_order.pk,
-                        )
-                        .exclude(removed_from_inventory=True)
-                        .only(
-                            "quantity_received",
-                            "qc_status",
-                            "qc_passed_rows",
-                            "qc_failed_rows",
-                        )
-                    )
-                    if not inwards:
-                        return "RESTORE_RECEIVED_QC_PENDING"
-
-                    all_inspected = True
-                    passed_quantity = 0
-                    failed_quantity = 0
-                    for inward in inwards:
-                        passed = self._qc_rows_quantity(inward.qc_passed_rows)
-                        failed = self._qc_rows_quantity(inward.qc_failed_rows)
-                        passed_quantity += passed
-                        failed_quantity += failed
-                        inspected = passed + failed
-                        if (
-                            str(inward.qc_status or "").strip().upper()
-                            not in {"COMPLETED", "PASS", "FAIL"}
-                            or inspected != int(inward.quantity_received or 0)
-                        ):
-                            all_inspected = False
-
-                    if not all_inspected:
-                        return "RESTORE_RECEIVED_QC_PENDING"
-                    if failed_quantity > 0:
-                        return "RESTORE_QC_FAILED"
-                    if passed_quantity >= sum(
-                        int(inward.quantity_received or 0)
-                        for inward in inwards
-                    ):
-                        return "RESTORE_COMPLETED"
-                    return "RESTORE_RECEIVED_QC_PENDING"
-
+            if not purchase_orders:
                 return "RESTORE_PO_RAISED"
 
-            # Keep a useful status if the linked PO was removed or archived.
+            po_statuses = {
+                str(purchase_order.status or "").strip().upper()
+                for purchase_order in purchase_orders
+            }
+            if po_statuses.intersection(
+                {"REJECTED", "FINANCE_REJECTED", "REPLACEMENT_FINANCE_REJECTED"}
+            ):
+                return "RESTORE_FINANCE_REJECTED"
+            if po_statuses.intersection(
+                {"PENDING_FINANCE", "REPLACEMENT_PENDING_FINANCE"}
+            ):
+                return "RESTORE_PENDING_FINANCE"
+
+            received_statuses = {
+                "REPLACEMENT_RECEIVED",
+                "REPLACEMENT_PARTIALLY_RECEIVED",
+            }
+            if po_statuses.intersection(received_statuses):
+                if (
+                    "REPLACEMENT_PARTIALLY_RECEIVED" in po_statuses
+                    or not po_statuses.issubset(received_statuses)
+                ):
+                    return "RESTORE_PARTIALLY_RECEIVED"
+
+                from inward.models import InwardEntry
+
+                inwards = list(
+                    InwardEntry.objects.filter(
+                        purchase_order_id__in=po_ids,
+                    )
+                    .exclude(removed_from_inventory=True)
+                    .only(
+                        "quantity_received",
+                        "qc_status",
+                        "qc_passed_rows",
+                        "qc_failed_rows",
+                    )
+                )
+                inspected_po_ids = {
+                    inward.purchase_order_id
+                    for inward in inwards
+                }
+                if not inwards or not set(po_ids).issubset(inspected_po_ids):
+                    return "RESTORE_RECEIVED_QC_PENDING"
+
+                all_inspected = True
+                passed_quantity = 0
+                failed_quantity = 0
+                for inward in inwards:
+                    passed = self._qc_rows_quantity(inward.qc_passed_rows)
+                    failed = self._qc_rows_quantity(inward.qc_failed_rows)
+                    passed_quantity += passed
+                    failed_quantity += failed
+                    inspected = passed + failed
+                    if (
+                        str(inward.qc_status or "").strip().upper()
+                        not in {"COMPLETED", "PASS", "FAIL"}
+                        or inspected != int(inward.quantity_received or 0)
+                    ):
+                        all_inspected = False
+
+                if not all_inspected:
+                    return "RESTORE_RECEIVED_QC_PENDING"
+                if failed_quantity > 0:
+                    return "RESTORE_QC_FAILED"
+                if passed_quantity >= sum(
+                    int(inward.quantity_received or 0)
+                    for inward in inwards
+                ):
+                    return "RESTORE_COMPLETED"
+                return "RESTORE_RECEIVED_QC_PENDING"
+
+            if po_statuses.intersection(
+                {"REPLACEMENT_ORDERED", "ORDERED"}
+            ):
+                return "RESTORE_ORDERED"
+            if po_statuses.intersection(
+                {"REPLACEMENT_APPROVED", "REPLACEMENT_FINANCE_APPROVED", "APPROVED"}
+            ):
+                return "RESTORE_FINANCE_APPROVED"
             return "RESTORE_PO_RAISED"
 
-        restore_status = str(
-            metadata.get("procurement_restore_status") or ""
-        ).strip().upper()
         if restore_status == "PENDING_PROCUREMENT":
             return "PENDING_PROCUREMENT"
         if restore_status == "PO_RAISED":
             return "RESTORE_PO_RAISED"
+        if restore_status == "PENDING_FINANCE":
+            return "RESTORE_PENDING_FINANCE"
+        if restore_status == "FINANCE_APPROVED":
+            return "RESTORE_FINANCE_APPROVED"
+        if restore_status == "ORDERED":
+            return "RESTORE_ORDERED"
+        if restore_status == "FINANCE_REJECTED":
+            return "RESTORE_FINANCE_REJECTED"
         if restore_status == "NOT_REQUIRED":
             return "FINAL_SCRAP"
 

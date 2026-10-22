@@ -451,6 +451,10 @@ class InwardEntrySerializer(CostDetailsSerializerMixin, serializers.ModelSeriali
         serializers.SerializerMethodField()
     )
 
+    is_returnable_restore = (
+        serializers.SerializerMethodField()
+    )
+
     line_items = InwardLineItemSerializer(
         many=True,
         required=False,
@@ -467,6 +471,7 @@ class InwardEntrySerializer(CostDetailsSerializerMixin, serializers.ModelSeriali
             "qc_passed_count",
             "qc_failed_count",
             "source_mr_number",
+            "is_returnable_restore",
             "component_code",
             "component_name",
             "purchase_order_number",
@@ -496,6 +501,34 @@ class InwardEntrySerializer(CostDetailsSerializerMixin, serializers.ModelSeriali
             .source_mr_number
             or ""
         ).strip()
+
+    def get_is_returnable_restore(self, obj):
+        purchase_order = obj.purchase_order
+        visited_ids = set()
+
+        while purchase_order is not None:
+            po_id = getattr(purchase_order, "pk", None)
+            if po_id is not None and po_id in visited_ids:
+                return False
+            if po_id is not None:
+                visited_ids.add(po_id)
+
+            remarks = str(
+                getattr(purchase_order, "remarks", "") or ""
+            ).upper()
+            if (
+                "RETURNABLE_RESTORE" in remarks
+                and "RETURNABLE_RESTORE_OUTWARD:" in remarks
+            ):
+                return True
+
+            purchase_order = getattr(
+                purchase_order,
+                "replacement_for",
+                None,
+            )
+
+        return False
 
     def get_purchase_order_number(self, obj):
         if not obj.purchase_order:

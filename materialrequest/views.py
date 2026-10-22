@@ -114,6 +114,102 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
             "on",
         }
 
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="finish-assembly",
+    )
+    def finish_assembly(self, request, pk=None):
+        auth = getattr(request, "auth", None)
+        try:
+            role = auth.get("active_role") or auth.get("activeRole") or ""
+        except (AttributeError, TypeError):
+            role = ""
+        if not role:
+            role = getattr(request.user, "active_role", "") or getattr(
+                request.user, "role", ""
+            )
+        role = str(getattr(role, "name", role) or "").strip().lower()
+        if role not in {"engineer", "admin"}:
+            return Response(
+                {"detail": "Only Engineer or Admin can finish an Assembly MR."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        with transaction.atomic():
+            try:
+                material_request = (
+                    MaterialRequest.objects
+                    .select_for_update()
+                    .get(pk=pk)
+                )
+            except MaterialRequest.DoesNotExist:
+                return Response(
+                    {"detail": "Material Request was not found."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            request_type = str(
+                material_request.request_type or ""
+            ).strip().upper()
+            if request_type not in {
+                "BOM",
+                "CUSTOM_BOM",
+                "CUSTOMIZED_BOM",
+                "CUSTOMISED_BOM",
+                "R&D",
+                "RD",
+            }:
+                return Response(
+                    {"detail": "Finish is only available for BOM, Custom BOM, and R&D requests."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if material_request.status == "MR_COMPLETED":
+                return Response(
+                    self.get_serializer(material_request).data,
+                    status=status.HTTP_200_OK,
+                )
+
+            if material_request.status != "INVENTORY_ISSUED":
+                return Response(
+                    {
+                        "detail": (
+                            "This request can be finished only after all "
+                            "components have been issued to Inventory."
+                        )
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            project_rows = list(
+                ProjectInventory.objects
+                .select_for_update()
+                .filter(material_request=material_request)
+                .order_by("id")
+            )
+            if not project_rows or not all(
+                row.is_fulfilled for row in project_rows
+            ):
+                return Response(
+                    {
+                        "detail": (
+                            "Every component line must be fully issued "
+                            "before this request can be finished."
+                        )
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            material_request.status = "MR_COMPLETED"
+            material_request.save(update_fields=["status"])
+            transaction.on_commit(invalidate_material_request_cache)
+
+        return Response(
+            self.get_serializer(material_request).data,
+            status=status.HTTP_200_OK,
+        )
+
     @staticmethod
     def get_next_material_request_id():
         """
@@ -2049,9 +2145,9 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
                 }
             )
 
-        # In Drone already treats INVENTORY_ISSUED as a completed issue.
-        # No Inventory/Procurement action is required for this Retail Sale.
-        material_request.status = "INVENTORY_ISSUED"
+        # Retail Sales is completed as soon as every component is issued.
+        # Its MR must enter In Drone automatically without a Finish action.
+        material_request.status = "MR_COMPLETED"
         material_request.po_raised = False
         material_request.save(
             update_fields=[
@@ -2226,7 +2322,7 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
         #   Manager approval
         #       -> available In-Store qty => Inventory issue
         #       -> shortage => Procurement / PO / Inward / QC
-        #       -> after full Inventory issue => In Drone
+        #       -> after full Inventory issue => MR_COMPLETED and In Drone
         #       -> Finance can then choose Sales
         #       -> Management approval => Outward Sales approved.
 
@@ -2307,8 +2403,13 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
                 "PROCUREMENT_PENDING"
             )
         elif all_fulfilled:
+            request_type = str(
+                material_request.request_type or ""
+            ).strip().upper()
             material_request.status = (
-                "INVENTORY_ISSUED"
+                "MR_COMPLETED"
+                if request_type in {"RETAIL_SALES", "RETURNABLE"}
+                else "INVENTORY_ISSUED"
             )
         else:
             material_request.status = (
@@ -2842,7 +2943,7 @@ class MaterialRequestViewSet(viewsets.ModelViewSet):
                 and str(
                     material_request.status or ""
                 ).strip().upper()
-                == "INVENTORY_ISSUED"
+                in {"INVENTORY_ISSUED", "MR_COMPLETED"}
             )
 
             if retail_sales_auto_issued:

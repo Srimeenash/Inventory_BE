@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from copy import deepcopy
 from uuid import uuid4
 
 from django.conf import settings
@@ -50,6 +51,7 @@ COMPONENT_USAGE_LIST_CACHE_VERSION_KEY = "ipms:componentusage:list:version"
 # the ORM. Use the same version key as NotificationViewSet so its cached list
 # is invalidated immediately when Returnable workflow changes.
 NOTIFICATION_LIST_CACHE_VERSION_KEY = "ipms:notifications:list:version"
+OUTWARD_LIST_CACHE_VERSION_KEY = "ipms:outward:list:version:v2"
 
 User = get_user_model()
 
@@ -69,6 +71,11 @@ def invalidate_notification_cache():
     versioned list-cache key here.
     """
     invalidate_cache_version(NOTIFICATION_LIST_CACHE_VERSION_KEY)
+
+
+def invalidate_outward_cache():
+    """Refresh Outward after Returnable QC creates its Scrap record."""
+    invalidate_cache_version(OUTWARD_LIST_CACHE_VERSION_KEY)
 
 
 class ComponentUsageViewSet(ModelViewSet):
@@ -2385,6 +2392,111 @@ class ComponentUsageViewSet(ModelViewSet):
         return details
 
     @classmethod
+    def _split_unreturned_assembly_usage_rows(cls, rows):
+        """Expand issued BOM/R&D quantities into independently returnable units."""
+        expanded_rows = []
+        changed = False
+        serial_fields = (
+            "serial_numbers",
+            "issued_serial_numbers",
+            "selected_serials",
+            "serials",
+        )
+
+        for row in rows or []:
+            source = str(
+                cls._usage_metadata(row).get("source") or ""
+            ).strip().upper()
+            quantity = max(int(getattr(row, "quantity", 0) or 0), 0)
+            if (
+                source != "ASSEMBLY_MR"
+                or not row.issued_date
+                or row.received_date
+                or quantity <= 1
+            ):
+                expanded_rows.append(row)
+                continue
+
+            serials = cls.normalize_serials(
+                getattr(row, "issued_serial_numbers", [])
+            )
+            original_details = cls._usage_metadata_list(row)
+            unit_rows = []
+
+            for unit_index in range(quantity):
+                unit_serials = (
+                    serials[unit_index:unit_index + 1]
+                    if unit_index < len(serials)
+                    else []
+                )
+                unit_details = deepcopy(original_details)
+                for detail in unit_details:
+                    if "quantity" in detail:
+                        detail["quantity"] = 1
+                    detail["assembly_unit_number"] = unit_index + 1
+                    detail["assembly_unit_count"] = quantity
+
+                    for field_name in serial_fields:
+                        if field_name not in detail:
+                            continue
+                        detail_serials = cls.normalize_serials(
+                            detail.get(field_name)
+                        )
+                        if len(detail_serials) == quantity:
+                            detail[field_name] = (
+                                detail_serials[unit_index:unit_index + 1]
+                            )
+                        elif len(detail_serials) == len(serials):
+                            detail[field_name] = (
+                                detail_serials[unit_index:unit_index + 1]
+                                if unit_index < len(detail_serials)
+                                else []
+                            )
+                        elif unit_serials and unit_serials[0] in detail_serials:
+                            detail[field_name] = [unit_serials[0]]
+                        else:
+                            detail[field_name] = []
+
+                if unit_index == 0:
+                    unit = row
+                    unit.quantity = 1
+                    unit.issued_serial_numbers = unit_serials
+                    unit.inventory_issue_details = unit_details
+                    unit.save(
+                        update_fields=[
+                            "quantity",
+                            "issued_serial_numbers",
+                            "inventory_issue_details",
+                        ]
+                    )
+                else:
+                    clone_values = {}
+                    for field in row._meta.concrete_fields:
+                        if field.primary_key or field.name in {
+                            "created_at",
+                            "updated_at",
+                        }:
+                            continue
+                        value = getattr(row, field.attname)
+                        if field.get_internal_type() == "JSONField":
+                            value = deepcopy(value)
+                        clone_values[field.attname] = value
+
+                    clone_values.update(
+                        quantity=1,
+                        issued_serial_numbers=unit_serials,
+                        inventory_issue_details=unit_details,
+                    )
+                    unit = ComponentUsage.objects.create(**clone_values)
+
+                unit_rows.append(unit)
+
+            expanded_rows.extend(unit_rows)
+            changed = True
+
+        return expanded_rows, changed
+
+    @classmethod
     def _movement_id_for_usage(cls, usage):
         return str(
             cls._usage_metadata(usage).get("movement_id") or ""
@@ -2610,6 +2722,290 @@ class ComponentUsageViewSet(ModelViewSet):
         )
 
     @action(
+        detail=False,
+        methods=["post"],
+        url_path="sync-assembly-mr",
+    )
+    @transaction.atomic
+    def sync_assembly_mr(self, request):
+        """Track every issued BOM/R&D component, including partial issue batches."""
+        try:
+            self.require_role(
+                request,
+                {
+                    "engineer",
+                    "inventory",
+                    "admin",
+                    "manager",
+                    "procurement",
+                    "finance",
+                    "management",
+                },
+            )
+        except PermissionError as exc:
+            return Response(
+                {"detail": str(exc)},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        material_request = self._resolve_material_request(
+            request.data.get("material_request_id")
+            or request.data.get("material_request")
+            or request.data.get("mr_id"),
+            lock=True,
+        )
+        if material_request is None:
+            return Response(
+                {"detail": "Material Request was not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        request_type = str(
+            material_request.request_type or ""
+        ).strip().upper()
+        if request_type not in {
+            "BOM",
+            "CUSTOM_BOM",
+            "CUSTOMIZED_BOM",
+            "CUSTOMISED_BOM",
+            "R&D",
+            "RD",
+        }:
+            return Response(
+                {"detail": "Only BOM, Custom BOM, and R&D Material Requests can be synchronized here."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        all_existing = list(
+            ComponentUsage.objects
+            .select_for_update()
+            .select_related("component", "material_request")
+            .filter(material_request=material_request)
+            .order_by("id")
+        )
+        existing = [
+            row for row in all_existing
+            if str(self._usage_metadata(row).get("source") or "").strip().upper()
+            == "ASSEMBLY_MR"
+        ]
+        existing, split_existing = self._split_unreturned_assembly_usage_rows(existing)
+        rows_changed = bool(split_existing)
+
+        project_rows = list(
+            ProjectInventory.objects
+            .select_for_update()
+            .select_related("component")
+            .filter(material_request=material_request)
+            .order_by("id")
+        )
+        if not project_rows:
+            if not existing:
+                return Response(
+                    {"detail": "No issued Project Inventory rows were found for this BOM/R&D request."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+        project_row_by_id = {
+            str(row.pk): row
+            for row in project_rows
+        }
+        project_row_by_component = {
+            str(row.component_id): row
+            for row in project_rows
+            if getattr(row, "component_id", None) is not None
+        }
+        accounted_quantity_by_project = {}
+        accounted_serials_by_project = {}
+
+        for usage in existing:
+            metadata = self._usage_metadata(usage)
+            project_row = project_row_by_id.get(
+                str(metadata.get("project_inventory_id") or "")
+            )
+            if project_row is None and getattr(usage, "component_id", None) is not None:
+                project_row = project_row_by_component.get(
+                    str(usage.component_id)
+                )
+
+            if project_row is None:
+                continue
+
+            project_key = str(project_row.pk)
+            usage_quantity = max(
+                int(
+                    getattr(usage, "quantity", 0)
+                    or metadata.get("quantity", 0)
+                    or 0
+                ),
+                0,
+            )
+            accounted_quantity_by_project[project_key] = (
+                accounted_quantity_by_project.get(project_key, 0)
+                + usage_quantity
+            )
+
+            usage_serials = self.normalize_serials(
+                getattr(usage, "issued_serial_numbers", [])
+            )
+            for detail in self._usage_metadata_list(usage):
+                for field_name in (
+                    "serial_numbers",
+                    "issued_serial_numbers",
+                    "selected_serials",
+                    "serials",
+                ):
+                    usage_serials = self.normalize_serials(
+                        usage_serials + self.normalize_serials(detail.get(field_name))
+                    )
+            accounted_serials_by_project[project_key] = self.normalize_serials(
+                accounted_serials_by_project.get(project_key, []) + usage_serials
+            )
+
+            if not metadata.get("project_inventory_id"):
+                self._set_usage_metadata(
+                    usage,
+                    project_inventory_id=project_row.pk,
+                    quantity=usage_quantity,
+                )
+                usage.save(update_fields=["inventory_issue_details"])
+                rows_changed = True
+
+        requested_date = material_request.date or timezone.localdate()
+        created = []
+        for project_row in project_rows:
+            issued_quantity = max(
+                int(getattr(project_row, "issued_store_quantity", 0) or 0)
+                + int(getattr(project_row, "issued_purchased_quantity", 0) or 0),
+                0,
+            )
+            component = project_row.component
+            if issued_quantity <= 0 or component is None:
+                continue
+
+            project_key = str(project_row.pk)
+            accounted_quantity = accounted_quantity_by_project.get(project_key, 0)
+            delta_quantity = max(issued_quantity - accounted_quantity, 0)
+            if delta_quantity <= 0:
+                continue
+
+            issued_serials = self.normalize_serials(
+                self.normalize_serials(
+                    getattr(project_row, "issued_store_serials", [])
+                )
+                + self.normalize_serials(
+                    getattr(project_row, "issued_purchased_serials", [])
+                )
+            )
+            accounted_serials = accounted_serials_by_project.get(project_key, [])
+            accounted_serial_set = set(accounted_serials)
+            if (
+                accounted_quantity > 0
+                and len(accounted_serial_set) < min(accounted_quantity, len(issued_serials))
+            ):
+                # Legacy usage rows may have quantity but no serial snapshots.
+                # Treat the already-accounted prefix as assigned so a later
+                # partial issue does not reuse those serials.
+                accounted_serial_set.update(issued_serials[:accounted_quantity])
+            delta_serials = [
+                serial for serial in issued_serials
+                if serial not in accounted_serial_set
+            ][:delta_quantity]
+
+            first_new_unit = accounted_quantity + 1
+            last_new_unit = issued_quantity
+            movement_id = (
+                f"ASSEMBLY-MR-{material_request.pk}-PI-{project_row.pk}"
+                f"-Q{first_new_unit}-{last_new_unit}"
+            )
+            created.append(
+                ComponentUsage.objects.create(
+                    material_request=material_request,
+                    employee_name=(
+                        material_request.requester_name or "Engineer"
+                    ),
+                    item_source="INVENTORY",
+                    component=component,
+                    component_name=(
+                        getattr(component, "name", "")
+                        or getattr(component, "component_name", "")
+                        or getattr(component, "component_id", "")
+                        or getattr(component, "code", "")
+                        or f"Component {component.pk}"
+                    ),
+                    component_type=(
+                        getattr(component, "component_type", "") or ""
+                    ),
+                    purpose="",
+                    requested_date=requested_date,
+                    return_due_date=material_request.required_date,
+                    issued_date=timezone.localdate(),
+                    quantity=delta_quantity,
+                    status="ISSUED",
+                    remarks=(
+                        getattr(material_request, "remarks", "") or ""
+                    ),
+                    return_approval_status="NOT_REQUIRED",
+                    issued_serial_numbers=delta_serials,
+                    inventory_issue_details=[
+                        {
+                            "source": "ASSEMBLY_MR",
+                            "assembly_return_tracking": True,
+                            "assembly_type": request_type,
+                            "customized_bom": bool(
+                                getattr(material_request, "customized_bom", False)
+                            ),
+                            "project_inventory_id": project_row.pk,
+                            "movement_id": movement_id,
+                            "mode": "COMPONENT",
+                            "quantity": delta_quantity,
+                        }
+                    ],
+                    inventory_adjusted=False,
+                    inventory_returned=False,
+                )
+            )
+            accounted_quantity_by_project[project_key] = issued_quantity
+            accounted_serials_by_project[project_key] = self.normalize_serials(
+                accounted_serials + delta_serials
+            )
+
+        if not existing and not created:
+            return Response(
+                {"detail": "No issued BOM/R&D component quantities were available to synchronize."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        if created:
+            rows_changed = True
+
+        synced_rows = list(
+            ComponentUsage.objects
+            .select_for_update()
+            .select_related("component", "material_request")
+            .filter(material_request=material_request)
+            .order_by("id")
+        )
+        synced_rows = [
+            row for row in synced_rows
+            if str(self._usage_metadata(row).get("source") or "").strip().upper()
+            == "ASSEMBLY_MR"
+        ]
+        synced_rows, split_synced = self._split_unreturned_assembly_usage_rows(synced_rows)
+        rows_changed = rows_changed or bool(split_synced)
+
+        if rows_changed:
+            transaction.on_commit(invalidate_component_usage_cache)
+
+        return Response(
+            self.get_serializer(synced_rows, many=True).data,
+            status=(
+                status.HTTP_201_CREATED
+                if created
+                else status.HTTP_200_OK
+            ),
+        )
+
+    @action(
         detail=True,
         methods=["post"],
         url_path="engineer-return",
@@ -2671,6 +3067,149 @@ class ComponentUsageViewSet(ModelViewSet):
             )
 
         remarks = str(request.data.get("remarks") or "").strip()
+
+        # Assembly MRs return selected component lines independently. The
+        # selected ids are handled atomically so a partial selection cannot
+        # accidentally return the other issued components in the MR.
+        selected_usage_ids = request.data.get("usage_ids")
+        if selected_usage_ids is not None:
+            request_type = str(
+                getattr(usage.material_request, "request_type", "") or ""
+            ).strip().upper()
+            if (
+                request_type not in {"BOM", "R&D", "RD"}
+                or str(self._usage_metadata(usage).get("source") or "").upper()
+                != "ASSEMBLY_MR"
+            ):
+                return Response(
+                    {"detail": "Selected component return is available only for issued BOM/R&D assembly lines."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if not isinstance(selected_usage_ids, list) or not selected_usage_ids:
+                return Response(
+                    {"usage_ids": "Select at least one component line to return."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            parsed_ids = []
+            for value in selected_usage_ids:
+                try:
+                    usage_id = int(value)
+                except (TypeError, ValueError):
+                    usage_id = 0
+                if usage_id <= 0:
+                    return Response(
+                        {"usage_ids": "Every selected component id must be valid."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                parsed_ids.append(usage_id)
+
+            parsed_ids = list(dict.fromkeys(parsed_ids))
+            if int(usage.pk) not in parsed_ids:
+                return Response(
+                    {"usage_ids": "The URL component must be included in the selected lines."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            selected_rows = list(
+                ComponentUsage.objects
+                .select_for_update()
+                .select_related("component", "material_request")
+                .filter(
+                    pk__in=parsed_ids,
+                    material_request_id=usage.material_request_id,
+                )
+                .order_by("id")
+            )
+            if len(selected_rows) != len(parsed_ids):
+                return Response(
+                    {"usage_ids": "One or more selected components do not belong to this Material Request."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if any(
+                row.purpose
+                or str(self._usage_metadata(row).get("source") or "").upper()
+                != "ASSEMBLY_MR"
+                for row in selected_rows
+            ):
+                return Response(
+                    {"usage_ids": "Select only BOM/R&D assembly component lines."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if any(
+                not row.issued_date or row.received_date
+                for row in selected_rows
+            ):
+                return Response(
+                    {"detail": "Every selected component must be issued and not already returned."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            actor = self._actor_name(request.user)
+            mr_number = (
+                getattr(usage.material_request, "material_request_id", "")
+                or "Assembly"
+            )
+            movement_id = (
+                f"ASSEMBLY-RETURN-{usage.material_request_id}-"
+                f"{uuid4().hex[:12].upper()}"
+            )
+            notifications = []
+            for row in selected_rows:
+                self._set_usage_metadata(
+                    row,
+                    movement_id=movement_id,
+                    assembly_return=True,
+                    returned_by=actor,
+                    return_date=raw_date,
+                    return_remarks=remarks,
+                    return_qc_status="PENDING",
+                )
+                row.received_date = return_date
+                row.return_condition = ""
+                row.return_reason = ""
+                row.return_approval_status = "NOT_REQUIRED"
+                row.save(
+                    update_fields=[
+                        "received_date",
+                        "return_condition",
+                        "return_reason",
+                        "return_approval_status",
+                        "inventory_issue_details",
+                    ]
+                )
+
+                notification, _ = Notification.objects.update_or_create(
+                    category="CU",
+                    receiver="INVENTORY",
+                    reference_id=str(row.pk),
+                    defaults={
+                        "requested_by": actor,
+                        "title": f"Return QC Required - {mr_number}",
+                        "message": (
+                            f"{actor} returned {row.component_name or 'Component'} "
+                            f"(Qty {int(row.quantity or 0)}) from {mr_number} "
+                            f"on {raw_date}. Inventory QC is required."
+                        ),
+                        "status": "INVENTORY_CHECK_PENDING",
+                        "is_read": False,
+                    },
+                )
+                notifications.append(notification.pk)
+
+            transaction.on_commit(invalidate_component_usage_cache)
+            transaction.on_commit(invalidate_notification_cache)
+            return Response(
+                {
+                    "detail": "Selected components moved to Inventory Returned. QC is pending.",
+                    "material_request_id": mr_number,
+                    "return_date": raw_date,
+                    "rows": self.get_serializer(selected_rows, many=True).data,
+                    "notification_ids": notifications,
+                },
+                status=status.HTTP_200_OK,
+            )
+
         rows = self._movement_rows(usage, lock=True)
         self._hydrate_missing_usage_serials(
             rows
@@ -2830,15 +3369,51 @@ class ComponentUsageViewSet(ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # View Details needs the exact In-Drone serials at every workflow
-        # stage, not only after Engineer clicks Move to Return.  QC itself is
-        # still protected by return_qc(), which requires returned rows.
-        rows = list(
-            self._movement_rows(
-                usage,
-                lock=True,
+        # QC can cover several partial Assembly returns from the same MR.
+        # Hydrate the exact selected rows instead of narrowing to the URL
+        # row's movement.
+        requested_usage_ids = request.data.get("usage_ids")
+        if requested_usage_ids is not None:
+            if not isinstance(requested_usage_ids, list) or not requested_usage_ids:
+                return Response(
+                    {"usage_ids": "Provide one or more usage ids to hydrate."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            try:
+                usage_ids = list(dict.fromkeys(int(value) for value in requested_usage_ids))
+            except (TypeError, ValueError):
+                return Response(
+                    {"usage_ids": "Every usage id must be a valid integer."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if int(usage.pk) not in usage_ids:
+                return Response(
+                    {"usage_ids": "The URL usage id must be included."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            rows = list(
+                ComponentUsage.objects
+                .select_for_update()
+                .select_related("component", "material_request")
+                .filter(
+                    pk__in=usage_ids,
+                    material_request_id=usage.material_request_id,
+                )
+                .order_by("id")
             )
-        )
+            if len(rows) != len(usage_ids) or any(
+                str(self._usage_metadata(row).get("source") or "").strip().upper()
+                != "ASSEMBLY_MR"
+                for row in rows
+            ):
+                return Response(
+                    {"usage_ids": "Select only Assembly components from this Material Request."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            # View Details needs exact In-Drone serials at every stage.
+            rows = list(self._movement_rows(usage, lock=True))
 
         if not rows:
             return Response(
@@ -3328,7 +3903,26 @@ class ComponentUsageViewSet(ModelViewSet):
             or "Returnable"
         )
         purpose = str(first.purpose or "").strip().upper()
-        purpose_label = cls._returnable_purpose_label(purpose)
+        first_usage_metadata = cls._usage_metadata(first)
+        assembly_return = bool(
+            str(first_usage_metadata.get("source") or "").upper()
+            == "ASSEMBLY_MR"
+        )
+        source_request_type = str(
+            getattr(material_request, "request_type", "") or ""
+        ).strip().upper()
+        purpose_label = (
+            (
+                "Customised BOM"
+                if source_request_type == "BOM"
+                and bool(getattr(material_request, "customized_bom", False))
+                else "BOM"
+                if source_request_type == "BOM"
+                else "R&D"
+            )
+            if assembly_return
+            else cls._returnable_purpose_label(purpose)
+        )
 
         movement_id = cls._movement_id_for_usage(first)
         if not movement_id:
@@ -3396,12 +3990,13 @@ class ComponentUsageViewSet(ModelViewSet):
 
         qc_remarks = " | ".join(remark_parts)
         outward_remarks = (
-            f"Returnable {purpose_label} QC Failed - {mr_number}."
-            + (
-                f" NOT OK Remarks: {qc_remarks}"
-                if qc_remarks
-                else " One or more returned components were marked NOT OK."
-            )
+            f"{purpose_label} assembly return QC Failed - {mr_number}."
+            if assembly_return
+            else f"Returnable {purpose_label} QC Failed - {mr_number}."
+        ) + (
+            f" NOT OK Remarks: {qc_remarks}"
+            if qc_remarks
+            else " One or more returned components were marked NOT OK."
         )
 
         workflow = (
@@ -3410,12 +4005,9 @@ class ComponentUsageViewSet(ModelViewSet):
             else "RETURNABLE_COMPONENT_QC_V1"
         )
 
-        first_usage_metadata = cls._usage_metadata(
-            first
-        )
-
         metadata = {
             "workflow": workflow,
+            "assembly_return": assembly_return,
             "drone_instance_id": (
                 first_usage_metadata.get(
                     "drone_instance_id"
@@ -3449,9 +4041,7 @@ class ComponentUsageViewSet(ModelViewSet):
             "returnable_purpose_label": purpose_label,
             "source_mr_id": getattr(material_request, "pk", None),
             "source_mr_number": mr_number,
-            "source_mr_request_type": str(
-                getattr(material_request, "request_type", "") or ""
-            ),
+            "source_mr_request_type": source_request_type,
             "source_mr_customized_bom": bool(
                 getattr(material_request, "customized_bom", False)
             ),
@@ -3460,15 +4050,15 @@ class ComponentUsageViewSet(ModelViewSet):
             # GOOD = reusable pieces of a failed returned drone.
             # For loose component QC this remains empty because only failed
             # units enter the Scrap/Restore decision.
-            "selected_items": good_items,
+            "selected_items": [] if assembly_return else good_items,
             "return_items": [],
             "reorder_items": [],
-            "good_items": good_items,
+            "good_items": [] if assembly_return else good_items,
             "failed_items": bad_items,
             "scrap_quantity": bad_quantity,
             "selected_quantity": sum(
                 int(item.get("quantity") or 0)
-                for item in (good_items if drone_mode else [])
+                for item in (good_items if drone_mode and not assembly_return else [])
             ),
             "return_quantity": 0,
             "reorder_quantity": 0,
@@ -3492,10 +4082,15 @@ class ComponentUsageViewSet(ModelViewSet):
         if len(bad_items) == 1:
             single_component_id = bad_items[0].get("component")
 
+        failure_source_label = (
+            f"{purpose_label} Assembly"
+            if assembly_return
+            else "Returnable"
+        )
         product_name = (
             bad_items[0].get("label")
             if len(bad_items) == 1
-            else f"{bad_quantity} Returnable QC Failed item(s) - {mr_number}"
+            else f"{bad_quantity} {failure_source_label} QC Failed item(s) - {mr_number}"
         )
 
         actor_name = cls._actor_name(request.user)
@@ -3537,7 +4132,7 @@ class ComponentUsageViewSet(ModelViewSet):
             reference_id=str(scrap_entry.pk),
             defaults={
                 "requested_by": actor_name,
-                "title": f"Returnable QC Failed - {mr_number}",
+                "title": f"{failure_source_label} QC Failed - {mr_number}",
                 "message": outward_remarks,
                 "status": "PENDING_MANAGER",
                 "is_read": False,
@@ -3591,17 +4186,70 @@ class ComponentUsageViewSet(ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        rows = [
-            row
-            for row in self._movement_rows(usage, lock=True)
-            if row.received_date
-        ]
+        requested_usage_ids = request.data.get("usage_ids")
+        if requested_usage_ids is not None:
+            if not isinstance(requested_usage_ids, list) or not requested_usage_ids:
+                return Response(
+                    {"usage_ids": "Select one or more returned component rows."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            try:
+                usage_ids = list(dict.fromkeys(int(value) for value in requested_usage_ids))
+            except (TypeError, ValueError):
+                return Response(
+                    {"usage_ids": "Every usage id must be a valid integer."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if int(usage.pk) not in usage_ids:
+                return Response(
+                    {"usage_ids": "The URL usage id must be included."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            rows = list(
+                ComponentUsage.objects
+                .select_for_update()
+                .select_related("component", "material_request")
+                .filter(
+                    pk__in=usage_ids,
+                    material_request_id=usage.material_request_id,
+                    purpose=usage.purpose,
+                    received_date__isnull=False,
+                )
+                .order_by("id")
+            )
+            if len(rows) != len(usage_ids) or any(
+                str(self._usage_metadata(row).get("source") or "").strip().upper()
+                != "ASSEMBLY_MR"
+                for row in rows
+            ):
+                return Response(
+                    {"usage_ids": "Select only returned Assembly components from this Material Request."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            rows = [
+                row
+                for row in self._movement_rows(usage, lock=True)
+                if row.received_date
+            ]
         self._hydrate_missing_usage_serials(
             rows
         )
         if not rows:
             return Response(
                 {"detail": "This movement has not been moved to Returned yet."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        if any(
+            str(self._usage_metadata(row).get("return_qc_status") or "")
+            .strip()
+            .upper()
+            in {"PASSED", "FAILED"}
+            for row in rows
+        ):
+            return Response(
+                {"detail": "One or more selected components have already completed Return QC."},
                 status=status.HTTP_409_CONFLICT,
             )
 
@@ -3695,6 +4343,14 @@ class ComponentUsageViewSet(ModelViewSet):
                 "MISCELLANEOUS_USAGE",
             }
         )
+        assembly_return = (
+            request_type in {"BOM", "R&D", "RD"}
+            and any(
+                str(self._usage_metadata(row).get("source") or "").upper()
+                == "ASSEMBLY_MR"
+                for row in rows
+            )
+        )
         any_bad_in_movement = any(
             item["condition"] == "NOT_OK"
             for items in normalized_by_usage.values()
@@ -3775,10 +4431,15 @@ class ComponentUsageViewSet(ModelViewSet):
             or "Returnable"
         )
 
+        notification_refs = (
+            [str(row.pk) for row in rows]
+            if assembly_return
+            else [str(first.pk)]
+        )
         Notification.objects.filter(
             category="CU",
             receiver="INVENTORY",
-            reference_id=str(first.pk),
+            reference_id__in=notification_refs,
         ).update(
             status="QC_CHECKED",
             is_read=True,
@@ -3797,17 +4458,20 @@ class ComponentUsageViewSet(ModelViewSet):
         # A failed drone keeps its GOOD serials with the drone disposition data
         # and sends only the failed disposition through the existing Outward /
         # Manager Restore-Reorder workflow.
-        returned_to_store = (
-            []
-            if (
-                drone_mode
-                or any_bad_in_movement
-            )
-            else self._return_returnable_qc_passed_to_store(
+        if assembly_return:
+            # Assembly components are independent lines: QC-passed units go
+            # back to In Store even when another selected line failed QC.
+            returned_to_store = self._return_returnable_qc_passed_to_store(
                 rows,
                 normalized_by_usage,
             )
-        )
+        elif drone_mode or any_bad_in_movement:
+            returned_to_store = []
+        else:
+            returned_to_store = self._return_returnable_qc_passed_to_store(
+                rows,
+                normalized_by_usage,
+            )
 
         if any_bad_in_movement:
             scrap_entry = self._create_returnable_qc_scrap(
@@ -3824,6 +4488,11 @@ class ComponentUsageViewSet(ModelViewSet):
                 "QC_PASSED_DRONE_READY"
                 if drone_mode
                 else "QC_PASSED_RETURNED_TO_STORE"
+            )
+
+        if scrap_entry is not None:
+            transaction.on_commit(
+                invalidate_outward_cache
             )
 
         transaction.on_commit(

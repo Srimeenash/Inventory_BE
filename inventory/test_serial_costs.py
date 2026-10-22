@@ -158,6 +158,68 @@ class SerialCostFlowTests(TestCase):
         detail=OutwardEntrySerializer(outward).data['cost_details'][0]
         self.assertEqual(detail['component_name'],'Wings');self.assertEqual(detail['totals']['allocated_cost'],'45.16')
 
+    def test_outward_serializer_returns_prices_for_every_scrap_component(self):
+        first_receipt = self.receipt()
+        first_serials = self.qc(first_receipt, [1, 2])
+
+        other = Component.objects.create(
+            component_id='CMP-OTHER-SCRAP',
+            name='Motor',
+            category='ELECTRICALS',
+        )
+        PurchaseOrderItem.objects.create(
+            purchase_order=self.po,
+            component=other,
+            quantity=2,
+            unit_price='100',
+            gst_percentage=0,
+        )
+        other_receipt = InwardEntry.objects.create(
+            code='INW-OTHER-SCRAP',
+            vendor=self.vendor,
+            purchase_order=self.po,
+            component=other,
+            quantity_received=2,
+            received_date=date.today(),
+            qc_passed_rows=[
+                {'id': 1, 'serial_number': 'MOTOR-SCRAP-1', 'qty': 1},
+                {'id': 2, 'serial_number': 'MOTOR-SCRAP-2', 'qty': 1},
+            ],
+        )
+        record_inward_costs(other_receipt)
+        other_serials = ['MOTOR-SCRAP-1', 'MOTOR-SCRAP-2']
+
+        outward = OutwardEntry.objects.create(
+            code='SCRAP-MULTI-COMPONENT',
+            out_date=date.today(),
+            quantity=4,
+            inventory_allocations={
+                'scrap_items': [
+                    {
+                        'component': self.component.pk,
+                        'component_name': self.component.name,
+                        'quantity': 2,
+                        'serial_numbers': first_serials,
+                    },
+                    {
+                        'component': other.pk,
+                        'component_name': other.name,
+                        'quantity': 2,
+                        'serial_numbers': other_serials,
+                    },
+                ],
+            },
+        )
+
+        details = OutwardEntrySerializer(outward).data['cost_details']
+        self.assertEqual(len(details), 2)
+        self.assertEqual(
+            {detail['component_name'] for detail in details},
+            {'Wings', 'Motor'},
+        )
+        self.assertTrue(all(detail['totals']['allocated_cost'] for detail in details))
+        self.assertEqual(sum(detail['quantity'] for detail in details), 4)
+
     def test_material_request_and_project_keep_issued_costs(self):
         from materialrequest.models import MaterialRequest
         from materialrequest.serializers import MaterialRequestSerializer

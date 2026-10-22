@@ -21,6 +21,16 @@ class ComponentUsageSerializer(serializers.ModelSerializer):
     )
     component_code = serializers.CharField(source="component.component_id", read_only=True, default="")
     component_category = serializers.CharField(source="component.category", read_only=True, default="")
+    component_specifications = serializers.CharField(
+        source="component.specifications",
+        read_only=True,
+        default="",
+    )
+    component_master_type = serializers.CharField(
+        source="component.component_type",
+        read_only=True,
+        default="",
+    )
 
     material_request_number = serializers.CharField(
         source="material_request.material_request_id",
@@ -41,6 +51,11 @@ class ComponentUsageSerializer(serializers.ModelSerializer):
         source="material_request.request_type",
         read_only=True,
         default="",
+    )
+    customized_bom = serializers.BooleanField(
+        source="material_request.customized_bom",
+        read_only=True,
+        default=False,
     )
 
     # Flight Test / Demo / Event reuse the original In-Drone MR.

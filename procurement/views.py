@@ -711,12 +711,36 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             else {}
         )
 
-        metadata[
-            "procurement_restore_status"
-        ] = str(
+        next_restore_status = str(
             restore_status
             or ""
         ).strip().upper()
+
+        if next_restore_status == "FINANCE_APPROVED":
+            related_statuses = list(
+                PurchaseOrder.objects.filter(
+                    remarks__contains=(
+                        f"RETURNABLE_RESTORE_OUTWARD:{outward_id}"
+                    )
+                ).values_list("status", flat=True)
+            )
+            completed_statuses = {
+                "REPLACEMENT_APPROVED",
+                "REPLACEMENT_ORDERED",
+                "REPLACEMENT_PARTIALLY_RECEIVED",
+                "REPLACEMENT_RECEIVED",
+            }
+            next_restore_status = (
+                "FINANCE_APPROVED"
+                if related_statuses
+                and all(
+                    str(value or "").strip().upper() in completed_statuses
+                    for value in related_statuses
+                )
+                else "PENDING_FINANCE"
+            )
+
+        metadata["procurement_restore_status"] = next_restore_status
 
         metadata[
             "restore_last_po_id"
@@ -737,6 +761,8 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         status_map = {
             "FINANCE_APPROVED":
                 "RESTORE_FINANCE_APPROVED",
+            "PENDING_FINANCE":
+                "RESTORE_PENDING_FINANCE",
             "FINANCE_REJECTED":
                 "RESTORE_FINANCE_REJECTED",
             "ORDERED":
@@ -744,12 +770,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         }
 
         mapped_status = status_map.get(
-            str(
-                restore_status
-                or ""
-            )
-            .strip()
-            .upper()
+            next_restore_status
         )
 
         if mapped_status:
@@ -867,6 +888,9 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         return ""
 
     def sync_replacement_mr_status(self, purchase_order):
+        if self.get_returnable_restore_outward_id(purchase_order):
+            return None
+
         source_mr_number = str(
             purchase_order.source_mr_number or ""
         ).strip()
@@ -5504,6 +5528,8 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         )
 
         self.sync_replacement_mr_status(purchase_order)
+        transaction.on_commit(invalidate_purchase_order_cache)
+        transaction.on_commit(invalidate_po_notification_cache)
         return Response(self.get_serializer(purchase_order).data)
 
     @action(
@@ -5574,6 +5600,8 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         )
 
         self.sync_replacement_mr_status(purchase_order)
+        transaction.on_commit(invalidate_purchase_order_cache)
+        transaction.on_commit(invalidate_po_notification_cache)
         return Response(self.get_serializer(purchase_order).data)
 
     @action(

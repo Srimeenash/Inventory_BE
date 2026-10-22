@@ -2036,6 +2036,127 @@ class ProjectInventoryViewSet(
             status=status.HTTP_200_OK,
         )
 
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="finished-assembly-components",
+    )
+    def finished_assembly_components(self, request):
+        material_requests = list(
+            MaterialRequest.objects
+            .filter(
+                status="MR_COMPLETED",
+                request_type__in=["BOM", "R&D"],
+            )
+            .prefetch_related("project_inventory_items__component")
+            .order_by("id")
+        )
+        if not material_requests:
+            return Response([], status=status.HTTP_200_OK)
+
+        from componentusage.models import ComponentUsage
+
+        usage_rows = ComponentUsage.objects.filter(
+            material_request__in=material_requests,
+            received_date__isnull=False,
+        ).only(
+            "material_request_id",
+            "component_id",
+            "quantity",
+            "issued_serial_numbers",
+            "inventory_issue_details",
+        )
+        returned_by_project_row = defaultdict(int)
+        returned_serials_by_project_row = defaultdict(set)
+        for usage in usage_rows:
+            details = usage.inventory_issue_details
+            if not isinstance(details, list) or not any(
+                isinstance(detail, dict)
+                and str(detail.get("source") or "").strip().upper()
+                == "ASSEMBLY_MR"
+                for detail in details
+            ):
+                continue
+
+            project_row_ids = {
+                str(detail.get("project_inventory_id"))
+                for detail in details
+                if isinstance(detail, dict)
+                and detail.get("project_inventory_id") is not None
+            }
+            for project_row_id in project_row_ids:
+                returned_by_project_row[project_row_id] += max(
+                    int(usage.quantity or 0),
+                    0,
+                )
+                serials = usage.issued_serial_numbers
+                if isinstance(serials, list):
+                    returned_serials_by_project_row[
+                        project_row_id
+                    ].update(
+                        str(serial).strip()
+                        for serial in serials
+                        if str(serial).strip()
+                    )
+
+        rows = []
+        for material_request in material_requests:
+            for project_row in material_request.project_inventory_items.all():
+                issued_quantity = max(
+                    int(project_row.issued_store_quantity or 0)
+                    + int(project_row.issued_purchased_quantity or 0),
+                    0,
+                )
+                project_row_key = str(project_row.pk)
+                returned_quantity = min(
+                    issued_quantity,
+                    returned_by_project_row[project_row_key],
+                )
+                remaining_quantity = max(
+                    issued_quantity - returned_quantity,
+                    0,
+                )
+
+                component = project_row.component
+                issued_serials = []
+                for serial_group in (
+                    project_row.issued_store_serials,
+                    project_row.issued_purchased_serials,
+                ):
+                    if isinstance(serial_group, list):
+                        issued_serials.extend(
+                            str(serial).strip()
+                            for serial in serial_group
+                            if str(serial).strip()
+                        )
+                returned_serials = returned_serials_by_project_row[
+                    project_row_key
+                ]
+                remaining_serials = [
+                    serial
+                    for serial in issued_serials
+                    if serial not in returned_serials
+                ]
+
+                rows.append({
+                    "id": f"{material_request.pk}-{project_row.pk}",
+                    "material_request_id": material_request.material_request_id,
+                    "request_type": material_request.request_type,
+                    "customized_bom": material_request.customized_bom,
+                    "project": material_request.project,
+                    "component_id": component.component_id,
+                    "component_name": component.name or component.component_id,
+                    "component_type": component.component_type or "",
+                    "specifications": component.specifications or "",
+                    "unit": component.unit_of_measurements or "",
+                    "issued_quantity": issued_quantity,
+                    "returned_quantity": returned_quantity,
+                    "remaining_quantity": remaining_quantity,
+                    "serial_numbers": remaining_serials,
+                })
+
+        return Response(rows, status=status.HTTP_200_OK)
+
 
     @action(
         detail=False,
@@ -2354,8 +2475,13 @@ class ProjectInventoryViewSet(
         ).strip()
 
         if all_fulfilled:
+            request_type = str(
+                material_request.request_type or ""
+            ).strip().upper()
             material_request.status = (
-                "INVENTORY_ISSUED"
+                "MR_COMPLETED"
+                if request_type in {"RETAIL_SALES", "RETURNABLE"}
+                else "INVENTORY_ISSUED"
             )
             material_request.save(
                 update_fields=["status"]

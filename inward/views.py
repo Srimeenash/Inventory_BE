@@ -1078,24 +1078,28 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
     def is_returnable_restore_po(
         purchase_order,
     ):
-        if purchase_order is None:
-            return False
+        current_po = purchase_order
+        visited_ids = set()
 
-        remarks = str(
-            getattr(
-                purchase_order,
-                "remarks",
-                "",
-            )
-            or ""
-        ).upper()
+        while current_po is not None:
+            po_id = getattr(current_po, "pk", None)
+            if po_id is not None and po_id in visited_ids:
+                return False
+            if po_id is not None:
+                visited_ids.add(po_id)
 
-        return (
-            "RETURNABLE_RESTORE"
-            in remarks
-            and "RETURNABLE_RESTORE_OUTWARD:"
-            in remarks
-        )
+            remarks = str(
+                getattr(current_po, "remarks", "") or ""
+            ).upper()
+            if (
+                "RETURNABLE_RESTORE" in remarks
+                and "RETURNABLE_RESTORE_OUTWARD:" in remarks
+            ):
+                return True
+
+            current_po = getattr(current_po, "replacement_for", None)
+
+        return False
 
     @staticmethod
     def get_returnable_restore_outward_id(
@@ -2695,6 +2699,8 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             source_po.source_mr_number
             or ""
         ).strip()
+        is_returnable_restore = self.is_returnable_restore_po(source_po)
+        is_direct_po = not source_mr_number
 
         # ------------------------------------------------------------
         # DIRECT vs MR FLOW
@@ -2709,12 +2715,27 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
         #
         # Therefore do not use order_type to decide Direct vs MR.
         # ------------------------------------------------------------
-        is_direct_po = not source_mr_number
-
         current_qc_action = str(
             inward_entry.qc_failed_action
             or "NONE"
         ).strip().upper()
+        existing_refund_statuses = {
+            str(row.get("refund_status") or "").strip().upper()
+            for row in (inward_entry.qc_failed_rows or [])
+            if isinstance(row, dict)
+        }
+        if existing_refund_statuses.intersection(
+            {"PENDING_PROCUREMENT", "PENDING_FINANCE", "REFUNDED"}
+        ):
+            return Response(
+                {
+                    "detail": (
+                        "Refund has already been selected for this "
+                        "failed QC entry."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         # Request may already be waiting for Procurement before a PO exists.
         if (
@@ -2822,7 +2843,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             else source_po
         )
 
-        if material_request:
+        if material_request and not is_returnable_restore:
             # MR-linked PO:
             # replacement quantity must stay within the still-unfulfilled
             # procurement requirement for this MR component.
@@ -3015,7 +3036,8 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
         )
 
         if (
-            material_request
+            not is_returnable_restore
+            and material_request
             and str(
                 material_request.status
                 or ""
@@ -3275,7 +3297,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             failed_quantity
         )
 
-        if material_request is not None:
+        if material_request is not None and not self.is_returnable_restore_po(source_po):
             request_items = (
                 self.get_material_request_items(
                     material_request,
@@ -3667,7 +3689,10 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             invalidate_purchase_orders_list_cache
         )
 
-        if material_request is not None:
+        if (
+            material_request is not None
+            and not self.is_returnable_restore_po(source_po)
+        ):
             material_request.status = (
                 "REPLACEMENT_APPROVED"
             )
@@ -3930,7 +3955,10 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             or ""
         ).strip()
 
-        if source_mr_number:
+        if (
+            source_mr_number
+            and not self.is_returnable_restore_po(source_po)
+        ):
             material_request = (
                 MaterialRequest.objects
                 .select_for_update()
@@ -4163,28 +4191,17 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             or ""
         ).strip()
 
-        # ------------------------------------------------------------
-        # REFUND ELIGIBILITY
-        # ------------------------------------------------------------
-        # Direct flow:
-        #     source_mr_number is empty
-        #     -> Refund is allowed
-        #     -> Replacement is allowed
-        #
-        # This intentionally includes Direct-origin Replacement POs
-        # such as 01/26-27-R1, 01/26-27-R2, etc.
-        #
-        # MR flow:
-        #     source_mr_number is present
-        #     -> Refund is NOT allowed
-        #     -> Replacement only
-        # ------------------------------------------------------------
-        if source_mr_number:
+        # Direct and Restore-origin QC failures may be refunded. Ordinary
+        # MR procurement remains replacement-only.
+        is_returnable_restore = self.is_returnable_restore_po(
+            source_po
+        )
+        if source_mr_number and not is_returnable_restore:
             return Response(
                 {
                     "detail": (
-                        "Refund is not available for an MR-linked PO. "
-                        "Use Replacement for MR flow QC failures."
+                        "Refund is available only for Direct PO or "
+                        "Restore QC failures."
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
@@ -4221,7 +4238,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                 {
                     "detail": (
                         "The failed component is not present "
-                        "on the Direct PO."
+                        "on the source PO."
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
@@ -4243,7 +4260,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                 {
                     "detail": (
                         "Failed QC quantity is greater than "
-                        "the Direct PO item quantity."
+                        "the source PO item quantity."
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
@@ -4397,7 +4414,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                 "requested_by":
                     actor,
                 "title": (
-                    "Direct PO QC Refund Approval - "
+                    "QC Refund Approval - "
                     f"{source_po.po_number}"
                 ),
                 "message": (
@@ -4477,7 +4494,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             from rest_framework.exceptions import PermissionDenied
 
             raise PermissionDenied(
-                "Only Procurement can approve a Direct PO Refund request."
+                "Only Procurement can approve a QC Refund request."
             )
 
         try:
@@ -4609,11 +4626,11 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
                 "requested_by":
                     actor,
                 "title": (
-                    "Direct PO QC Refund Finance Approval - "
+                    "QC Refund Finance Approval - "
                     f"{getattr(source_po, 'po_number', '-')}"
                 ),
                 "message": (
-                    "Procurement approved the Direct PO QC Failed refund. "
+                    "Procurement approved the QC Failed refund. "
                     "Finance approval is required before quantity/value is deducted."
                 ),
                 "status":
@@ -4663,7 +4680,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             from rest_framework.exceptions import PermissionDenied
 
             raise PermissionDenied(
-                "Only Finance can approve a Direct PO Refund request."
+                "Only Finance can approve a QC Refund request."
             )
 
         try:
@@ -4751,7 +4768,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             return Response(
                 {
                     "detail":
-                        "Source Direct PO/component could not be resolved."
+                        "Source PO/component could not be resolved."
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
@@ -4761,15 +4778,15 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             or ""
         ).strip()
 
-        # Finance may approve Refund for any Direct-flow PO,
-        # including Direct-origin Replacement POs (-R1/-R2/...).
-        # MR-linked QC failures remain Replacement-only.
-        if source_mr_number:
+        is_returnable_restore = self.is_returnable_restore_po(
+            source_po
+        )
+        if source_mr_number and not is_returnable_restore:
             return Response(
                 {
                     "detail": (
-                        "Refund is not available for an MR-linked PO. "
-                        "Use Replacement for MR flow QC failures."
+                        "Refund is available only for Direct PO or "
+                        "Restore QC failures."
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
@@ -4792,7 +4809,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             return Response(
                 {
                     "detail":
-                        "Direct PO item could not be resolved."
+                        "Source PO item could not be resolved."
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
@@ -4827,7 +4844,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             return Response(
                 {
                     "detail":
-                        "Refund quantity is invalid for the current Direct PO quantity."
+                        "Refund quantity is invalid for the current PO quantity."
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
@@ -4918,7 +4935,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
         return Response(
             {
                 "detail":
-                    "Finance approved Refund. Direct PO quantity and value were reduced.",
+                    "Finance approved Refund. Source PO quantity and value were reduced.",
                 "status":
                     "REFUNDED",
                 "source_po_id":
@@ -4959,7 +4976,7 @@ class InwardEntryViewSet(viewsets.ModelViewSet):
             from rest_framework.exceptions import PermissionDenied
 
             raise PermissionDenied(
-                "Only Finance can reject a Direct PO Refund request."
+                "Only Finance can reject a QC Refund request."
             )
 
         reason = str(
